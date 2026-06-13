@@ -1,0 +1,248 @@
+# =============================================================================
+# Enterprise RAG System — 全局配置文件
+# =============================================================================
+# 技术决策说明:
+# - 采用 Qdrant 而非 Pinecone: Qdrant 原生支持 sparse+dense 混合搜索，
+#   避免引入 Elasticsearch 的运维复杂度，且 mmap 零拷贝对大规模向量有显著
+#   性能优势。Pinecone 的 3-4x 溢价在初创阶段ROI不足。
+# - embedding 模型可热切换: 当前默认 voyage-3-large（英文最高质量），
+#   通过 embedder.backend 配置可切换到 text-embedding-3-large / BGE-M3。
+#   决策依据: MTEB Retrieval leaderboard 2026年4月数据。
+# =============================================================================
+
+# --------------------------------------------------------------------------
+# 0. 全局路径
+# --------------------------------------------------------------------------
+paths:
+  data_dir: "data/sample_docs"
+  output_dir: "outputs"
+
+# --------------------------------------------------------------------------
+# 1. Embedding 模型配置
+# --------------------------------------------------------------------------
+# 决策依据: MTEB Retrieval 2026年4月 leaderboard
+#   - voyage-3-large: MTEB ~62, 英文+代码场景最优
+#   - text-embedding-3-large: MTEB ~59, 通用场景默认值
+#   - BGE-M3: MTEB ~58, 开源多语言首选 (Apache 2.0)
+# 权衡: BGE-M3 自托管零 API 成本，但需要 GPU 资源；商业模型按量付费
+embedding:
+  backend: "voyage"          # 选项: voyage | openai | bge
+  voyage_model: "voyage-3-large"
+  openai_model: "text-embedding-3-large"
+  bge_model: "BAAI/bge-m3"
+  dimension: 1024            # 维度需与 reranker 匹配
+  batch_size: 100            # 批量 embedding，降低 API 调用次数
+  normalize: true             # cosine similarity 需要 L2 归一化
+  # Contextual Retrieval: 每个 chunk embed 前 prepend 此长度的上下文摘要
+  contextual_prefix_tokens: 80
+
+# --------------------------------------------------------------------------
+# 2. Chunking 分块策略配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - 固定 token 分块 (fixed) 是最常用但质量最低的方案: 会在句子中间断开
+# - 层级分块 (hierarchical) 保留文档结构，适合 SOP/政策文档
+# - 语义分块 (semantic) 用 embedding 相似度检测断点，适合长文分析
+# - 2026 FAANG 标准: 512 tokens (事实型) / 1024 tokens (分析型)
+#   块间重叠 64-128 tokens 保留跨块语义
+# - 最小块阈值 150 tokens: 低于此值的块过于碎片化，会破坏检索精度
+chunking:
+  strategy: "recursive"      # 选项: fixed | hierarchical | semantic | recursive
+  chunk_size: 512            # tokens
+  chunk_overlap: 64          # tokens
+  min_chunk_size: 150        # 低于此值的块丢弃
+  # hierarchical 策略额外配置
+  heading_levels: [1, 2, 3]  # 按这些标题层级切分（用于 hierarchical 策略）
+  # semantic 策略额外配置
+  semantic_threshold: 0.7     # 句子间 embedding 相似度阈值，低于此值则断开
+
+# --------------------------------------------------------------------------
+# 3. 向量数据库 (Qdrant) 配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - Qdrant vs pgvector: Qdrant 支持 sparse vector (BM25) 原生混合搜索，
+#   pgvector 需要 ParadeDB 扩展。Qdrant 的 mmap 技术在 >1M 向量时内存
+#   效率显著优于纯内存索引。
+# - HNSW vs IVF: HNSW 是 2026 年生产环境绝对主流，IVF 在冷启动
+#   和内存占用上有优势，但 Qdrant 已将 HNSW 优化到极致。
+# - 注意: Qdrant 默认使用 dot_product (点积)，需与 embedding 归一化配合
+vector_db:
+  provider: "qdrant"
+  url: "http://localhost:6333"
+  collection_name: "enterprise_rag"
+  vector_size: 1024          # 需与 embedding.dimension 严格一致
+  distance: "Cosine"         # 选项: Cosine | Dot | Euclid
+  # HNSW 索引参数
+  hnsw:
+    m: 16                    # 每层连接数，m↑ 精度↑ 内存↑
+    ef_construct: 128        # 构建时动态列表大小，ef↑ 精度↑ 速度↓
+  # Sparse vector (BM25) 配置
+  sparse:
+    enabled: true
+    tokenizer: "default"     # BM25 分词器
+    k1: 1.5                  # BM25 term 频率饱和参数
+    b: 0.75                  # BM25 字段长度归一化参数
+  # 批量写入配置
+  batch_size: 64
+
+# --------------------------------------------------------------------------
+# 4. Reranker 配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - Cross-Encoder vs Bi-Encoder: Cross-Encoder 将 query+doc 联合编码，
+#   捕获细粒度交互，是当前生产环境绝对主流方案。
+# - Cohere Rerank 3.5: 2026 年企业默认值，$2/1K，~80ms，NDCG@10 +10-30%
+# - BGE Reranker v2-m3: 开源自托管，需小 GPU，~30ms，适合合规/成本敏感场景
+# - ColBERT v2: token 级 late interaction，适合超大候选集压缩
+# - 决策: 优先 Cohere API（最快上线），有合规/成本需求后迁移到 BGE 本地
+reranker:
+  provider: "cohere"         # 选项: cohere | bge | voyage
+  cohere_model: "rerank-3.5"
+  bge_model: "BAAI/bge-reranker-v2-m3"
+  top_k: 5                  # Reranker 输出最终 top-k 上下文块
+  candidate_size: 50        # 融合后送入 reranker 的候选集大小
+
+# --------------------------------------------------------------------------
+# 5. LLM 生成模型配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - Claude 3.7 Sonnet: 复杂推理、长文档分析首选，200K 上下文
+# - GPT-4.5: 通用生产，API 生态最成熟
+# - Gemini 2.5 Pro: 超长上下文 (1M)，多模态，多语言场景
+# - 架构决策: Router 用 Haiku (快速+便宜)，生成用 Sonnet (质量)
+# - Structured Output: JSON Schema 约束输出是 2026 生产环境必选项，
+#   避免 LLM 输出格式不稳定导致的解析错误
+llm:
+  # DeepSeek API 配置
+  deepseek:
+    api_key: ""              # 填写你的 DeepSeek API Key
+    base_url: "https://api.deepseek.com"
+    models:
+      chat: "deepseek-chat"
+      coder: "deepseek-coder"
+
+  # 生成模型
+  generator:
+    provider: "anthropic"    # 选项: anthropic | openai | google | deepseek
+    model: "claude-3-7-sonnet-20250620"
+    max_tokens: 2048
+    temperature: 0.3        # 低 temperature 保证回答稳定性
+  # 路由/分类模型 (轻量)
+  router:
+    provider: "anthropic"
+    model: "claude-3-5-haiku-20250620"
+    max_tokens: 256
+    temperature: 0.1
+  # Structured Output Schema
+  output_schema:
+    answer: "string"
+    citations: "array[{doc_id, chunk_index, quote}]"
+    confidence: "enum[high, medium, low, insufficient]"
+    gaps: "array[string]"
+
+# --------------------------------------------------------------------------
+# 6. Hybrid Search 配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - BM25 + Dense 是 2026 年 FAANG 标准组合。纯向量检索在精确标识符
+#   (SKU/合同号/政策编号) 上召回率极差；BM25 在语义 paraphrase 上盲区。
+# - RRF (Reciprocal Rank Fusion): k=60 是业界默认值，无需 score 归一化，
+#   对 BM25 和 cosine 不同量纲天然鲁棒。
+# - 并行执行: BM25 和 dense 必须同时发起，而非串行，以节省延迟
+hybrid_search:
+  # BM25 和 dense 各自召回 top-n
+  individual_top_k: 50
+  # RRF 融合参数: k=60 是学术和工业界共同验证的最优默认值
+  rrf_k: 60
+  # BM25 和 dense 结果融合权重 (0.0-1.0)
+  # 0.5 表示平等权重；偏向精确匹配可提高 BM25 权重
+  bm25_weight: 0.5
+  dense_weight: 0.5
+
+# --------------------------------------------------------------------------
+# 7. Agentic 编排配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - Router + ReAct + Plan-and-Execute 三层递进是 2026 年主流方案。
+#   从简单到复杂渐进式引入复杂度，避免用复杂方案解决简单问题。
+# - ReAct 循环的 max_iterations 限制是防止无限循环的标准工程实践。
+# - Plan-and-Execute 的规划步骤数量限制同样防止规划爆炸。
+# - Memory Bank 是监管行业（金融/医疗/法律）的可解释性必备组件。
+agentic:
+  # 查询复杂度阈值 (Haiku 输出的置信度低于此值则升级到 ReAct)
+  complexity_threshold: 0.6
+  # ReAct 配置
+  react:
+    max_iterations: 5
+    early_stop_threshold: 0.85  # 置信度达到此值时提前退出
+  # Plan-and-Execute 配置
+  plan_execute:
+    max_steps: 8
+    max_subqueries_per_step: 3
+  # Memory Bank 配置
+  memory_bank:
+    max_claims: 50       # 单次会话最大 claim 数量
+    ttl_hours: 24        # claim 保留时间
+
+# --------------------------------------------------------------------------
+# 8. 语义缓存配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - 语义缓存可节省 40-80% 的 LLM 调用成本，同时将命中查询响应时间从
+#   数秒压缩到 ~50ms (embedding + Redis FT.SEARCH)。
+# - 相似度阈值 0.92 是 precision/cost 的经验最优值。
+#   阈值↑ = 质量↑ = 命中率↓。实测 0.92-0.95 是生产合理区间。
+# - Redis vs Valkey: Valkey 是 Redis fork，协议兼容，性能相当，
+#   且 Valkey 在某些工作负载上有内存效率优势。两者均可。
+semantic_cache:
+  enabled: true
+  provider: "redis"          # 选项: redis | valkey
+  host: "localhost"
+  port: 6379
+  ttl_days: 7               # 缓存条目 TTL
+  similarity_threshold: 0.92  # cosine similarity 命中阈值
+  index_name: "semantic_cache"
+  max_entries: 100000       # 缓存最大条目数（超出后 LRU 淘汰）
+
+# --------------------------------------------------------------------------
+# 9. 评估配置
+# --------------------------------------------------------------------------
+# 决策说明:
+# - RAGAS 五指标是学术界和工业界共同认可的标准评估体系。
+#   Faithfulness/Answer Relevancy/Context Precision/Context Recall/
+#   Answer Correctness。
+# - 阈值设定 (≥0.85/0.75/0.70/0.70/0.80) 是 2026 年生产环境经验值。
+#   低于阈值的指标会触发告警和可选自动回滚。
+# - DeepEval 的 pytest 风格集成是 DevOps / MLOps 能力的直接体现。
+evaluation:
+  # RAGAS 指标阈值
+  thresholds:
+    faithfulness: 0.85
+    answer_relevancy: 0.75
+    context_precision: 0.70
+    context_recall: 0.70
+    answer_correctness: 0.80
+  # 测试集配置
+  test_set:
+    min_size: 30           # 最小测试集大小
+    categories:
+      - simple             # 简单事实型
+      - moderate          # 中等复杂度
+      - difficult         # 复杂推理/多跳
+  # CI/CD 集成
+  ci:
+    fail_on_regression: true
+    regression_threshold: 0.05  # 指标下降超过 5% 则失败
+
+# --------------------------------------------------------------------------
+# 10. 日志与可观测性配置
+# --------------------------------------------------------------------------
+logging:
+  level: "INFO"            # 选项: DEBUG | INFO | WARNING | ERROR
+  format: "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
+  file: "logs/rag_system.log"
+  # 全链路 trace: 每个请求分配 trace_id，记录每个 stage 的耗时和输入输出
+  trace:
+    enabled: true
+    log_retrieval_scores: true
+    log_citation_mapping: true

@@ -1,0 +1,15 @@
+"""
+generation 模块 — 生成层
+================================================================================
+技术决策记录:
+- 分层 LLM 策略: Router 用 Haiku (快速+便宜)，Generator 用 Sonnet (质量)。
+- Structured Output: JSON Schema 约束 LLM 输出，避免解析错误和幻觉引用。
+- Prompt Template: 引用标注格式、置信度评估、信息缺口识别。
+"""
+
+from backend.generation.llm_client import LLMClient
+from backend.generation.prompt_builder import PromptBuilder
+from backend.generation.structured_output import StructuredOutputGenerator
+from backend.generation.streaming import LLMStreamer
+
+__all__ = ["LLMClient", "PromptBuilder", "StructuredOutputGenerator", "LLMStreamer"]
