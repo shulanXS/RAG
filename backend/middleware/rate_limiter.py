@@ -165,3 +165,90 @@ def check_rate_limit(tenant_id: str, tier: str = "free"):
 class RateLimitExceeded(Exception):
     """限流超出异常"""
     pass
+
+
+class RateLimitMiddleware:
+    """
+    FastAPI/Starlette 限流中间件
+
+    从请求头中提取 tenant_id，默认 fallback 到 IP。
+    将限流结果以响应头返回: X-RateLimit-Remaining, X-RateLimit-Reset
+    """
+
+    def __init__(self, app, limiter: RateLimiter | None = None):
+        self.app = app
+        self._limiter = limiter
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        limiter = self._limiter or get_rate_limiter()
+        tenant_id = self._extract_tenant_id(scope)
+        tier = self._extract_tier(scope)
+
+        try:
+            allowed, remaining, reset_in = limiter.check_rate_limit(tenant_id, tier)
+        except Exception:
+            allowed = True
+            remaining = -1
+            reset_in = 60
+
+        if not allowed:
+            response = [
+                b"HTTP/1.1 429 Too Many Requests\r\n",
+                b"Content-Type: application/json\r\n",
+                b"Retry-After: 60\r\n",
+                b"\r\n",
+                b'{"detail":"Rate limit exceeded"}',
+            ]
+            async for chunk in receive:
+                pass
+            for item in response:
+                await send({"type": "http.response.body", "body": item})
+            return
+
+        status_sent = False
+
+        async def send_wrapper(message):
+            nonlocal status_sent
+            if message["type"] == "http.response.start" and not status_sent:
+                status_sent = True
+                await send({
+                    "type": "http.response.start",
+                    "status": message["status"],
+                    "headers": [
+                        *message.get("headers", []),
+                        (b"x-ratelimit-remaining", str(remaining).encode()),
+                        (b"x-ratelimit-reset", str(reset_in).encode()),
+                    ],
+                })
+            else:
+                await send(message)
+
+        await self.app(scope, receive, send_wrapper)
+
+    def _extract_tenant_id(self, scope) -> str:
+        headers = dict(scope.get("headers", []))
+        auth = headers.get(b"authorization", b"").decode()
+        if auth.startswith("Bearer "):
+            import base64, json
+            try:
+                payload = auth[7:].split(".")[1]
+                padded = payload + "=" * (4 - len(payload) % 4)
+                claims = json.loads(base64.urlsafe_b64decode(padded))
+                return claims.get("sub", "anonymous")
+            except Exception:
+                pass
+        client = scope.get("client")
+        if client:
+            return f"ip:{client[0]}"
+        return "unknown"
+
+    def _extract_tier(self, scope) -> str:
+        headers = dict(scope.get("headers", []))
+        tier_header = headers.get(b"x-rate-limit-tier", b"").decode()
+        if tier_header in ("free", "pro", "enterprise"):
+            return tier_header
+        return "free"

@@ -12,6 +12,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from backend.api import chat_router, search_router, documents_router, health_router
+from backend.middleware.rate_limiter import RateLimitMiddleware, get_rate_limiter
 
 # 配置日志
 logging.basicConfig(
@@ -45,6 +46,12 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# 限流中间件（Redis 滑动窗口）
+try:
+    app.add_middleware(RateLimitMiddleware, limiter=get_rate_limiter())
+except Exception:
+    pass  # Redis 不可用时跳过限流
 
 # 注册路由
 app.include_router(health_router, prefix="/api")

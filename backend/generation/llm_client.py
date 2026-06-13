@@ -241,6 +241,7 @@ class LLMClient:
       Haiku 成本仅为 Sonnet 的 1/20，分层使用可节省 60-70% LLM 成本。
     - Structured Output: 各后端均支持 JSON Schema 约束输出，
       这是 2026 年生产环境的必备功能。
+    - Circuit Breaker: 每个 provider 独立熔断，防止单点故障雪崩。
     """
 
     def __init__(
@@ -250,15 +251,31 @@ class LLMClient:
         router_provider: Literal["anthropic", "openai", "google", "deepseek"] = "anthropic",
         router_model: str = "claude-3-5-haiku-20250620",
     ):
+        from backend.middleware.circuit_breaker import get_breaker, CircuitBreakerConfig
+
         # Generator (主生成模型)
         self.generator_client = self._create_backend(
             generator_provider, generator_model
         )
         self._generator_model = generator_model
+        self._generator_provider = generator_provider
+        self._generator_breaker = get_breaker(
+            f"llm:{generator_provider}:{generator_model}",
+            CircuitBreakerConfig(failure_threshold=5, recovery_timeout=30.0),
+        )
 
         # Router (轻量分类模型)
         self.router_client = self._create_backend(router_provider, router_model)
         self._router_model = router_model
+        self._router_provider = router_provider
+        self._router_breaker = get_breaker(
+            f"llm:{router_provider}:{router_model}",
+            CircuitBreakerConfig(failure_threshold=3, recovery_timeout=30.0),
+        )
+
+    @property
+    def generator_model(self) -> str:
+        return self._generator_model
 
     def _create_backend(
         self,
@@ -302,12 +319,17 @@ class LLMClient:
         if model and model != self._generator_model:
             client = self._create_backend("anthropic", model)
 
-        return await client.generate_async(
-            prompt,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system,
-        )
+        try:
+            return await self._generator_breaker.call(
+                client.generate_async,
+                prompt,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+            )
+        except Exception as e:
+            logger.error(f"LLM generate failed, circuit breaker may be open: {e}")
+            return ""
 
     def generate(
         self,

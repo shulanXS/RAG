@@ -4,11 +4,13 @@ chat.py — 对话相关 API 路由
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from typing import Annotated
 
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
 
 logger = logging.getLogger(__name__)
@@ -117,3 +119,45 @@ async def chat(request: ChatRequest) -> ChatResponse:
     except Exception as e:
         logger.exception(f"Chat request failed: {e}")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/stream")
+async def stream_chat(request: StreamChatRequest):
+    """
+    SSE 流式对话端点
+
+    发送两种事件:
+    - citation: 检索引用（立即返回）
+    - message: 答案 token 流
+    - done: 完成信号
+    """
+    async def event_generator():
+        try:
+            orchestrator = get_orchestrator()
+            result = await orchestrator.run(
+                query=request.query,
+                conversation_history=None,
+            )
+
+            yield f"event: citation\ndata: {json.dumps(result.citations)}\n\n"
+
+            if result.answer:
+                for i in range(0, len(result.answer), 20):
+                    chunk = result.answer[i : i + 20]
+                    yield f"event: message\ndata: {json.dumps(chunk)}\n\n"
+
+            yield f"event: done\ndata: {json.dumps({'confidence': result.confidence, 'latency_ms': result.latency_ms})}\n\n"
+
+        except Exception as e:
+            logger.exception(f"Stream chat failed: {e}")
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
