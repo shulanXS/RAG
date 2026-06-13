@@ -216,33 +216,30 @@ class HybridSearchEngine:
             query_vector = self._embedder.embed(query)
             context.dense_latency_ms += (time.perf_counter() - embed_start) * 1000
 
-        # 步骤 2: 并行执行 BM25 和 Dense 检索（独立计时）
-        bm25_start = time.perf_counter()
-
-        async def run_bm25() -> list:
+        # 步骤 2: 并行执行 BM25 和 Dense 检索（各内部独立计时）
+        async def run_bm25() -> tuple[list, float]:
+            t0 = time.perf_counter()
             if self._bm25_retriever is None:
-                return []
-            return self._bm25_retriever.search(query, top_k=self._individual_top_k)
+                return [], 0.0
+            result = self._bm25_retriever.search(query, top_k=self._individual_top_k)
+            return result, (time.perf_counter() - t0) * 1000
 
-        async def run_dense() -> list:
-            return self._vector_retriever.search(
+        async def run_dense() -> tuple[list, float]:
+            t0 = time.perf_counter()
+            result = await self._vector_retriever.search(
                 query_vector=query_vector,
                 top_k=self._individual_top_k,
                 query_filter=acl_filter,
             )
+            return result, (time.perf_counter() - t0) * 1000
 
-        # 并行执行
-        bm25_results, dense_results = await asyncio.gather(
+        (bm25_results, bm25_ms), (dense_results, dense_ms) = await asyncio.gather(
             asyncio.to_thread(run_bm25),
             asyncio.to_thread(run_dense),
         )
 
-        bm25_end = time.perf_counter()
-        dense_end = time.perf_counter()
-
-        # 分别记录各自耗时
-        context.bm25_latency_ms = (bm25_end - bm25_start) * 1000
-        context.dense_latency_ms = (dense_end - bm25_start) * 1000 + context.dense_latency_ms
+        context.bm25_latency_ms = bm25_ms
+        context.dense_latency_ms = dense_ms
         context.bm25_top_k = len(bm25_results)
         context.dense_top_k = len(dense_results)
 

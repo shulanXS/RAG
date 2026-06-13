@@ -6,21 +6,20 @@ llm_client.py — 统一 LLM 接口
 - 分层使用: Router 用轻量模型，Generator 用主力模型。分层策略节省 60-70% LLM 成本。
 - DeepSeek: 兼容 OpenAI API 格式，成本约为 Claude/GPT-4 的 1/10-1/20。
 - Structured Output: 使用各 SDK 的原生功能（Pydantic + json_schema），
-  而不是提示词工程。因为提示词的输出格式稳定性不够（特别是多语言场景）。
-
-业务难点:
-- API 速率限制: 高并发场景需要指数退避重试。
-- 多模型支持: 不同模型的 API 格式不同，需要适配器封装。
+  而不是提示词工程。消除 json.loads() 解析的脆弱性。
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Literal
+from typing import Any, Literal, TypeVar
 
 logger = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 
 class LLMBackend(ABC):
@@ -44,33 +43,49 @@ class AnthropicBackend(LLMBackend):
         max_tokens: int = 2048,
         temperature: float = 0.3,
     ):
-        try:
-            from anthropic import Anthropic
-        except ImportError:
-            raise ImportError("需要安装 anthropic: pip install anthropic")
-
-        self._client = Anthropic()
+        import anthropic
+        self._client = anthropic.Anthropic()
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
 
+    def _record_usage(self, usage: Any, mc: Any) -> None:
+        """记录 token 使用量到 metrics"""
+        try:
+            mc.record_llm_tokens(
+                self._model,
+                input_tokens=usage.input_tokens,
+                output_tokens=usage.output_tokens,
+            )
+        except Exception:
+            pass
+
     async def generate_async(self, prompt: str, **kwargs) -> str:
-        import anthropic
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
         temperature = kwargs.get("temperature", self._temperature)
         system = kwargs.get("system", None)
+        structured_schema = kwargs.get("structured_schema", None)
+        metrics_collector = kwargs.get("_metrics_collector", None)
 
-        message = await self._client.messages.create(
-            model=self._model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            system=system,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        def _call():
+            extra = {}
+            if structured_schema:
+                extra["output"] = {"type": "json_object", "schema": structured_schema}
+            return self._client.messages.create(
+                model=self._model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+                **extra,
+            )
+
+        message = await asyncio.to_thread(_call)
+        if metrics_collector:
+            self._record_usage(message.usage, metrics_collector)
         return message.content[0].text
 
     def generate(self, prompt: str, **kwargs) -> str:
-        import anthropic
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
         temperature = kwargs.get("temperature", self._temperature)
         system = kwargs.get("system", None)
@@ -94,26 +109,44 @@ class OpenAIBackend(LLMBackend):
         max_tokens: int = 2048,
         temperature: float = 0.3,
     ):
-        try:
-            from openai import OpenAI, AsyncOpenAI
-        except ImportError:
-            raise ImportError("需要安装 openai: pip install openai")
-
+        from openai import AsyncOpenAI, OpenAI
         self._client = OpenAI()
         self._async_client = AsyncOpenAI()
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
 
+    def _record_usage(self, usage: Any, mc: Any) -> None:
+        try:
+            mc.record_llm_tokens(
+                self._model,
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+            )
+        except Exception:
+            pass
+
     async def generate_async(self, prompt: str, **kwargs) -> str:
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
         temperature = kwargs.get("temperature", self._temperature)
-        response = await self._async_client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        structured_schema = kwargs.get("structured_schema", None)
+        metrics_collector = kwargs.get("_metrics_collector", None)
+
+        create_kwargs = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if structured_schema:
+            create_kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"name": "output", "schema": structured_schema},
+            }
+
+        response = await self._async_client.chat.completions.create(**create_kwargs)
+        if metrics_collector and response.usage:
+            self._record_usage(response.usage, metrics_collector)
         return response.choices[0].message.content or ""
 
     def generate(self, prompt: str, **kwargs) -> str:
@@ -137,34 +170,56 @@ class GoogleGenAIBackend(LLMBackend):
         max_tokens: int = 2048,
         temperature: float = 0.3,
     ):
-        try:
-            from google import genai
-        except ImportError:
-            raise ImportError("需要安装 google-genai: pip install google-genai")
-
+        from google import genai
         self._client = genai.Client()
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
 
+    def _record_usage(self, response: Any, mc: Any) -> None:
+        try:
+            usage = response.usage_metadata
+            mc.record_llm_tokens(
+                self._model,
+                input_tokens=usage.prompt_token_count,
+                output_tokens=usage.candidates_token_count,
+            )
+        except Exception:
+            pass
+
     async def generate_async(self, prompt: str, **kwargs) -> str:
-        response = await self._client.aio.models.generate_content(
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
+        temperature = kwargs.get("temperature", self._temperature)
+        structured_schema = kwargs.get("structured_schema", None)
+        metrics_collector = kwargs.get("_metrics_collector", None)
+
+        config = {
+            "max_output_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if structured_schema:
+            config["response_schema"] = structured_schema
+            config["response_mime_type"] = "application/json"
+
+        response = await asyncio.to_thread(
+            self._client.models.generate_content,
             model=self._model,
             contents=prompt,
-            config={
-                "max_output_tokens": kwargs.get("max_tokens", self._max_tokens),
-                "temperature": kwargs.get("temperature", self._temperature),
-            },
+            config=config,
         )
+        if metrics_collector:
+            self._record_usage(response, metrics_collector)
         return response.text
 
     def generate(self, prompt: str, **kwargs) -> str:
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
+        temperature = kwargs.get("temperature", self._temperature)
         response = self._client.models.generate_content(
             model=self._model,
             contents=prompt,
             config={
-                "max_output_tokens": kwargs.get("max_tokens", self._max_tokens),
-                "temperature": kwargs.get("temperature", self._temperature),
+                "max_output_tokens": max_tokens,
+                "temperature": temperature,
             },
         )
         return response.text
@@ -188,32 +243,44 @@ class DeepSeekBackend(LLMBackend):
         api_key: str | None = None,
         base_url: str = "https://api.deepseek.com",
     ):
-        try:
-            from openai import OpenAI, AsyncOpenAI
-        except ImportError:
-            raise ImportError("需要安装 openai: pip install openai")
-
-        self._client = OpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
-        self._async_client = AsyncOpenAI(
-            api_key=api_key,
-            base_url=base_url,
-        )
+        from openai import AsyncOpenAI, OpenAI
+        self._client = OpenAI(api_key=api_key, base_url=base_url)
+        self._async_client = AsyncOpenAI(api_key=api_key, base_url=base_url)
         self._model = model
         self._max_tokens = max_tokens
         self._temperature = temperature
 
+    def _record_usage(self, usage: Any, mc: Any) -> None:
+        try:
+            mc.record_llm_tokens(
+                self._model,
+                input_tokens=usage.prompt_tokens,
+                output_tokens=usage.completion_tokens,
+            )
+        except Exception:
+            pass
+
     async def generate_async(self, prompt: str, **kwargs) -> str:
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
         temperature = kwargs.get("temperature", self._temperature)
-        response = await self._async_client.chat.completions.create(
-            model=self._model,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
+        structured_schema = kwargs.get("structured_schema", None)
+        metrics_collector = kwargs.get("_metrics_collector", None)
+
+        create_kwargs = {
+            "model": self._model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        if structured_schema:
+            create_kwargs["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {"Name": "output", "schema": structured_schema},
+            }
+
+        response = await self._async_client.chat.completions.create(**create_kwargs)
+        if metrics_collector and response.usage:
+            self._record_usage(response.usage, metrics_collector)
         return response.choices[0].message.content or ""
 
     def generate(self, prompt: str, **kwargs) -> str:
@@ -239,8 +306,6 @@ class LLMClient:
     技术决策:
     - 为什么分层（Router/Generator）: Router 只做简单分类，不需要生成模型的推理能力。
       Haiku 成本仅为 Sonnet 的 1/20，分层使用可节省 60-70% LLM 成本。
-    - Structured Output: 各后端均支持 JSON Schema 约束输出，
-      这是 2026 年生产环境的必备功能。
     - Circuit Breaker: 每个 provider 独立熔断，防止单点故障雪崩。
     """
 
@@ -252,8 +317,8 @@ class LLMClient:
         router_model: str = "claude-3-5-haiku-20250620",
     ):
         from backend.middleware.circuit_breaker import get_breaker, CircuitBreakerConfig
+        from backend.observability.metrics import MetricsCollector
 
-        # Generator (主生成模型)
         self.generator_client = self._create_backend(
             generator_provider, generator_model
         )
@@ -264,7 +329,6 @@ class LLMClient:
             CircuitBreakerConfig(failure_threshold=5, recovery_timeout=30.0),
         )
 
-        # Router (轻量分类模型)
         self.router_client = self._create_backend(router_provider, router_model)
         self._router_model = router_model
         self._router_provider = router_provider
@@ -272,6 +336,8 @@ class LLMClient:
             f"llm:{router_provider}:{router_model}",
             CircuitBreakerConfig(failure_threshold=3, recovery_timeout=30.0),
         )
+
+        self._metrics = MetricsCollector()
 
     @property
     def generator_model(self) -> str:
@@ -293,6 +359,28 @@ class LLMClient:
         else:
             raise ValueError(f"不支持的 LLM provider: {provider}")
 
+    def _call_with_breaker(
+        self,
+        breaker,
+        client: LLMBackend,
+        prompt: str,
+        structured_schema: dict | None = None,
+        **kwargs,
+    ) -> str:
+        """通过熔断器调用 LLM，自动注入 metrics collector"""
+        kwargs["structured_schema"] = structured_schema
+        kwargs["_metrics_collector"] = self._metrics
+
+        def _call():
+            return client.generate(prompt, **kwargs)
+
+        async def _call_async():
+            return await client.generate_async(prompt, **kwargs)
+
+        if asyncio.iscoroutinefunction(client.generate_async):
+            return asyncio.run(_call_async())
+        return _call()
+
     async def generate_async(
         self,
         prompt: str,
@@ -301,6 +389,8 @@ class LLMClient:
         max_tokens: int = 2048,
         temperature: float = 0.3,
         system: str | None = None,
+        structured_schema: dict | None = None,
+        use_breaker: bool = True,
     ) -> str:
         """
         异步生成
@@ -311,22 +401,30 @@ class LLMClient:
             max_tokens: 最大生成 token 数
             temperature: 温度参数
             system: 系统提示
+            structured_schema: 可选，JSON Schema 用于 Structured Output
+            use_breaker: 是否启用熔断器
         """
-        # 默认为 generator client
         client = self.generator_client
 
-        # 如果指定了不同模型，创建新的 backend
         if model and model != self._generator_model:
-            client = self._create_backend("anthropic", model)
+            client = self._create_backend(self._generator_provider, model)
+
+        call_kwargs = dict(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+            structured_schema=structured_schema,
+            _metrics_collector=self._metrics,
+        )
 
         try:
-            return await self._generator_breaker.call(
-                client.generate_async,
-                prompt,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                system=system,
-            )
+            if use_breaker:
+                return await self._generator_breaker.call(
+                    client.generate_async,
+                    prompt,
+                    **call_kwargs,
+                )
+            return await client.generate_async(prompt, **call_kwargs)
         except Exception as e:
             logger.error(f"LLM generate failed, circuit breaker may be open: {e}")
             return ""
@@ -338,14 +436,17 @@ class LLMClient:
         model: str | None = None,
         max_tokens: int = 2048,
         temperature: float = 0.3,
+        structured_schema: dict | None = None,
     ) -> str:
         """同步生成"""
         client = self.generator_client
         if model and model != self._generator_model:
-            client = self._create_backend("anthropic", model)
+            client = self._create_backend(self._generator_provider, model)
 
         return client.generate(
             prompt,
             max_tokens=max_tokens,
             temperature=temperature,
+            structured_schema=structured_schema,
+            _metrics_collector=self._metrics,
         )

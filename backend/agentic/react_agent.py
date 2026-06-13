@@ -177,9 +177,9 @@ class ReActAgent:
         self._max_iters = max_iterations
         self._early_stop = early_stop_threshold
 
-        # 内部状态
         self._current_chunks: list[dict] = []
         self._trace: list[dict] = []
+        self._compiled_graph = self._build_graph()
 
     def _build_graph(self):
         """
@@ -259,9 +259,6 @@ class ReActAgent:
         else:
             display_query = query
 
-        # 构建并运行图
-        graph = self._build_graph()
-
         initial_state: ReActState = {
             "query": query,
             "rewritten_query": rewritten_query or query,
@@ -277,7 +274,7 @@ class ReActAgent:
         }
 
         try:
-            result = await graph.ainvoke(initial_state)
+            result = await self._compiled_graph.ainvoke(initial_state)
         except Exception as e:
             logger.error(f"ReAct 执行异常: {e}")
             return f"Agent 执行失败: {e}", 0.0, []

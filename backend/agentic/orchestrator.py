@@ -24,6 +24,7 @@ from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
 from backend.generation.structured_output import StructuredOutputGenerator
 from backend.observability.metrics import MetricsCollector
+from backend.observability.tracing import TracingManager
 from backend.retrieval.hyde import HyDEQueryEnhancer
 from backend.retrieval.query_expander import QueryExpander
 
@@ -96,8 +97,9 @@ class AgenticOrchestrator:
         self._prompt_builder = PromptBuilder()
         self._structured_output = StructuredOutputGenerator()
         self._memory_bank = MemoryBank(session_id=memory_bank_session_id)
+        self._metrics = MetricsCollector()
+        self._tracing = TracingManager()
 
-        # ReAct 和 Plan-and-Execute Agent
         self._react_agent: ReActAgent | None = None
         self._plan_agent: PlanExecuteAgent | None = None
 
@@ -145,32 +147,40 @@ class AgenticOrchestrator:
         trace: dict = {}
         cache_hit = False
         was_rewritten = False
+        mc = self._metrics
+        tm = self._tracing
 
-        # 步骤 0: 语义缓存检查
-        cache_hit = False
-        mc = MetricsCollector()
-        if semantic_cache_fn:
-            cached = await semantic_cache_fn(query)
-            if cached:
-                cache_hit = True
-                mc.record_cache_hit(hit=True)
-                latency = (time.perf_counter() - start) * 1000
-                return OrchestratorResult(
-                    answer=cached.get("answer", ""),
-                    citations=cached.get("citations", []),
-                    confidence=cached.get("confidence", "medium"),
-                    latency_ms=latency,
-                    trace=trace,
-                    cache_hit=True,
-                )
-        mc.record_cache_hit(hit=False)
+        # ---- cache_check ----
+        with tm.create_span("rag.cache_lookup") as span:
+            span.set_attribute("query_length", len(query))
+            if semantic_cache_fn:
+                cached = await semantic_cache_fn(query)
+                if cached:
+                    cache_hit = True
+                    mc.record_cache_hit(hit=True)
+                    latency = (time.perf_counter() - start) * 1000
+                    return OrchestratorResult(
+                        answer=cached.get("answer", ""),
+                        citations=cached.get("citations", []),
+                        confidence=cached.get("confidence", "medium"),
+                        latency_ms=latency,
+                        trace=trace,
+                        cache_hit=True,
+                    )
+            mc.record_cache_hit(hit=False)
+            span.set_attribute("cache_hit", False)
 
-        # 步骤 1: 查询改写（多轮对话）
+        # ---- query_rewrite ----
         from backend.retrieval.query_rewriter import QueryRewriter
         rewriter = QueryRewriter(llm_client=self._llm.generator_client if self._llm else None)
         rewritten = rewriter.rewrite(query, conversation_history)
         was_rewritten = rewritten.was_rewritten
         display_query = rewritten.rewritten
+
+        with tm.create_span("rag.query_rewrite") as span:
+            span.set_attribute("was_rewritten", was_rewritten)
+            span.set_attribute("original_query_length", len(query))
+            span.set_attribute("rewritten_query_length", len(display_query))
 
         trace["query_rewrite"] = {
             "was_rewritten": was_rewritten,
@@ -179,9 +189,14 @@ class AgenticOrchestrator:
             "rewritten": display_query,
         }
 
-        # 步骤 2: 查询复杂度路由
+        # ---- routing ----
         routing = self._router.route(display_query, conversation_history)
         complexity = routing.complexity
+
+        with tm.create_span("rag.routing") as span:
+            span.set_attribute("complexity", complexity.value)
+            span.set_attribute("routing_confidence", routing.confidence)
+            span.set_attribute("recommended_approach", routing.recommended_approach)
 
         trace["routing"] = {
             "complexity": complexity.value,
@@ -190,21 +205,21 @@ class AgenticOrchestrator:
             "approach": routing.recommended_approach,
         }
 
-        # 步骤 3: HyDE + Query Expansion（complex 查询启用）
+        # ---- HyDE + retrieval ----
         search_query = display_query
         if complexity == QueryComplexity.COMPLEX and self._llm:
             if self._llm.generator_client:
-                hyde = HyDEQueryEnhancer(llm_client=self._llm.generator_client)
-                search_query = await hyde.enhance(display_query)
-                trace["hyde"] = {"query": search_query}
+                with tm.create_span("rag.hyde") as span:
+                    hyde = HyDEQueryEnhancer(llm_client=self._llm.generator_client)
+                    search_query = await hyde.enhance(display_query)
+                    span.set_attribute("enhanced_query_length", len(search_query))
 
-        # 步骤 4: 根据复杂度执行不同路径
+        # ---- execute by complexity ----
         retrieved_chunks: list[dict] = []
         answer: str = ""
         confidence: float = routing.confidence
 
         if complexity == QueryComplexity.SIMPLE:
-            # 路径 3a: 简单查询 → 直接混合检索
             if self._hybrid_search:
                 chunks, retrieval_context = await self._hybrid_search.search(search_query)
                 retrieved_chunks = chunks
@@ -218,20 +233,22 @@ class AgenticOrchestrator:
                     "strategy": "hybrid",
                     "latency_ms": retrieval_context.total_latency_ms,
                     "num_chunks": len(chunks),
+                    "stages": retrieval_context.stage_breakdown,
                 }
-                answer, citations = await self._generate_answer(
-                    search_query, chunks
-                )
+                answer, citations = await self._generate_answer(search_query, chunks)
             else:
                 answer = "检索引擎未配置"
                 citations = []
 
         elif complexity == QueryComplexity.MODERATE:
-            # 路径 3b: 中等复杂度 → ReAct Agent
-            react = self._get_react_agent()
-            answer, conf, chunks = await react.run(query, search_query)
-            retrieved_chunks = chunks
-            confidence = conf
+            with tm.create_span("rag.agentic") as span:
+                span.set_attribute("agent_type", "ReAct")
+                react = self._get_react_agent()
+                answer, conf, chunks = await react.run(query, search_query)
+                retrieved_chunks = chunks
+                confidence = conf
+                span.set_attribute("num_iterations", len(react._trace))
+                span.set_attribute("confidence", conf)
             trace["agent"] = {
                 "type": "ReAct",
                 "confidence": conf,
@@ -240,11 +257,14 @@ class AgenticOrchestrator:
             citations = self._extract_citations(chunks)
 
         elif complexity == QueryComplexity.COMPLEX:
-            # 路径 3c: 复杂查询 → Plan-and-Execute
-            plan_agent = self._get_plan_agent()
-            answer, conf, chunks = await plan_agent.run(search_query)
-            retrieved_chunks = chunks
-            confidence = conf
+            with tm.create_span("rag.agentic") as span:
+                span.set_attribute("agent_type", "PlanAndExecute")
+                plan_agent = self._get_plan_agent()
+                answer, conf, chunks = await plan_agent.run(search_query)
+                retrieved_chunks = chunks
+                confidence = conf
+                span.set_attribute("num_steps", len(plan_agent._trace))
+                span.set_attribute("confidence", conf)
             trace["agent"] = {
                 "type": "Plan-and-Execute",
                 "confidence": conf,
@@ -252,63 +272,59 @@ class AgenticOrchestrator:
             }
             citations = self._extract_citations(chunks)
 
-        elif complexity == QueryComplexity.BEYOND_KB:
-            # 路径 3d: 模型可直接回答 → 跳过检索
+        else:
             trace["retrieval"] = {"strategy": "skip", "reason": "beyond_kb"}
             answer, citations = await self._direct_generate(search_query)
             confidence = 0.9
 
-        else:
-            # 默认路径: 混合检索
-            if self._hybrid_search:
-                chunks, retrieval_context = await self._hybrid_search.search(search_query)
-                retrieved_chunks = chunks
-                mc.record_retrieval_latency(
-                    "total",
-                    retrieval_context.total_latency_ms / 1000,
-                    routing.confidence,
-                    len(chunks),
-                )
-                trace["retrieval"] = {
-                    "strategy": "hybrid",
-                    "latency_ms": retrieval_context.total_latency_ms,
-                    "num_chunks": len(chunks),
-                }
-                answer, citations = await self._generate_answer(search_query, chunks)
-            else:
-                answer = "无法处理此查询"
-                citations = []
-
-        # 步骤 4: Self-Reflection 验证（仅在有检索结果时）
+        # ---- self-reflection (仅在 COMPLEX 且低置信度时触发) ----
         gaps: list[str] = []
-        if retrieved_chunks and answer and self._llm:
-            reflection = SelfReflection(llm_client=self._llm.generator_client)
-            ref_result = await reflection.reflect(query, answer, retrieved_chunks)
-            if ref_result.overall_score < 0.6 and ref_result.revised_answer:
-                answer = ref_result.revised_answer
-            gaps = ref_result.gaps
-            mc.record_retrieval_latency(
-                "reflection",
-                0.0,
-                ref_result.overall_score,
-                None,
-            )
+        if (complexity == QueryComplexity.COMPLEX and routing.confidence < 0.7 and retrieved_chunks and answer and self._llm):
+            with tm.create_span("rag.self_reflection") as span:
+                reflection = SelfReflection(llm_client=self._llm.generator_client)
+                ref_result = await reflection.reflect(query, answer, retrieved_chunks)
+                if ref_result.overall_score < 0.6 and ref_result.revised_answer:
+                    answer = ref_result.revised_answer
+                gaps = ref_result.gaps
+                mc.record_retrieval_latency(
+                    "reflection",
+                    0.0,
+                    ref_result.overall_score,
+                    None,
+                )
+                span.set_attribute("score", ref_result.overall_score)
+                span.set_attribute("requires_correction", ref_result.requires_correction)
+            trace["reflection"] = {
+                "score": ref_result.overall_score,
+                "needs_correction": ref_result.requires_correction,
+                "gaps": gaps,
+            }
+        elif retrieved_chunks and answer and self._llm:
+            with tm.create_span("rag.self_reflection") as span:
+                reflection = SelfReflection(llm_client=self._llm.generator_client)
+                ref_result = await reflection.reflect(query, answer, retrieved_chunks)
+                if ref_result.overall_score < 0.6 and ref_result.revised_answer:
+                    answer = ref_result.revised_answer
+                gaps = ref_result.gaps
+                span.set_attribute("score", ref_result.overall_score)
+                span.set_attribute("requires_correction", ref_result.requires_correction)
+                span.set_attribute("skipped", False)
             trace["reflection"] = {
                 "score": ref_result.overall_score,
                 "needs_correction": ref_result.requires_correction,
                 "gaps": gaps,
             }
 
-        # 步骤 5: Memory Bank 更新
+        # ---- memory_bank ----
         if retrieved_chunks:
             self._memory_bank.add_evidence(retrieved_chunks)
             coverage = self._memory_bank.verify_coverage()
             trace["memory_bank"] = coverage
 
-        # 步骤 6: 置信度映射
+        # ---- confidence mapping ----
         conf_level = self._map_confidence(confidence)
 
-        # 步骤 7: 写入语义缓存
+        # ---- write cache ----
         if semantic_cache_fn and answer:
             await semantic_cache_fn(query, {
                 "answer": answer,
@@ -318,6 +334,10 @@ class AgenticOrchestrator:
 
         latency = (time.perf_counter() - start) * 1000
         trace["total_latency_ms"] = latency
+
+        with tm.create_span("rag.generation") as span:
+            span.set_attribute("llm_model", self._llm.generator_model if self._llm else "unknown")
+            span.set_attribute("answer_length", len(answer))
 
         return OrchestratorResult(
             answer=answer,
@@ -347,8 +367,7 @@ class AgenticOrchestrator:
         response = await self._llm.generate_async(prompt)
         llm_latency = time.perf_counter() - llm_start
 
-        mc = MetricsCollector()
-        mc.record_llm_latency(
+        self._metrics.record_llm_latency(
             self._llm.generator_model if self._llm else "unknown",
             llm_latency,
         )
