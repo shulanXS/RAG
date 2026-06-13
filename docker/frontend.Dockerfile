@@ -1,37 +1,33 @@
 # =============================================================================
-# Frontend Dockerfile — Vite + Vue 3
+# Frontend Dockerfile — Next.js + Node
 # =============================================================================
 FROM node:20-alpine AS builder
 
 WORKDIR /app
 
-# Copy dependency files
 COPY frontend/package.json frontend/package-lock.json* ./
-
-# Install dependencies
 RUN npm install
 
-# Copy source code
 COPY frontend/ ./
-
-# Build
 RUN npm run build
 
-# Production stage
-FROM nginx:alpine
+FROM node:20-alpine AS runner
 
-# Remove default nginx config
-RUN rm -rf /usr/share/nginx/html/*
+WORKDIR /app
 
-# Copy built assets
-COPY --from=builder /app/dist /usr/share/nginx/html
+ENV NODE_ENV=production
 
-# Copy custom nginx config
-COPY docker/nginx.conf /etc/nginx/conf.d/default.conf
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 nextjs
 
-EXPOSE 80
+COPY --from=builder --chown=nextjs:nodejs /app/public ./public
+COPY --from=builder --chown=nextjs:nodejs /app/.next/standalone ./
+COPY --from=builder --chown=nextjs:nodejs /app/.next/static ./.next/static
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget --no-verbose --tries=1 --spider http://localhost:80 || exit 1
+USER nextjs
 
-CMD ["nginx", "-g", "daemon off;"]
+EXPOSE 3000
+
+ENV PORT=3000
+
+CMD ["node", "server.js"]
