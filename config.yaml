@@ -233,6 +233,13 @@ evaluation:
   ci:
     fail_on_regression: true
     regression_threshold: 0.05  # 指标下降超过 5% 则失败
+  # Online Evaluation 配置
+  online:
+    enabled: true
+    latency_threshold_ms: 3000  # 高延迟 → 100% 采样
+    confidence_threshold: 0.6   # 低置信度 → 100% 采样
+    sample_rate: 0.1             # 高质量请求采样率
+    buffer_size: 100             # 评估缓冲区大小
 
 # --------------------------------------------------------------------------
 # 10. 日志与可观测性配置
@@ -246,3 +253,75 @@ logging:
     enabled: true
     log_retrieval_scores: true
     log_citation_mapping: true
+
+# --------------------------------------------------------------------------
+# 11. Query Expansion 配置 (Phase 1)
+# --------------------------------------------------------------------------
+query_expansion:
+  enabled: true
+  max_expansions: 5         # 最大扩展子查询数量
+  min_expansions: 1        # 最少扩展数量
+  use_deepseek: true       # 使用 DeepSeek 生成扩展查询
+
+# --------------------------------------------------------------------------
+# 12. HyDE 增强配置 (Phase 1)
+# --------------------------------------------------------------------------
+hyde:
+  enabled: true
+  max_hypotheses: 3         # 最大假设数量
+  confidence_threshold: 0.3  # 假设置信度阈值
+  use_deepseek: true        # 使用 DeepSeek 生成假设
+
+# --------------------------------------------------------------------------
+# 13. Intent Classification 配置 (Phase 1)
+# --------------------------------------------------------------------------
+intent_classification:
+  enabled: true
+  use_deepseek: true
+
+# --------------------------------------------------------------------------
+# 14. ColBERT 配置 (Phase 2)
+# --------------------------------------------------------------------------
+colbert:
+  enabled: false            # 默认关闭，需 GPU
+  model: "colbertv2/colbertv2.0"
+  device: "cuda"           # cuda | cpu
+  max_token: 512
+  normalize: true
+
+# --------------------------------------------------------------------------
+# 15. Parent Document Retrieval 配置 (Phase 2)
+# --------------------------------------------------------------------------
+parent_retriever:
+  enabled: false
+  parent_merge_tokens: 2000  # 父 chunk 最大 token 数
+  fusion_mode: "multiply"    # multiply | add | rrf
+  sibling_count: 3           # 每个 chunk 召回的同文档相关 chunks 数
+
+# --------------------------------------------------------------------------
+# 16. Sub-question Decomposition 配置 (Phase 3)
+# --------------------------------------------------------------------------
+subquestion_decomposer:
+  enabled: true
+  max_subquestions: 8
+  enable_dependency_analysis: true
+  use_deepseek: true
+
+# --------------------------------------------------------------------------
+# 17. Self-Reflection 配置 (Phase 3)
+# --------------------------------------------------------------------------
+self_reflection:
+  enabled: true
+  score_threshold: 0.6      # 低于此阈值需要修正
+  reflection_rounds: 2      # 最大反思轮数
+  use_deepseek: true
+
+# --------------------------------------------------------------------------
+# 18. Tool Registry 配置 (Phase 3)
+# --------------------------------------------------------------------------
+tool_registry:
+  enabled: true
+  tools:
+    - calculator
+    - datetime
+    # - web_search    # 未来扩展

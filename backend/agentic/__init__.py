@@ -18,8 +18,25 @@ from backend.agentic.react_agent import ReActAgent, ReActState
 from backend.agentic.plan_execute import PlanExecuteAgent, PlanState
 from backend.agentic.memory_bank import MemoryBank, Claim, Evidence
 from backend.agentic.orchestrator import AgenticOrchestrator, OrchestratorResult
+from backend.agentic.subquestion_decomposer import (
+    SubQuestionDecomposer,
+    SubQuestion,
+    SubQuestionType,
+    DecompositionResult,
+)
+from backend.agentic.self_reflection import (
+    SelfReflection,
+    ReflectionResult,
+    ReflectionCheck,
+)
+from backend.agentic.tool_registry import (
+    ToolRegistry,
+    ToolCall,
+    get_tool_registry,
+)
 
 __all__ = [
+    # Core
     "QueryComplexity",
     "QueryRouter",
     "ReActAgent",
@@ -31,4 +48,17 @@ __all__ = [
     "Evidence",
     "AgenticOrchestrator",
     "OrchestratorResult",
+    # Sub-question Decomposition
+    "SubQuestionDecomposer",
+    "SubQuestion",
+    "SubQuestionType",
+    "DecompositionResult",
+    # Self-Reflection
+    "SelfReflection",
+    "ReflectionResult",
+    "ReflectionCheck",
+    # Tool Use
+    "ToolRegistry",
+    "ToolCall",
+    "get_tool_registry",
 ]

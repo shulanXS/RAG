@@ -163,7 +163,10 @@ class PlanExecuteAgent:
                 return "finish"
             return "execute_step"
 
-        graph.add_conditional_edges("plan", route_plan, {"execute_step": "execute_step", "finish": "finish"})
+        graph.add_conditional_edges("plan", route_plan, {
+            "execute_step": "execute_step",
+            "finish": "finish",
+        })
         graph.add_conditional_edges("execute_step", route_step, {"execute_step": "execute_step", "finish": "finish"})
         graph.add_edge("finish", END)
 

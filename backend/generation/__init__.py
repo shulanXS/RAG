@@ -9,7 +9,27 @@ generation 模块 — 生成层
 
 from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
-from backend.generation.structured_output import StructuredOutputGenerator
+from backend.generation.structured_output import StructuredOutputGenerator, RAGStructuredOutput
 from backend.generation.streaming import LLMStreamer
+from backend.generation.grounded_generator import GroundedGenerator, GroundedResult, GroundedClaim
+from backend.generation.citation_generator import (
+    SentenceLevelCitationExtractor,
+    CitationGenerationResult,
+    SentencedAnswer,
+    SentenceSource,
+)
 
-__all__ = ["LLMClient", "PromptBuilder", "StructuredOutputGenerator", "LLMStreamer"]
+__all__ = [
+    "LLMClient",
+    "PromptBuilder",
+    "StructuredOutputGenerator",
+    "RAGStructuredOutput",
+    "LLMStreamer",
+    "GroundedGenerator",
+    "GroundedResult",
+    "GroundedClaim",
+    "SentenceLevelCitationExtractor",
+    "CitationGenerationResult",
+    "SentencedAnswer",
+    "SentenceSource",
+]
