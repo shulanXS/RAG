@@ -39,6 +39,7 @@ class ReActState(TypedDict, total=False):
     - retrieved_chunks: 本次迭代检索到的 chunks
     - reasoning: LLM 当前推理步骤
     - action: LLM 当前决定采取的行动
+    - next_query: 用于下一步检索的查询（从 LLM reasoning 中提取）
     - memory_bank_summary: Memory Bank 摘要
     - final_answer: 最终答案（当 action == "FINISH" 时）
     - confidence: 当前置信度
@@ -51,6 +52,7 @@ class ReActState(TypedDict, total=False):
     retrieved_chunks: list
     reasoning: str
     action: Literal["retrieve", "think", "finish", "error"]
+    next_query: str
     memory_bank_summary: str
     final_answer: str | None
     confidence: float
@@ -308,12 +310,13 @@ class ReActAgent:
 
         try:
             import json
-            response = self._llm.generate(prompt, max_tokens=512, temperature=0.1)
+            response = await self._llm.generate_async(prompt, max_tokens=512, temperature=0.1)
             parsed = json.loads(response.strip())
 
             action = parsed.get("action", "think")
             confidence = float(parsed.get("confidence", 0.5))
             reasoning = parsed.get("reasoning", "")
+            next_query = parsed.get("next_query", state.get("rewritten_query", state.get("query", "")))
 
             # 记录推理轨迹
             self._trace.append({
@@ -327,6 +330,7 @@ class ReActAgent:
                 "action": action,
                 "confidence": confidence,
                 "reasoning": reasoning,
+                "next_query": next_query,
                 "iterations": iters + 1,
                 "trace": self._trace,
             }
@@ -345,9 +349,8 @@ class ReActAgent:
         iters = state.get("iterations", 0)
         reasoning = state.get("reasoning", "")
 
-        # 从 reasoning 中提取检索查询
-        # 简化实现：直接用 rewritten_query
-        query = state.get("rewritten_query", state.get("query", ""))
+        # 使用 LLM 生成的 next_query 执行检索（而非固定用 rewritten_query）
+        query = state.get("next_query", state.get("rewritten_query", state.get("query", "")))
 
         try:
             chunks = await self._retrieve_fn(query)
@@ -386,7 +389,7 @@ class ReActAgent:
 """
 
         try:
-            answer = self._llm.generate(prompt, max_tokens=1024, temperature=0.3)
+            answer = await self._llm.generate_async(prompt, max_tokens=1024, temperature=0.3)
             return {"final_answer": answer}
         except Exception as e:
             logger.warning(f"生成节点异常: {e}")

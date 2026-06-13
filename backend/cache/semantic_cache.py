@@ -278,6 +278,11 @@ class RedisSemanticCache(SemanticCache if REDISVL_AVAILABLE else object):
             # 写入索引（带 TTL）
             await index.add(record)
 
+            # 设置 Redis TTL（redisvl key 格式为 {index_name}:{id}）
+            redis_client = self._get_client()
+            redis_key = f"{self._index_name}:{doc_id}"
+            redis_client.expire(redis_key, self._ttl_seconds)
+
             logger.debug(f"语义缓存写入: key={doc_id}, ttl={self._ttl_seconds}s")
 
         except Exception as e:

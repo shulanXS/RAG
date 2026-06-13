@@ -268,7 +268,7 @@ class RAGASEvaluator:
 """
         try:
             import json
-            response = self._llm.generate(prompt, max_tokens=256, temperature=0.1)
+            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
             data = json.loads(response.strip())
             score = float(data.get("score", 0.5))
             return RAGASResult(
@@ -303,7 +303,7 @@ class RAGASEvaluator:
 """
         try:
             import json
-            response = self._llm.generate(prompt, max_tokens=128, temperature=0.1)
+            response = await self._llm.generate_async(prompt, max_tokens=128, temperature=0.1)
             data = json.loads(response.strip())
             score = float(data.get("score", 0.5))
             return RAGASResult(
@@ -341,7 +341,7 @@ class RAGASEvaluator:
 """
         try:
             import json
-            response = self._llm.generate(prompt, max_tokens=256, temperature=0.1)
+            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
             data = json.loads(response.strip())
             scores = data.get("relevance_scores", [])
 
@@ -381,7 +381,7 @@ class RAGASEvaluator:
 """
         try:
             import json
-            response = self._llm.generate(prompt, max_tokens=256, temperature=0.1)
+            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
             data = json.loads(response.strip())
             score = float(data.get("score", 0.5))
             return RAGASResult(
@@ -416,7 +416,7 @@ class RAGASEvaluator:
 """
         try:
             import json
-            response = self._llm.generate(prompt, max_tokens=256, temperature=0.1)
+            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
             data = json.loads(response.strip())
             score = float(data.get("score", 0.5))
             return RAGASResult(

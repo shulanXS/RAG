@@ -137,18 +137,11 @@ class PlanExecuteConfig(BaseModel):
     max_subqueries_per_step: int = 3
 
 
-class MemoryBankConfig(BaseModel):
-    """Memory Bank 配置"""
-    max_claims: int = 50
-    ttl_hours: int = 24
-
-
 class AgenticConfig(BaseModel):
     """Agentic 编排配置"""
     complexity_threshold: float = 0.6
     react: ReActConfig = Field(default_factory=ReActConfig)
     plan_execute: PlanExecuteConfig = Field(default_factory=PlanExecuteConfig)
-    memory_bank: MemoryBankConfig = Field(default_factory=MemoryBankConfig)
 
 
 class SemanticCacheConfig(BaseModel):

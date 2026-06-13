@@ -16,10 +16,6 @@ from backend.retrieval.reranker import CrossEncoderReranker, CohereReranker, BGE
 from backend.retrieval.query_rewriter import QueryRewriter, QueryClassifier, QueryIntent, QueryType
 from backend.retrieval.hybrid_search import HybridSearchEngine
 from backend.retrieval.hyde import HyDEQueryEnhancer, HyDEHypothesis, HyDEResult
-from backend.retrieval.query_expander import QueryExpander, ExpandedQuery, ExpansionResult, QueryIntent as ExpansionIntent
-from backend.retrieval.colbert_retriever import ColBERTRetriever, ColBERTResult, ColBERTFusion
-from backend.retrieval.parent_retriever import ParentChunkRetriever, ParentChunkResult, build_parent_chunks
-
 __all__ = [
     # Core retrieval
     "BM25Retriever",
@@ -38,15 +34,4 @@ __all__ = [
     "HyDEQueryEnhancer",
     "HyDEHypothesis",
     "HyDEResult",
-    "QueryExpander",
-    "ExpandedQuery",
-    "ExpansionResult",
-    "ExpansionIntent",
-    # Advanced retrieval
-    "ColBERTRetriever",
-    "ColBERTResult",
-    "ColBERTFusion",
-    "ParentChunkRetriever",
-    "ParentChunkResult",
-    "build_parent_chunks",
 ]

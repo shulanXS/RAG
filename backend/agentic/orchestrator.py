@@ -4,12 +4,14 @@ orchestrator.py — 中央编排器
 技术决策记录:
 - 中央编排器统一调度 Router + ReAct + Plan-and-Execute 三层模式。
 - 从 Query Router 开始，根据复杂度决定走哪条路径。
-- Memory Bank 贯穿整个流程，累积 claim-evidence 链路。
 - 所有路径最终汇合到生成层（LLM Generation）。
+- Self-reflection 作为内部步骤内联，减少模块间依赖。
+- Memory Bank 简化为轻量级内联实现，移除 714 行的外部模块。
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass, field
@@ -18,15 +20,12 @@ from typing import Literal
 from backend.agentic.query_router import QueryComplexity, QueryRouter
 from backend.agentic.react_agent import ReActAgent
 from backend.agentic.plan_execute import PlanExecuteAgent
-from backend.agentic.memory_bank import MemoryBank
-from backend.agentic.self_reflection import SelfReflection
 from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
 from backend.generation.structured_output import StructuredOutputGenerator
 from backend.observability.metrics import MetricsCollector
 from backend.observability.tracing import TracingManager
 from backend.retrieval.hyde import HyDEQueryEnhancer
-from backend.retrieval.query_expander import QueryExpander
 
 logger = logging.getLogger(__name__)
 
@@ -58,30 +57,154 @@ class OrchestratorResult:
     cache_hit: bool = False
 
 
+# =============================================================================
+# 内联轻量级 Memory Bank（替代 714 行的外部模块）
+# =============================================================================
+
+
+@dataclass
+class EvidenceUnit:
+    source_id: str
+    text: str
+    doc_title: str = ""
+    section_path: str = ""
+    retrieval_score: float = 0.0
+    used_by_claims: list[str] = field(default_factory=list)
+
+
+class SimpleMemoryBank:
+    """
+    轻量级 Memory Bank — 仅保留核心引用追踪，移除 claim-evidence 链路
+    """
+    def __init__(self, session_id: str):
+        self._session_id = session_id
+        self._evidence: dict[str, EvidenceUnit] = {}
+
+    def add_evidence(self, chunks: list[dict]) -> list[str]:
+        evidence_ids = []
+        for chunk in chunks:
+            eid = f"ev_{chunk.get('chunk_id', '')}"
+            if eid not in self._evidence:
+                self._evidence[eid] = EvidenceUnit(
+                    source_id=chunk.get("chunk_id", ""),
+                    text=chunk.get("text", "")[:500],
+                    doc_title=chunk.get("doc_title", ""),
+                    section_path=chunk.get("section_path", ""),
+                    retrieval_score=chunk.get("rerank_score", chunk.get("rrf_score", 0.0)),
+                )
+            evidence_ids.append(eid)
+        return evidence_ids
+
+    def verify_coverage(self) -> dict:
+        used = set()
+        for ev in self._evidence.values():
+            used.update(ev.used_by_claims)
+        total = len(self._evidence)
+        return {
+            "total_chunks": total,
+            "used_chunks": len(used),
+            "coverage": len(used) / total if total > 0 else 1.0,
+        }
+
+
+# =============================================================================
+# 内联 Self-Reflection（替代独立的 364 行模块）
+# =============================================================================
+
+
+_REFLECTION_PROMPT = """你是一个答案质量审查专家。请对以下答案进行严格检查。
+
+用户问题: {query}
+
+检索到的上下文:
+{context}
+
+初始答案:
+{answer}
+
+请以 JSON 格式输出:
+{{
+  "overall_score": 0.0-1.0,
+  "needs_more_retrieval": true|false,
+  "requires_correction": true|false,
+  "gaps": ["缺口1", "缺口2"],
+  "hallucinated_claims": ["幻觉陈述1"]
+}}"""
+
+
+async def _do_reflection(
+    llm_client,
+    query: str,
+    answer: str,
+    contexts: list[dict],
+) -> tuple[float, list[str], str, bool]:
+    """
+    内联自我反思：评估答案质量，返回 (score, gaps, revised_answer, needs_correction)
+    """
+    if not contexts or not answer:
+        return 0.5, [], answer, False
+
+    ctx_text = "\n".join(
+        f"[{i+1}] {c.get('text', '')[:300]}"
+        for i, c in enumerate(contexts[:10])
+    )
+
+    prompt = _REFLECTION_PROMPT.format(
+        query=query,
+        context=ctx_text,
+        answer=answer,
+    )
+
+    try:
+        response = await llm_client.generate_async(prompt, max_tokens=512, temperature=0.1)
+        data = json.loads(response.strip())
+        score = float(data.get("overall_score", 0.5))
+        needs_correction = data.get("requires_correction", False)
+        gaps = data.get("gaps", [])
+
+        revised = answer
+        if needs_correction and score < 0.5:
+            revise_prompt = f"""基于以下审查意见修正答案。
+
+原始问题: {query}
+原答案: {answer}
+
+审查发现的问题: {', '.join(gaps[:3])}
+
+上下文: {ctx_text}
+
+要求: 只基于上下文修正，不要引入外部知识。如有无法回答的方面，明确标注。
+
+修正后的答案:"""
+            revised = await llm_client.generate_async(revise_prompt, max_tokens=1024, temperature=0.2)
+
+        return score, gaps, revised, needs_correction
+    except Exception as e:
+        logger.warning(f"Self-reflection failed: {e}")
+        return 0.5, [], answer, False
+
+
+# =============================================================================
+# 中央编排器
+# =============================================================================
+
+
 class AgenticOrchestrator:
     """
     中央编排器 — 统一调度 Agentic RAG 全流程
 
     执行流程:
     ┌─────────────────────────────────────────────────────────────┐
-    │  1. Query Rewrite (多轮对话改写)                           │
-    │  2. Query Router (复杂度分类 → 决定路径)                     │
-    │  3a. Simple → HybridSearchEngine → 生成                      │
-    │  3b. Moderate → ReAct Agent → 生成                          │
-    │  3c. Complex → Plan-and-Execute → 生成                      │
-    │  3d. Beyond KB → Direct LLM → 生成                          │
-    │  4. Memory Bank → Claim-Evidence 链接                       │
-    │  5. Structured Output → JSON 约束输出                       │
+    │  1. 语义缓存检查                                           │
+    │  2. Query Rewrite (多轮对话改写)                           │
+    │  3. Query Router (复杂度分类 → 决定路径)                     │
+    │  4a. Simple   → HybridSearchEngine → 生成                    │
+    │  4b. Moderate  → ReAct Agent      → 生成                    │
+    │  4c. Complex   → Plan-and-Execute → 生成                    │
+    │  4d. Beyond KB → Direct LLM       → 生成                    │
+    │  5. Self-Reflection (内联)                                │
+    │  6. 引用提取                                                │
     └─────────────────────────────────────────────────────────────┘
-
-    设计模式: Facade Pattern
-    - 对外提供单一入口（run()），隐藏内部复杂度
-    - 内部委托给 Router、Agent、MemoryBank 等组件
-
-    技术要点:
-    - 所有复杂度级别共用 Memory Bank（累积证据）
-    - 语义缓存检查在路由之前执行（最快路径）
-    - 路由决策记录在 trace 中（用于评估和 debug）
     """
 
     def __init__(
@@ -89,14 +212,14 @@ class AgenticOrchestrator:
         hybrid_search_engine=None,
         router: QueryRouter | None = None,
         llm_client: LLMClient | None = None,
-        memory_bank_session_id: str = "default",
+        session_id: str = "default",
     ):
         self._hybrid_search = hybrid_search_engine
         self._router = router or QueryRouter()
         self._llm = llm_client
         self._prompt_builder = PromptBuilder()
         self._structured_output = StructuredOutputGenerator()
-        self._memory_bank = MemoryBank(session_id=memory_bank_session_id)
+        self._memory_bank = SimpleMemoryBank(session_id=session_id)
         self._metrics = MetricsCollector()
         self._tracing = TracingManager()
 
@@ -132,17 +255,6 @@ class AgenticOrchestrator:
         conversation_history: list[dict] | None = None,
         semantic_cache_fn=None,
     ) -> OrchestratorResult:
-        """
-        执行完整的 Agentic RAG 流程
-
-        Args:
-            query: 用户查询
-            conversation_history: 对话历史（用于 query rewriting）
-            semantic_cache_fn: 语义缓存查询函数
-
-        Returns:
-            OrchestratorResult: 包含答案、引用、置信度等
-        """
         start = time.perf_counter()
         trace: dict = {}
         cache_hit = False
@@ -205,7 +317,7 @@ class AgenticOrchestrator:
             "approach": routing.recommended_approach,
         }
 
-        # ---- HyDE + retrieval ----
+        # ---- HyDE (仅 COMPLEX 复杂度) ----
         search_query = display_query
         if complexity == QueryComplexity.COMPLEX and self._llm:
             if self._llm.generator_client:
@@ -218,6 +330,7 @@ class AgenticOrchestrator:
         retrieved_chunks: list[dict] = []
         answer: str = ""
         confidence: float = routing.confidence
+        citations: list[dict] = []
 
         if complexity == QueryComplexity.SIMPLE:
             if self._hybrid_search:
@@ -277,41 +390,21 @@ class AgenticOrchestrator:
             answer, citations = await self._direct_generate(search_query)
             confidence = 0.9
 
-        # ---- self-reflection (仅在 COMPLEX 且低置信度时触发) ----
+        # ---- self-reflection (内联，仅在有检索结果且非 BEYOND_KB 时触发) ----
         gaps: list[str] = []
-        if (complexity == QueryComplexity.COMPLEX and routing.confidence < 0.7 and retrieved_chunks and answer and self._llm):
+        if retrieved_chunks and answer and self._llm and self._llm.generator_client:
             with tm.create_span("rag.self_reflection") as span:
-                reflection = SelfReflection(llm_client=self._llm.generator_client)
-                ref_result = await reflection.reflect(query, answer, retrieved_chunks)
-                if ref_result.overall_score < 0.6 and ref_result.revised_answer:
-                    answer = ref_result.revised_answer
-                gaps = ref_result.gaps
-                mc.record_retrieval_latency(
-                    "reflection",
-                    0.0,
-                    ref_result.overall_score,
-                    None,
+                score, gaps, revised, needs_correction = await _do_reflection(
+                    self._llm.generator_client, query, answer, retrieved_chunks
                 )
-                span.set_attribute("score", ref_result.overall_score)
-                span.set_attribute("requires_correction", ref_result.requires_correction)
+                if needs_correction and score < 0.5:
+                    answer = revised
+                confidence = score
+                span.set_attribute("score", score)
+                span.set_attribute("needs_correction", needs_correction)
             trace["reflection"] = {
-                "score": ref_result.overall_score,
-                "needs_correction": ref_result.requires_correction,
-                "gaps": gaps,
-            }
-        elif retrieved_chunks and answer and self._llm:
-            with tm.create_span("rag.self_reflection") as span:
-                reflection = SelfReflection(llm_client=self._llm.generator_client)
-                ref_result = await reflection.reflect(query, answer, retrieved_chunks)
-                if ref_result.overall_score < 0.6 and ref_result.revised_answer:
-                    answer = ref_result.revised_answer
-                gaps = ref_result.gaps
-                span.set_attribute("score", ref_result.overall_score)
-                span.set_attribute("requires_correction", ref_result.requires_correction)
-                span.set_attribute("skipped", False)
-            trace["reflection"] = {
-                "score": ref_result.overall_score,
-                "needs_correction": ref_result.requires_correction,
+                "score": score,
+                "needs_correction": needs_correction,
                 "gaps": gaps,
             }
 

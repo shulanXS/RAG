@@ -359,28 +359,6 @@ class LLMClient:
         else:
             raise ValueError(f"不支持的 LLM provider: {provider}")
 
-    def _call_with_breaker(
-        self,
-        breaker,
-        client: LLMBackend,
-        prompt: str,
-        structured_schema: dict | None = None,
-        **kwargs,
-    ) -> str:
-        """通过熔断器调用 LLM，自动注入 metrics collector"""
-        kwargs["structured_schema"] = structured_schema
-        kwargs["_metrics_collector"] = self._metrics
-
-        def _call():
-            return client.generate(prompt, **kwargs)
-
-        async def _call_async():
-            return await client.generate_async(prompt, **kwargs)
-
-        if asyncio.iscoroutinefunction(client.generate_async):
-            return asyncio.run(_call_async())
-        return _call()
-
     async def generate_async(
         self,
         prompt: str,
