@@ -2,6 +2,9 @@
 prompt_builder.py — Prompt 模板与上下文组装
 ================================================================================
 技术决策记录:
+- P2 阶段：prompt 内容从代码搬到 prompts/v{version}.yaml，git-tracked。
+  PromptBuilder 在构造时 load_prompts()，version 由 PROMPT_VERSION 控制。
+  prompt_hash 暴露给 trace，CI 跑 eval 时记录"prompt 改了 → NDCG 涨/跌"。
 - 引用标注格式: 在 Prompt 中明确要求每个关键陈述附带引用标记。
 - 置信度评估: 让 LLM 对答案的置信度做自评（high/medium/low/insufficient）。
 - 信息缺口识别: 要求 LLM 识别「检索结果中缺失但问题可能需要的信息」。
@@ -10,7 +13,9 @@ prompt_builder.py — Prompt 模板与上下文组装
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
+
+from prompts import load_prompts, get_prompt_hash
 
 
 class PromptBuilder:
@@ -21,6 +26,7 @@ class PromptBuilder:
     - build_context(): 将检索到的 chunks 组装为带引用标注的上下文
     - build_prompt(): 将用户查询和上下文组装为完整的 LLM Prompt
     - 引用格式: [来源: doc_id / section_path]
+    - P2: prompt 文本从 prompts/v{version}.yaml 加载，便于 review/diff/rollback
 
     提示词设计原则:
     1. 角色定义: 明确 AI 的角色和职责
@@ -29,20 +35,20 @@ class PromptBuilder:
     4. 约束条件: 不要编造、不要超出上下文范围
     """
 
-    SYSTEM_PROMPT = """你是一个企业知识助手。你将基于检索到的上下文信息回答用户问题。
-
-核心原则:
-1. **忠实性**: 只使用上下文中的信息回答，不要编造或引入新信息
-2. **可溯源性**: 每个关键陈述必须标注来源
-3. **诚实性**: 如果上下文信息不足以回答，明确说明
-4. **简洁性**: 直接回答，不要重复问题或无效信息
-
-输出格式要求:
-- 如果提供 JSON Schema，使用该 Schema 输出
-- 否则以自然语言输出，确保每个关键信息有来源标注"""
-
     def __init__(self):
-        self._system_prompt = self.SYSTEM_PROMPT
+        prompts, self._prompt_hash = load_prompts(), get_prompt_hash(load_prompts())
+        self._system_prompt = prompts.get("system", "").strip()
+        self._requirements = prompts.get("requirements", {}) or {}
+        self._structured_template = prompts.get("structured_template", "").strip()
+        self._prompt_version = prompts.get("version", "unknown")
+
+    @property
+    def prompt_version(self) -> str:
+        return self._prompt_version
+
+    @property
+    def prompt_hash(self) -> str:
+        return self._prompt_hash
 
     def build_context(self, chunks: list[dict]) -> str:
         """
@@ -101,20 +107,9 @@ class PromptBuilder:
         # 构建回答要求
         requirements = []
         if require_citations:
-            requirements.append(
-                "回答要求:\n"
-                "1. 每个关键陈述必须标注来源，格式: [来源序号]\n"
-                "2. 如果信息不足以回答，明确说明「基于提供的信息无法回答此问题」\n"
-                "3. 不要编造信息，不要超出上下文范围"
-            )
+            requirements.append(self._requirements.get("with_citations", "").strip())
         if require_confidence:
-            requirements.append(
-                "\n4. 对你的回答做一个置信度评估:\n"
-                "   - high: 上下文充分支持，答案可靠\n"
-                "   - medium: 上下文部分支持，可能有遗漏\n"
-                "   - low: 上下文支持不足，需要更多信息\n"
-                "   - insufficient: 上下文完全不包含答案所需信息"
-            )
+            requirements.append(self._requirements.get("with_confidence", "").strip())
 
         prompt_parts.append("\n\n" + "\n".join(requirements))
 
@@ -134,7 +129,8 @@ class PromptBuilder:
         - 在 Prompt 中明确 JSON 输出格式
         - 适用于需要机器可解析输出的场景（API、自动化流程）
         """
-        prompt = f"""你是一个企业知识助手。请基于以下检索到的上下文信息回答用户问题。
+        if not self._structured_template:
+            prompt = f"""你是一个企业知识助手。请基于以下检索到的上下文信息回答用户问题。
 
 [检索到的上下文]
 {context}
@@ -148,7 +144,13 @@ class PromptBuilder:
 
 JSON 输出（不要包含任何非 JSON 内容）:
 """
-        return prompt
+            return prompt
+
+        return self._structured_template.format(
+            context=context,
+            query=query,
+            schema=self._format_schema(output_schema),
+        )
 
     @staticmethod
     def _format_schema(schema: dict, indent: int = 0) -> str:

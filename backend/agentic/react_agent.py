@@ -61,6 +61,75 @@ class ReActState(TypedDict, total=False):
 
 
 # =============================================================================
+# 1b. LangGraph stream event adapter
+# =============================================================================
+
+
+async def _iter_langgraph_events(stream):
+    """
+    把 LangGraph astream 输出转换为统一的 agentic event dict，
+    并在迭代结束后通过 _last_state_marker 事件暴露最终 state。
+
+    LangGraph 0.2+ 的 astream() yield (node_name, state_dict) 元组。
+    """
+    NODE_TO_STEP = {
+        "think": "thought",
+        "act": "action",
+        "observe": "observation",
+        "retrieve": "action",
+        "finish": "final",
+        "max_iter": "final",
+    }
+
+    last_state: dict | None = None
+
+    try:
+        async for chunk in stream:
+            if not isinstance(chunk, tuple) or len(chunk) < 2:
+                continue
+            node_name, state = chunk[0], chunk[1]
+            last_state = state if isinstance(state, dict) else None
+            step_type = NODE_TO_STEP.get(str(node_name), "thought")
+
+            iteration = state.get("iterations", 0) if isinstance(state, dict) else 0
+            content = ""
+            confidence = 0.0
+            reasoning = ""
+            if isinstance(state, dict):
+                if step_type == "thought":
+                    content = str(state.get("reasoning", ""))
+                    reasoning = content
+                elif step_type == "action":
+                    content = f"action={state.get('action', '?')}, next_query={state.get('next_query', '')}"
+                elif step_type == "observation":
+                    content = f"retrieved {len(state.get('retrieved_chunks', []))} chunks"
+                elif step_type == "final":
+                    content = str(state.get("final_answer") or "")
+                confidence = float(state.get("confidence", 0.0))
+
+            yield {
+                "stage": "agentic",
+                "step_type": step_type,
+                "content": content,
+                "iteration": iteration,
+                "confidence": confidence,
+                "done": True,
+                "is_last": False,
+                "_trace_entry": {
+                    "iteration": iteration,
+                    "step_type": step_type,
+                    "reasoning": reasoning,
+                    "confidence": confidence,
+                },
+            }
+    except TypeError:
+        return
+
+    # 用一个内部 sentinel event 暴露 last_state，让 run_stream 能拿到 final_answer
+    yield {"_last_state_marker": last_state}
+
+
+# =============================================================================
 # 2. ReAct Prompt Templates
 # =============================================================================
 
@@ -68,28 +137,29 @@ REACT_SYSTEM_PROMPT = """你是一个企业知识助手的推理引擎。
 
 你的任务是通过迭代推理和检索，回答用户问题。
 
-可用工具:
-- retrieve(query): 检索相关文档片段
-  输入: 检索查询字符串
-  输出: 相关文档片段列表
+可用工具 (你可以选择调用以下任意一个):
+{tool_schemas}
 
 推理模式:
 1. think: 分析当前状态，决定下一步行动
-2. retrieve: 调用检索工具，获取相关上下文
-3. finish: 当置信度足够高时，生成最终答案
+2. retrieve: 调用 retrieve 工具，从知识库获取相关上下文
+3. tool_call: 调用 calculator / datetime / web_search 等其他工具
+4. finish: 当置信度足够高时，生成最终答案
 
 输出格式 (JSON):
-{
+{{
   "reasoning": "你的推理过程",
-  "action": "think|retrieve|finish",
+  "action": "think|retrieve|tool_call|finish",
+  "tool_name": "如果 action=tool_call，工具名称（calculator/datetime/web_search）",
+  "tool_args": {{"如果 action=tool_call，工具参数"}},
   "next_query": "如果 action=retrieve，输入检索查询",
   "confidence": 0.0-1.0,
   "answer": "如果 action=finish，输入最终答案"
-}
+}}
 
 约束:
 - 最多执行 {max_iterations} 次迭代
-- 每次迭代最多检索一次
+- 每次迭代最多执行一个工具
 - 如果置信度 >= {early_stop_threshold}，立即生成答案
 - 如果迭代次数耗尽仍未达到置信度阈值，给出当前最佳答案并说明局限性
 """
@@ -166,6 +236,7 @@ class ReActAgent:
         retrieval_fn=None,
         max_iterations: int = 5,
         early_stop_threshold: float = 0.85,
+        tool_registry=None,
     ):
         """
         Args:
@@ -173,11 +244,13 @@ class ReActAgent:
             retrieval_fn: 检索函数，签名为 async def(query) -> list[chunks]
             max_iterations: 最大迭代次数
             early_stop_threshold: 置信度阈值，达到此值则提前退出
+            tool_registry: ToolRegistry 实例 (P2.4: 真接入多工具)
         """
         self._llm = llm_client
         self._retrieve_fn = retrieval_fn
         self._max_iters = max_iterations
         self._early_stop = early_stop_threshold
+        self._tool_registry = tool_registry
 
         self._current_chunks: list[dict] = []
         self._trace: list[dict] = []
@@ -204,6 +277,7 @@ class ReActAgent:
         # 添加节点
         graph.add_node("think", self._think_node)
         graph.add_node("retrieve", self._retrieve_node)
+        graph.add_node("tool", self._tool_node)
         graph.add_node("finish", self._finish_node)
         graph.add_node("max_iter", self._max_iter_node)
 
@@ -211,7 +285,7 @@ class ReActAgent:
         graph.set_entry_point("think")
 
         # 条件边: think → ?
-        def route_action(state: ReActState) -> Literal["retrieve", "finish", "max_iter"]:
+        def route_action(state: ReActState) -> Literal["retrieve", "tool", "finish", "max_iter"]:
             action = state.get("action", "think")
             iters = state.get("iterations", 0)
 
@@ -219,6 +293,8 @@ class ReActAgent:
                 return "finish"
             elif action == "retrieve" and iters < self._max_iters:
                 return "retrieve"
+            elif action == "tool_call" and iters < self._max_iters:
+                return "tool"
             elif iters >= self._max_iters:
                 return "max_iter"
             else:
@@ -229,6 +305,7 @@ class ReActAgent:
             route_action,
             {
                 "retrieve": "retrieve",
+                "tool": "tool",
                 "finish": "finish",
                 "max_iter": "max_iter",
                 "think": "think",  # 如果 action=think，继续 think
@@ -237,6 +314,7 @@ class ReActAgent:
 
         # 固定边
         graph.add_edge("retrieve", "think")
+        graph.add_edge("tool", "think")
         graph.add_edge("max_iter", "finish")
         graph.add_edge("finish", END)
 
@@ -287,6 +365,99 @@ class ReActAgent:
 
         return final_answer, confidence, all_chunks
 
+    async def run_stream(self, query: str, rewritten_query: str = ""):
+        """
+        流式执行 ReAct Agent，逐步 yield 推理事件。
+
+        Yields:
+            dict: 事件负载，至少包含
+                - "stage": "agentic"
+                - "step_type": "thought" | "action" | "observation" | "final"
+                - "content": 文本内容
+                - "iteration": 当前迭代轮次
+                - "done": 是否为该迭代的最后一个事件
+                - "is_last": 是否为整个 Agent 流程的最后一步
+        """
+        self._current_chunks = []
+        self._trace = []
+
+        if rewritten_query:
+            display_query = rewritten_query
+        else:
+            display_query = query
+
+        initial_state: ReActState = {
+            "query": query,
+            "rewritten_query": rewritten_query or query,
+            "iterations": 0,
+            "retrieved_chunks": [],
+            "reasoning": "",
+            "action": "think",
+            "memory_bank_summary": "",
+            "final_answer": None,
+            "confidence": 0.0,
+            "error": None,
+            "trace": [],
+        }
+
+        # 用 LangGraph 的 astream() 捕获节点级事件；
+        # 若 LangGraph 版本不支持，则回退到 invoke。
+        last_state: dict | None = None
+        try:
+            if hasattr(self._compiled_graph, "astream"):
+                # astream() 在节点完成后 yield 状态，可用 step 类型过滤
+                stream = self._compiled_graph.astream(initial_state)
+            else:
+                # 回退路径：执行 invoke 一次，从结果 state 构造 final 事件
+                result = await self._compiled_graph.ainvoke(initial_state)
+                last_state = result if isinstance(result, dict) else None
+                stream = iter([])
+
+            async for event in _iter_langgraph_events(stream):
+                # 处理内部 sentinel
+                if "_last_state_marker" in event:
+                    last_state = event["_last_state_marker"]
+                    continue
+                # 累积 trace
+                trace_entry = event.pop("_trace_entry", None)
+                if trace_entry:
+                    self._trace.append(trace_entry)
+                # 用户可见事件：去掉内部字段后 yield
+                yield event
+        except Exception as e:
+            logger.error(f"ReAct 流式执行异常: {e}")
+            yield {
+                "stage": "agentic",
+                "step_type": "error",
+                "content": f"Agent 流式执行失败: {e}",
+                "iteration": 0,
+                "done": True,
+                "is_last": True,
+            }
+            return
+
+        # 最终汇总事件：从 last_state 拿 final_answer，从 self._trace 拿迭代信息
+        final_answer = ""
+        if isinstance(last_state, dict):
+            final_answer = str(last_state.get("final_answer") or "")
+        elif self._trace:
+            # 极端 fallback：trace 最后一条的 reasoning
+            final_answer = self._trace[-1].get("reasoning", "") or ""
+
+        last_iteration = self._trace[-1].get("iteration", 0) if self._trace else 0
+        last_confidence = self._trace[-1].get("confidence", 0.0) if self._trace else 0.0
+
+        yield {
+            "stage": "agentic",
+            "step_type": "final",
+            "content": final_answer,
+            "iteration": last_iteration,
+            "confidence": last_confidence,
+            "done": True,
+            "is_last": True,
+            "num_iterations": len(self._trace),
+        }
+
     async def _think_node(self, state: ReActState) -> dict:
         """
         推理节点: LLM 分析当前状态，决定下一步行动
@@ -298,6 +469,20 @@ class ReActAgent:
         iters = state.get("iterations", 0)
         context = self._format_context(state.get("retrieved_chunks", []))
 
+        # P2.4: 动态注入 ToolRegistry 的 schema
+        if self._tool_registry is not None:
+            try:
+                import json
+                tool_schemas = json.dumps(
+                    self._tool_registry.get_tool_schemas(),
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            except Exception:
+                tool_schemas = "(tool schemas unavailable)"
+        else:
+            tool_schemas = "- retrieve(query): 检索知识库"
+
         user_prompt = REACT_USER_PROMPT.format(
             query=state.get("rewritten_query", state.get("query", "")),
             iterations=iters,
@@ -306,7 +491,7 @@ class ReActAgent:
             context=context or "(暂无上下文，请检索)",
         )
 
-        prompt = f"{REACT_SYSTEM_PROMPT.format(max_iterations=self._max_iters, early_stop_threshold=self._early_stop)}\n\n{user_prompt}"
+        prompt = f"{REACT_SYSTEM_PROMPT.format(max_iterations=self._max_iters, early_stop_threshold=self._early_stop, tool_schemas=tool_schemas)}\n\n{user_prompt}"
 
         try:
             import json
@@ -317,6 +502,8 @@ class ReActAgent:
             confidence = float(parsed.get("confidence", 0.5))
             reasoning = parsed.get("reasoning", "")
             next_query = parsed.get("next_query", state.get("rewritten_query", state.get("query", "")))
+            tool_name = parsed.get("tool_name", "")
+            tool_args = parsed.get("tool_args", {}) or {}
 
             # 记录推理轨迹
             self._trace.append({
@@ -324,6 +511,7 @@ class ReActAgent:
                 "action": action,
                 "reasoning": reasoning,
                 "confidence": confidence,
+                "tool_name": tool_name,
             })
 
             return {
@@ -331,6 +519,8 @@ class ReActAgent:
                 "confidence": confidence,
                 "reasoning": reasoning,
                 "next_query": next_query,
+                "tool_name": tool_name,
+                "tool_args": tool_args,
                 "iterations": iters + 1,
                 "trace": self._trace,
             }
@@ -364,6 +554,33 @@ class ReActAgent:
         except Exception as e:
             logger.warning(f"检索节点异常: {e}")
             return {"error": str(e)}
+
+    async def _tool_node(self, state: ReActState) -> dict:
+        """
+        P2.4: 工具执行节点 - 调用 calculator / datetime / web_search 等
+        """
+        if self._tool_registry is None:
+            return {"reasoning": state.get("reasoning", "") + "\n[no tool registry]"}
+        tool_name = state.get("tool_name", "")
+        tool_args = state.get("tool_args", {})
+        if not tool_name:
+            return {"reasoning": state.get("reasoning", "") + "\n[tool_name missing]"}
+        try:
+            result = await self._tool_registry.execute_by_name(tool_name, tool_args)
+            obs = result.result if result.success else f"ERROR: {result.error}"
+            obs_text = (
+                f"Tool {tool_name} → {obs}" if not isinstance(obs, str)
+                else f"Tool {tool_name} → {obs[:500]}"
+            )
+            # 累积到 memory_bank_summary 让 LLM 在后续 think 时能看到
+            prev = state.get("memory_bank_summary", "")
+            return {
+                "memory_bank_summary": (prev + "\n" + obs_text).strip(),
+                "reasoning": state.get("reasoning", "") + f"\n[tool: {tool_name}]",
+            }
+        except Exception as e:
+            logger.warning(f"工具执行异常: {tool_name}: {e}")
+            return {"reasoning": state.get("reasoning", "") + f"\n[tool error: {e}]"}
 
     async def _finish_node(self, state: ReActState) -> dict:
         """生成节点: 基于收集的上下文生成最终答案"""

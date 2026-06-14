@@ -243,8 +243,51 @@ class OnlineEvaluator:
         self._sample_buffer.clear()
 
     def _persist_samples(self, samples: list[EvaluationSample]):
-        """写入存储（可扩展为数据库/API）"""
-        pass
+        """
+        写入存储（P2.3: 用 SQLite 持久化，跨进程可见）。
+        覆盖之前空实现 (online_evaluator.py:245)。
+        """
+        if not samples:
+            return
+        try:
+            from backend.evaluation.eval_store import get_eval_store
+
+            store = get_eval_store()
+            run_id = f"online_{datetime.utcnow().strftime('%Y%m%d_%H%M%S')}"
+            store.save_run(
+                run_id=run_id,
+                started_at=datetime.utcnow().isoformat(),
+                ended_at=datetime.utcnow().isoformat(),
+                total_cases=len(samples),
+                passed_cases=sum(1 for s in samples if s.ragas_result and s.ragas_result.get("overall_pass", False)),
+                avg_faithfulness=0.0,
+                avg_answer_relevancy=0.0,
+                avg_context_precision=0.0,
+                avg_context_recall=0.0,
+                avg_answer_correctness=0.0,
+                weakest_metric="",
+                metadata={"source": "online_evaluator"},
+            )
+            sample_dicts = []
+            for s in samples:
+                m = (s.ragas_result or {}).get("metrics", {})
+                sample_dicts.append({
+                    "sample_id": s.sample_id,
+                    "timestamp": s.timestamp,
+                    "query": s.query,
+                    "answer": s.answer,
+                    "faithfulness": m.get("faithfulness", {}).get("score", 0.0),
+                    "answer_relevancy": m.get("answer_relevancy", {}).get("score", 0.0),
+                    "context_precision": m.get("context_precision", {}).get("score", 0.0),
+                    "context_recall": m.get("context_recall", {}).get("score", 0.0),
+                    "answer_correctness": m.get("answer_correctness", {}).get("score", 0.0),
+                    "overall_pass": (s.ragas_result or {}).get("overall_pass", False),
+                    "latency_ms": s.latency_ms,
+                })
+            store.save_samples(run_id, sample_dicts)
+            logger.info(f"在线评估已持久化: run_id={run_id}, samples={len(sample_dicts)}")
+        except Exception as e:
+            logger.warning(f"_persist_samples 失败（已忽略）: {e}")
 
     def get_quality_dashboard(
         self,

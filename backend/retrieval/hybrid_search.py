@@ -26,13 +26,16 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
 
 from backend.ingestion.embedder import Embedder
 from backend.retrieval.bm25_retriever import BM25Retriever
 from backend.retrieval.fusion import RRFFusion, FusionResult
 from backend.retrieval.reranker import CrossEncoderReranker, get_reranker
 from backend.retrieval.vector_retriever import VectorRetriever
+
+if TYPE_CHECKING:
+    from backend.security.tenant import TenantContext
 
 logger = logging.getLogger(__name__)
 
@@ -130,6 +133,7 @@ class HybridSearchEngine:
         rrf_k: int = 60,
         bm25_weight: float = 0.5,
         dense_weight: float = 0.5,
+        bm25_mode: str = "qdrant_sparse",
     ):
         self._embedder = embedder
         self._vector_retriever = vector_retriever
@@ -139,6 +143,7 @@ class HybridSearchEngine:
         self._rrf_fusion = RRFFusion(k=rrf_k)
         self._bm25_weight = bm25_weight
         self._dense_weight = dense_weight
+        self._bm25_mode = bm25_mode
 
     @classmethod
     def from_config(cls, config, embedder: Embedder) -> "HybridSearchEngine":
@@ -149,6 +154,9 @@ class HybridSearchEngine:
         - 工厂方法模式：从 config 对象构建实例，避免在 __init__ 中
           直接依赖全局 config（隐式耦合）。
         - Reranker 懒加载：默认使用 Cohere Rerank 3.5，可配置切换。
+        - BM25 路径根据 config.vector_db.bm25_mode 决定：
+            * "qdrant_sparse": 服务端融合，无需外部 BM25Retriever
+            * "external":  保留 rank_bm25 + 应用层 RRF 融合
         """
         vector_retriever = VectorRetriever(
             url=config.vector_db.url,
@@ -157,16 +165,19 @@ class HybridSearchEngine:
             distance=config.vector_db.distance,
         )
 
-        # BM25 Retriever（可选，Qdrant native sparse vector 可能已覆盖）
+        # BM25 Retriever：仅在 external 模式下需要
         bm25_retriever = None
-        try:
-            bm25_retriever = BM25Retriever(
-                language="mixed",
-                k1=config.vector_db.sparse_k1,
-                b=config.vector_db.sparse_b,
-            )
-        except ImportError:
-            logger.warning("BM25 retriever 不可用（rank-bm25 未安装）")
+        if config.vector_db.bm25_mode == "external":
+            try:
+                bm25_retriever = BM25Retriever(
+                    language="mixed",
+                    k1=config.vector_db.sparse_k1,
+                    b=config.vector_db.sparse_b,
+                )
+            except ImportError:
+                logger.warning("BM25 retriever 不可用（rank-bm25 未安装）")
+        else:
+            logger.info("BM25 mode=qdrant_sparse: 使用 Qdrant 原生 sparse vector，跳过外部 BM25Retriever")
 
         # Reranker（默认 Cohere，可配置为 BGE 本地）
         reranker = None
@@ -186,6 +197,7 @@ class HybridSearchEngine:
             rrf_k=config.hybrid_search.rrf_k,
             bm25_weight=config.hybrid_search.bm25_weight,
             dense_weight=config.hybrid_search.dense_weight,
+            bm25_mode=config.vector_db.bm25_mode,
         )
 
     async def search(
@@ -193,6 +205,7 @@ class HybridSearchEngine:
         query: str,
         query_vector: list[float] | None = None,
         acl_filter: dict | None = None,
+        tenant: "TenantContext | str | None" = None,
     ) -> tuple[list[dict], RetrievalContext]:
         """
         执行混合检索
@@ -201,14 +214,30 @@ class HybridSearchEngine:
             query: 用户查询文本
             query_vector: 可选，预计算的 query embedding（如已缓存）
             acl_filter: 可选，ACL 过滤条件
+            tenant: 可选，租户上下文（TenantContext 或 str tenant_id）。
+                    传入后会自动注入 tenant_id 过滤条件，
+                    与 acl_filter 通过 AND 组合，确保跨租户数据不可见。
 
         Returns:
             (retrieved_chunks, retrieval_context)
             retrieved_chunks: 检索到的 top-5 chunks
             retrieval_context: 检索过程信息（延迟、分数等）
+
+        技术决策:
+        - 根据 bm25_mode 走两条不同路径：
+            * "qdrant_sparse": Qdrant 服务端融合 dense + sparse，
+              单一结果流，避免 RRF 融合时的 chunk_id 重复
+            * "external":      保留 rank_bm25 + 应用层 RRF 融合（高级调参场景）
+        - 无论哪种模式，最终都做 chunk_id 去重，避免 RRF 权重叠加。
         """
         start = time.perf_counter()
         context = RetrievalContext(query=query)
+
+        # 多租户隔离：合并 acl_filter + tenant filter（P3-13）
+        from backend.security.tenant import build_tenant_filter
+
+        tenant_filter = build_tenant_filter(tenant, acl_filter) if tenant is not None else None
+        effective_acl = acl_filter  # 透传给可能的额外逻辑
 
         # 步骤 1: Embed query（如果未提供）
         if query_vector is None:
@@ -216,48 +245,83 @@ class HybridSearchEngine:
             query_vector = self._embedder.embed(query)
             context.dense_latency_ms += (time.perf_counter() - embed_start) * 1000
 
-        # 步骤 2: 并行执行 BM25 和 Dense 检索（各内部独立计时）
-        async def run_bm25() -> tuple[list, float]:
-            t0 = time.perf_counter()
-            if self._bm25_retriever is None:
-                return [], 0.0
-            result = self._bm25_retriever.search(query, top_k=self._individual_top_k)
-            return result, (time.perf_counter() - t0) * 1000
+        bm25_results: list = []
+        dense_results: list = []
+        bm25_ms = 0.0
+        dense_ms = 0.0
 
-        async def run_dense() -> tuple[list, float]:
-            t0 = time.perf_counter()
-            result = await self._vector_retriever.search(
+        if self._bm25_mode == "qdrant_sparse":
+            # 路径 A: Qdrant 服务端 hybrid search（推荐）
+            dense_start = time.perf_counter()
+            fused = self._vector_retriever.hybrid_search(
                 query_vector=query_vector,
+                sparse_query=self._build_sparse_query(query),
                 top_k=self._individual_top_k,
-                query_filter=acl_filter,
+                query_filter=tenant_filter,  # 用合并后的 filter
             )
-            return result, (time.perf_counter() - t0) * 1000
+            dense_ms = (time.perf_counter() - dense_start) * 1000
+            dense_results = [
+                {
+                    "chunk_id": r.chunk_id,
+                    "doc_id": r.doc_id,
+                    "score": r.score,
+                    "rank": r.rank,
+                    "text": r.text,
+                    "section_path": r.section_path,
+                    "metadata": r.metadata,
+                }
+                for r in fused
+            ]
+            context.bm25_top_k = 0  # BM25 已融合到 dense 结果中
+            context.dense_top_k = len(dense_results)
 
-        (bm25_results, bm25_ms), (dense_results, dense_ms) = await asyncio.gather(
-            asyncio.to_thread(run_bm25),
-            asyncio.to_thread(run_dense),
-        )
+            # Qdrant 服务端融合已完成，跳过应用层 RRF
+            result_sets: dict[str, list] = {"fused": dense_results}
+            fused_results = self._normalize_fused(result_sets)
+        else:
+            # 路径 B: 外部 rank_bm25 + dense + 应用层 RRF
+            async def run_bm25() -> tuple[list, float]:
+                t0 = time.perf_counter()
+                if self._bm25_retriever is None:
+                    return [], 0.0
+                result = self._bm25_retriever.search(query, top_k=self._individual_top_k)
+                return result, (time.perf_counter() - t0) * 1000
 
-        context.bm25_latency_ms = bm25_ms
-        context.dense_latency_ms = dense_ms
-        context.bm25_top_k = len(bm25_results)
-        context.dense_top_k = len(dense_results)
+            async def run_dense() -> tuple[list, float]:
+                t0 = time.perf_counter()
+                result = await self._vector_retriever.search(
+                    query_vector=query_vector,
+                    top_k=self._individual_top_k,
+                    query_filter=tenant_filter,  # 用合并后的 filter
+                )
+                return result, (time.perf_counter() - t0) * 1000
 
-        # 至少有一路有结果
-        if not bm25_results and not dense_results:
-            context.total_latency_ms = (time.perf_counter() - start) * 1000
-            logger.warning(f"混合检索无结果: query='{query[:50]}'")
-            return [], context
+            (bm25_results, bm25_ms), (dense_results, dense_ms) = await asyncio.gather(
+                asyncio.to_thread(run_bm25),
+                asyncio.to_thread(run_dense),
+            )
 
-        # 步骤 3: RRF 融合
+            context.bm25_latency_ms = bm25_ms
+            context.dense_latency_ms = dense_ms
+            context.bm25_top_k = len(bm25_results)
+            context.dense_top_k = len(dense_results)
+
+            if not bm25_results and not dense_results:
+                context.total_latency_ms = (time.perf_counter() - start) * 1000
+                logger.warning(f"混合检索无结果: query='{query[:50]}'")
+                return [], context
+
+            result_sets = {}
+            if bm25_results:
+                result_sets["bm25"] = bm25_results
+            if dense_results:
+                result_sets["dense"] = dense_results
+            fused_results = self._normalize_fused(result_sets)
+
+        # 步骤 3: RRF 融合（qdrant_sparse 模式下 fused_results 已经是单流）
         fusion_start = time.perf_counter()
-        result_sets = {}
-        if bm25_results:
-            result_sets["bm25"] = bm25_results
-        if dense_results:
-            result_sets["dense"] = dense_results
-
-        fused_results: list[FusionResult] = self._rrf_fusion.fuse(result_sets)
+        if self._bm25_mode != "qdrant_sparse":
+            fused_results: list[FusionResult] = self._rrf_fusion.fuse(result_sets)
         context.fusion_candidates = len(fused_results)
         context.fusion_latency_ms = (time.perf_counter() - fusion_start) * 1000
 
@@ -354,6 +418,58 @@ class HybridSearchEngine:
         )
 
         return final_chunks, context
+
+    def _build_sparse_query(self, query: str) -> dict | "models.Document":
+        """
+        从 query 构造 Qdrant sparse vector 查询体。
+
+        Qdrant 1.10+ 推荐方案：传 `models.Document(text=..., model="Qdrant/bm25")`，
+        由 Qdrant 服务端按 BM25 (IDF + TF 归一化) 算 indices/values。
+
+        这样能保持和写入端 (index_chunks_with_sparse) 完全一致的 BM25 公式，
+        避免应用层手算 TF 与服务端 IDF 公式不一致造成的排序偏差。
+        """
+        try:
+            from qdrant_client.http import models
+            return models.Document(text=query, model="Qdrant/bm25")
+        except Exception:
+            # 极旧版 Qdrant 兼容：手工 tokenize + TF
+            import collections
+            tokens = [t for t in query.split() if t]
+            if not tokens:
+                return {"indices": [], "values": []}
+            counter = collections.Counter(tokens)
+            indices = sorted(counter.keys())
+            values = [float(counter[i]) for i in indices]
+            return {"indices": indices, "values": values}
+
+    def _normalize_fused(self, result_sets: dict[str, list]) -> list[FusionResult]:
+        """
+        将多路检索结果转换为 FusionResult 列表（RRF 融合前的中间格式）。
+
+        同时按 chunk_id 去重，避免同一 chunk 在多路中出现造成 RRF 权重叠加。
+        """
+        seen_chunk_ids: set[str] = set()
+        out: list[FusionResult] = []
+        for source, items in result_sets.items():
+            for item in items:
+                chunk_id = item.get("chunk_id", "")
+                if not chunk_id or chunk_id in seen_chunk_ids:
+                    continue
+                seen_chunk_ids.add(chunk_id)
+                out.append(
+                    FusionResult(
+                        chunk_id=chunk_id,
+                        doc_id=item.get("doc_id", ""),
+                        text=item.get("text", ""),
+                        section_path=item.get("section_path", ""),
+                        metadata=item.get("metadata", {}),
+                        fused_score=float(item.get("score", 0.0)),
+                        individual_scores={source: float(item.get("score", 0.0))},
+                        sources=[source],
+                    )
+                )
+        return out
 
     def search_sync(
         self,

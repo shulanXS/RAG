@@ -201,9 +201,10 @@ async def index_documents(
                 # Contextual Retrieval: 使用 prepend 了文档上下文的 embedding
                 embeddings = embedder.embed_chunks_with_context(doc_chunks, doc_summary)
 
-                indexer.index_chunks(
+                # P1.1: 使用 sparse+Modifier.IDF 写双路索引（Qdrant 服务端 BM25）
+                indexer.index_chunks_with_sparse(
                     chunks=doc_chunks,
-                    embeddings=embeddings,
+                    dense_embeddings=embeddings,
                     doc_id=doc_id,
                 )
                 indexed_count += len(doc_chunks)

@@ -12,7 +12,7 @@
 .PHONY: help install dev test lint clean \
 	up down restart logs status \
 	backend-uvicorn frontend-dev \
-	ingest eval \
+	ingest eval demo \
 	build build-backend build-frontend
 
 # =============================================================================
@@ -46,6 +46,7 @@ help:
 	@echo "  数据与评估"
 	@echo "    ingest          运行文档索引脚本"
 	@echo "    eval            运行系统评估"
+	@echo "    demo            一键演示 (启动 + 索引 + 评估)"
 	@echo ""
 	@echo "  构建"
 	@echo "    build           构建所有 Docker 镜像"
@@ -147,6 +148,57 @@ ingest:
 eval:
 	@echo "运行系统评估..."
 	$(PYTHON) scripts/eval.py
+
+# =============================================================================
+# 一键演示 (P4.3) — 启动 -> 索引 -> 评估 -> 提示打开浏览器
+# =============================================================================
+demo:
+	@echo ""
+	@echo "=================================================="
+	@echo "  Enterprise RAG — 一键演示"
+	@echo "=================================================="
+	@echo ""
+	@echo "[1/4] 启动 Docker 服务 (Qdrant, Redis, Jaeger, Prometheus, Grafana)..."
+	@$(MAKE) --no-print-directory up
+	@echo "      ✓ 等待服务就绪..."
+	@sleep 10
+	@echo ""
+	@echo "[2/4] 索引 sample 文档..."
+	@$(MAKE) --no-print-directory ingest
+	@echo "      ✓ 索引完成"
+	@echo ""
+	@echo "[3/4] 跑 RAGAS 评估 (可选 — 可访问 /eval 查看 dashboard)..."
+	@$(MAKE) --no-print-directory eval || echo "      (eval 跳过 — 不是阻塞)"
+	@echo "      ✓ 评估完成"
+	@echo ""
+	@echo "[4/4] 启动后端服务..."
+	@echo "      启动后请保持此终端运行"
+	@echo ""
+	@echo "=================================================="
+	@echo "  服务地址"
+	@echo "=================================================="
+	@echo "  Chat UI:           http://localhost:$(FRONTEND_PORT)"
+	@echo "  API docs:          http://localhost:$(BACKEND_PORT)/docs"
+	@echo "  Trace Viewer:      http://localhost:$(FRONTEND_PORT)/traces"
+	@echo "  Eval Dashboard:    http://localhost:$(FRONTEND_PORT)/eval"
+	@echo "  Jaeger UI:         http://localhost:16686"
+	@echo "  Prometheus:        http://localhost:9090"
+	@echo "  Grafana:           http://localhost:3001  (admin/admin)"
+	@echo "  /metrics:          http://localhost:$(BACKEND_PORT)/metrics"
+	@echo "=================================================="
+	@echo ""
+	@$(MAKE) --no-print-directory dev
+
+# =============================================================================
+# 性能压测 (P4.5)
+# =============================================================================
+bench:
+	@echo "运行 k6 负载测试 (需要先 make up + 索引)..."
+	@if [ -z "$$API_URL" ]; then echo "Set API_URL=http://localhost:8000"; API_URL=http://localhost:8000; fi
+	@if [ -z "$$TOKEN" ]; then echo "Set TOKEN=<jwt>"; exit 1; fi
+	k6 run --out json=bench-results.json -e API_URL=$$API_URL -e TOKEN=$$TOKEN k6/load_test.js
+	@echo ""
+	@echo "✓ 压测完成，结果见 bench-results.json"
 
 # =============================================================================
 # 清理

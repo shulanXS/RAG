@@ -294,6 +294,37 @@ def main():
         else:
             console.print("\n[green]CI 状态: PASS[/green]")
 
+        # P2: Eval diff gate — 对比上一次同 prompt_hash 的 run
+        try:
+            from backend.evaluation.eval_store import get_eval_store
+            from prompts import get_prompts_with_hash
+            from backend.config import get_config as _gc
+
+            cfg = _gc()
+            _, prompt_hash = get_prompts_with_hash()
+            # 取最近一次 run (已写库的)
+            store = get_eval_store()
+            latest = store.get_latest_run()
+            if latest and latest.get("prompt_hash"):
+                gate = store.diff_against_previous(
+                    latest["run_id"],
+                    thresholds=cfg.evaluation.ci.thresholds.__dict__ if hasattr(cfg.evaluation.ci, "thresholds") else None,
+                )
+                if gate.get("passed"):
+                    console.print(f"[green]Diff Gate: PASS[/green]  reason={gate.get('reason')}")
+                else:
+                    console.print(f"[red]Diff Gate: FAIL[/red]  reason={gate.get('reason')}")
+                    for m, d in gate.get("diffs", {}).items():
+                        if d.get("below_threshold"):
+                            console.print(
+                                f"  [red]- {m}: {d['previous']:.3f} -> {d['current']:.3f} "
+                                f"(drop={d['delta']:.3f}, max={d['max_allowed_drop']:.3f})[/red]"
+                            )
+                    # CI 失败时退出码 2 (区别于 should_fail_ci 的 1)
+                    sys.exit(2)
+        except Exception as e:
+            logger.warning(f"Eval diff gate skipped: {e}")
+
     except Exception as e:
         console.print(f"\n[red]评估失败: {e}[/red]")
         logger.exception("评估过程异常")

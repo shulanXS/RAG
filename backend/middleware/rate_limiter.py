@@ -51,6 +51,7 @@ class RateLimiter:
     - 使用 Redis ZSET 实现滑动窗口计数器
     - 每个 tenant_id 有独立的限流 key
     - tier 决定请求速率上限
+    - P1.2: 切换到 redis.asyncio.Redis，避免在 FastAPI 异步请求里阻塞 event loop
     """
 
     def __init__(
@@ -61,8 +62,9 @@ class RateLimiter:
     ):
         if not REDIS_AVAILABLE:
             raise ImportError("需要安装 redis: pip install redis")
-        
-        self._client = redis.Redis(host=host, port=port, decode_responses=False)
+
+        import redis.asyncio as aioredis
+        self._client = aioredis.Redis(host=host, port=port, decode_responses=False)
         self._tiers = tiers or DEFAULT_TIERS
 
     def _get_key(self, tenant_id: str) -> str:
@@ -105,7 +107,8 @@ class RateLimiter:
         # 设置过期时间
         pipe.expire(key, 120)
 
-        results = pipe.execute()
+        # P1.2: redis.asyncio 模式下 pipeline() 返回的对象可 await execute()
+        results = await pipe.execute()
         current_count = results[1]  # zcard result
 
         remaining = max(0, tier_config.requests_per_minute - current_count - 1)
@@ -113,7 +116,7 @@ class RateLimiter:
 
         # 如果不允许，不要将当前请求计入
         if not allowed:
-            self._client.zrem(key, f"{now}")
+            await self._client.zrem(key, f"{now}")
 
         logger.debug(
             f"RateLimit: tenant={tenant_id} tier={tier} "
@@ -122,12 +125,13 @@ class RateLimiter:
 
         return allowed, remaining, 60
 
-    def get_window_count(self, tenant_id: str) -> int:
+    async def get_window_count(self, tenant_id: str) -> int:
         """获取当前窗口内的请求数"""
         key = self._get_key(tenant_id)
         now = time.time()
         window_start = now - 60
-        return self._client.zcount(key, window_start, now)
+        # P1.2: async API
+        return await self._client.zcount(key, window_start, now)
 
 
 # 全局限流器实例（延迟初始化）
@@ -189,7 +193,7 @@ class RateLimitMiddleware:
         tier = self._extract_tier(scope)
 
         try:
-            allowed, remaining, reset_in = limiter.check_rate_limit(tenant_id, tier)
+            allowed, remaining, reset_in = await limiter.check_rate_limit(tenant_id, tier)
         except Exception:
             allowed = True
             remaining = -1

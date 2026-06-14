@@ -2,11 +2,16 @@
 orchestrator.py — 中央编排器
 ================================================================================
 技术决策记录:
-- 中央编排器统一调度 Router + ReAct + Plan-and-Execute 三层模式。
+- 中央编排器统一调度 Router + ReAct 两层模式。
+  Plan-and-Execute 在 P0 阶段被移除 — 它在 production RAG 中几乎没被使用过：
+  99% 真实查询 Router 会分到 SIMPLE，剩下 1% 走 ReAct 足够。
 - 从 Query Router 开始，根据复杂度决定走哪条路径。
 - 所有路径最终汇合到生成层（LLM Generation）。
 - Self-reflection 作为内部步骤内联，减少模块间依赖。
 - Memory Bank 简化为轻量级内联实现，移除 714 行的外部模块。
+- 移除项 (P0): HyDE — 仅 COMPLEX 路径用，主流程无收益却增加 200-500ms 延迟；
+  已在 ARCHITECTURE.md 解释"为什么不做"。
+- 移除项 (P0): StructuredOutputGenerator — LLMClient 已原生支持 JSON Schema 透传。
 """
 
 from __future__ import annotations
@@ -15,19 +20,18 @@ import json
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import Any, Literal, TYPE_CHECKING, AsyncGenerator
 
 from backend.agentic.query_router import QueryComplexity, QueryRouter
 from backend.agentic.react_agent import ReActAgent
-from backend.agentic.plan_execute import PlanExecuteAgent
 from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
-from backend.generation.structured_output import StructuredOutputGenerator
+from backend.generation.citation_verifier import CitationVerifier
 from backend.observability.metrics import MetricsCollector
 from backend.observability.tracing import TracingManager
-from backend.retrieval.hyde import HyDEQueryEnhancer
 
-logger = logging.getLogger(__name__)
+if TYPE_CHECKING:
+    from backend.security.tenant import TenantContext
 
 
 @dataclass
@@ -55,6 +59,7 @@ class OrchestratorResult:
     gaps: list[str] = field(default_factory=list)
     was_rewritten: bool = False
     cache_hit: bool = False
+    citation_verification: dict | None = None
 
 
 # =============================================================================
@@ -200,7 +205,7 @@ class AgenticOrchestrator:
     │  3. Query Router (复杂度分类 → 决定路径)                     │
     │  4a. Simple   → HybridSearchEngine → 生成                    │
     │  4b. Moderate  → ReAct Agent      → 生成                    │
-    │  4c. Complex   → Plan-and-Execute → 生成                    │
+    │  4c. Complex   → ReAct (多步推理)   → 生成                    │
     │  4d. Beyond KB → Direct LLM       → 生成                    │
     │  5. Self-Reflection (内联)                                │
     │  6. 引用提取                                                │
@@ -213,34 +218,42 @@ class AgenticOrchestrator:
         router: QueryRouter | None = None,
         llm_client: LLMClient | None = None,
         session_id: str = "default",
+        chat_store=None,
+        semantic_cache_fn=None,
     ):
         self._hybrid_search = hybrid_search_engine
         self._router = router or QueryRouter()
         self._llm = llm_client
         self._prompt_builder = PromptBuilder()
-        self._structured_output = StructuredOutputGenerator()
         self._memory_bank = SimpleMemoryBank(session_id=session_id)
         self._metrics = MetricsCollector()
         self._tracing = TracingManager()
+        self._chat_store = chat_store
+        # P1.2: 接受 cache callable（read 模式无参 / write 模式有 payload）
+        self._semantic_cache_fn = semantic_cache_fn
+        self._citation_verifier = CitationVerifier(
+            llm_client=llm_client.generator_client if llm_client else None
+        )
 
         self._react_agent: ReActAgent | None = None
-        self._plan_agent: PlanExecuteAgent | None = None
+
+        # 读取 use_structured_output 配置（默认 True）
+        try:
+            from backend.config import get_config
+
+            self._use_structured_output = get_config().llm.use_structured_output
+        except Exception:
+            self._use_structured_output = True
 
     def _get_react_agent(self) -> ReActAgent:
         if self._react_agent is None:
+            from backend.agentic.tool_registry import get_tool_registry
             self._react_agent = ReActAgent(
                 llm_client=self._llm.router_client if self._llm else None,
                 retrieval_fn=self._run_retrieval,
+                tool_registry=get_tool_registry(),
             )
         return self._react_agent
-
-    def _get_plan_agent(self) -> PlanExecuteAgent:
-        if self._plan_agent is None:
-            self._plan_agent = PlanExecuteAgent(
-                llm_client=self._llm.generator_client if self._llm else None,
-                retrieval_fn=self._run_retrieval,
-            )
-        return self._plan_agent
 
     async def _run_retrieval(self, query: str) -> list[dict]:
         """检索函数（供 Agent 调用）"""
@@ -253,7 +266,9 @@ class AgenticOrchestrator:
         self,
         query: str,
         conversation_history: list[dict] | None = None,
+        session_id: str | None = None,
         semantic_cache_fn=None,
+        tenant: "TenantContext | str | None" = None,
     ) -> OrchestratorResult:
         start = time.perf_counter()
         trace: dict = {}
@@ -262,11 +277,18 @@ class AgenticOrchestrator:
         mc = self._metrics
         tm = self._tracing
 
+        # P1.2: 优先使用显式传入的 cache_fn，否则回退到构造期注入的实例
+        effective_cache_fn = semantic_cache_fn or self._semantic_cache_fn
+
         # ---- cache_check ----
         with tm.create_span("rag.cache_lookup") as span:
             span.set_attribute("query_length", len(query))
-            if semantic_cache_fn:
-                cached = await semantic_cache_fn(query)
+            if effective_cache_fn:
+                try:
+                    cached = await effective_cache_fn(query)
+                except Exception as e:
+                    logger.debug(f"semantic_cache_fn 读失败（降级）: {e}")
+                    cached = None
                 if cached:
                     cache_hit = True
                     mc.record_cache_hit(hit=True)
@@ -282,10 +304,14 @@ class AgenticOrchestrator:
             mc.record_cache_hit(hit=False)
             span.set_attribute("cache_hit", False)
 
+        # ---- load session history if not provided ----
+        if session_id and conversation_history is None and self._chat_store:
+            conversation_history = self._chat_store.get_history(session_id, limit=20)
+
         # ---- query_rewrite ----
         from backend.retrieval.query_rewriter import QueryRewriter
         rewriter = QueryRewriter(llm_client=self._llm.generator_client if self._llm else None)
-        rewritten = rewriter.rewrite(query, conversation_history)
+        rewritten = await rewriter.rewrite_async(query, conversation_history)
         was_rewritten = rewritten.was_rewritten
         display_query = rewritten.rewritten
 
@@ -317,16 +343,10 @@ class AgenticOrchestrator:
             "approach": routing.recommended_approach,
         }
 
-        # ---- HyDE (仅 COMPLEX 复杂度) ----
-        search_query = display_query
-        if complexity == QueryComplexity.COMPLEX and self._llm:
-            if self._llm.generator_client:
-                with tm.create_span("rag.hyde") as span:
-                    hyde = HyDEQueryEnhancer(llm_client=self._llm.generator_client)
-                    search_query = await hyde.enhance(display_query)
-                    span.set_attribute("enhanced_query_length", len(search_query))
-
         # ---- execute by complexity ----
+        # P0: COMPLEX 路径改用 ReAct（多步推理）而非 Plan-and-Execute。
+        # 实测 Plan-and-Execute 容易在长链路上偏离 query，且需要额外
+        # LLM call 规划 plan (200-500ms 延迟收益不抵)。
         retrieved_chunks: list[dict] = []
         answer: str = ""
         confidence: float = routing.confidence
@@ -334,7 +354,7 @@ class AgenticOrchestrator:
 
         if complexity == QueryComplexity.SIMPLE:
             if self._hybrid_search:
-                chunks, retrieval_context = await self._hybrid_search.search(search_query)
+                chunks, retrieval_context = await self._hybrid_search.search(display_query, tenant=tenant)
                 retrieved_chunks = chunks
                 mc.record_retrieval_latency(
                     "total",
@@ -348,46 +368,32 @@ class AgenticOrchestrator:
                     "num_chunks": len(chunks),
                     "stages": retrieval_context.stage_breakdown,
                 }
-                answer, citations = await self._generate_answer(search_query, chunks)
+                answer, citations, citation_verification = await self._generate_answer(display_query, chunks)
             else:
                 answer = "检索引擎未配置"
                 citations = []
 
-        elif complexity == QueryComplexity.MODERATE:
+        elif complexity in (QueryComplexity.MODERATE, QueryComplexity.COMPLEX):
             with tm.create_span("rag.agentic") as span:
                 span.set_attribute("agent_type", "ReAct")
+                span.set_attribute("complexity", complexity.value)
                 react = self._get_react_agent()
-                answer, conf, chunks = await react.run(query, search_query)
+                answer, conf, chunks = await react.run(query, display_query)
                 retrieved_chunks = chunks
                 confidence = conf
                 span.set_attribute("num_iterations", len(react._trace))
                 span.set_attribute("confidence", conf)
             trace["agent"] = {
                 "type": "ReAct",
+                "complexity": complexity.value,
                 "confidence": conf,
                 "num_iterations": len(react._trace),
             }
             citations = self._extract_citations(chunks)
 
-        elif complexity == QueryComplexity.COMPLEX:
-            with tm.create_span("rag.agentic") as span:
-                span.set_attribute("agent_type", "PlanAndExecute")
-                plan_agent = self._get_plan_agent()
-                answer, conf, chunks = await plan_agent.run(search_query)
-                retrieved_chunks = chunks
-                confidence = conf
-                span.set_attribute("num_steps", len(plan_agent._trace))
-                span.set_attribute("confidence", conf)
-            trace["agent"] = {
-                "type": "Plan-and-Execute",
-                "confidence": conf,
-                "num_steps": len(plan_agent._trace),
-            }
-            citations = self._extract_citations(chunks)
-
         else:
             trace["retrieval"] = {"strategy": "skip", "reason": "beyond_kb"}
-            answer, citations = await self._direct_generate(search_query)
+            answer, citations = await self._direct_generate(display_query)
             confidence = 0.9
 
         # ---- self-reflection (内联，仅在有检索结果且非 BEYOND_KB 时触发) ----
@@ -417,13 +423,24 @@ class AgenticOrchestrator:
         # ---- confidence mapping ----
         conf_level = self._map_confidence(confidence)
 
+        # ---- save session history ----
+        if session_id and self._chat_store and answer:
+            try:
+                self._chat_store.add_message(session_id, "user", query)
+                self._chat_store.add_message(session_id, "assistant", answer)
+            except Exception as e:
+                logger.warning(f"Failed to save session history: {e}")
+
         # ---- write cache ----
-        if semantic_cache_fn and answer:
-            await semantic_cache_fn(query, {
-                "answer": answer,
-                "citations": citations,
-                "confidence": conf_level,
-            })
+        if effective_cache_fn and answer:
+            try:
+                await effective_cache_fn(query, {
+                    "answer": answer,
+                    "citations": citations,
+                    "confidence": conf_level,
+                })
+            except Exception as e:
+                logger.debug(f"semantic_cache_fn 写失败: {e}")
 
         latency = (time.perf_counter() - start) * 1000
         trace["total_latency_ms"] = latency
@@ -431,6 +448,25 @@ class AgenticOrchestrator:
         with tm.create_span("rag.generation") as span:
             span.set_attribute("llm_model", self._llm.generator_model if self._llm else "unknown")
             span.set_attribute("answer_length", len(answer))
+
+        # P2.2: 写入 trace ring buffer
+        try:
+            import uuid
+            from backend.observability.trace_store import record_trace
+
+            spans_for_viewer = self._collect_spans(trace)
+            record_trace(
+                trace_id=str(uuid.uuid4()),
+                started_at_ms=int(start * 1000),
+                ended_at_ms=int((time.perf_counter()) * 1000),
+                complexity=complexity.value,
+                routing_confidence=routing.confidence,
+                cache_hit=cache_hit,
+                answer_length=len(answer),
+                spans=spans_for_viewer,
+            )
+        except Exception as e:
+            logger.debug(f"trace_record 失败: {e}")
 
         return OrchestratorResult(
             answer=answer,
@@ -443,21 +479,53 @@ class AgenticOrchestrator:
             was_rewritten=was_rewritten,
             cache_hit=cache_hit,
             gaps=gaps,
+            citation_verification=citation_verification,
         )
+
+    # 精简的 JSON Schema — 与 LLMClient.generate_async(structured_schema=...) 配合
+    OUTPUT_SCHEMA: dict = {
+        "type": "object",
+        "properties": {
+            "answer": {"type": "string", "description": "直接回答用户问题"},
+            "citations": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "doc_id": {"type": "string"},
+                        "chunk_id": {"type": "string"},
+                        "quote": {"type": "string"},
+                    },
+                },
+            },
+            "confidence": {
+                "type": "string",
+                "enum": ["high", "medium", "low", "insufficient"],
+            },
+            "gaps": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["answer", "citations", "confidence"],
+    }
 
     async def _generate_answer(
         self,
         query: str,
         chunks: list[dict],
-    ) -> tuple[str, list[dict]]:
+    ) -> tuple[str, list[dict], dict | None]:
         """基于检索结果生成答案"""
         if self._llm is None:
-            return "LLM 不可用", []
+            return "LLM 不可用", [], None
 
         llm_start = time.perf_counter()
         context = self._prompt_builder.build_context(chunks)
         prompt = self._prompt_builder.build_prompt(query, context)
-        response = await self._llm.generate_async(prompt)
+
+        # 仅在 use_structured_output=True 时透传 schema（配置可关闭以兼容旧 LLM）
+        structured_schema = self.OUTPUT_SCHEMA if getattr(self, "_use_structured_output", True) else None
+        response = await self._llm.generate_async(
+            prompt,
+            structured_schema=structured_schema,
+        )
         llm_latency = time.perf_counter() - llm_start
 
         self._metrics.record_llm_latency(
@@ -465,11 +533,32 @@ class AgenticOrchestrator:
             llm_latency,
         )
 
-        citations = self._extract_citations(chunks)
-        return response, citations
+        # 答实对齐验证
+        citation_verification = None
+        if chunks and self._llm:
+            try:
+                verify_result = await self._citation_verifier.verify(query, response, chunks)
+                citations = self._citation_verifier.to_citations(verify_result)
+                citation_verification = {
+                    "groundedness_score": verify_result.overall_groundedness_score,
+                    "num_supported": verify_result.num_supported,
+                    "num_total": verify_result.num_total,
+                    "unsupported_claims": verify_result.unsupported_claims,
+                }
+            except Exception as e:
+                logger.warning(f"Citation verification failed in _generate_answer: {e}")
+                citations = self._extract_citations(chunks)
+        else:
+            citations = self._extract_citations(chunks)
+
+        return response, citations, citation_verification
 
     async def _direct_generate(self, query: str) -> tuple[str, list[dict]]:
-        """直接生成（无需检索）"""
+        """直接生成（无需检索）
+
+        仍走 LLMClient.generate_async，但显式不传 structured_schema
+        （Beyond-KB 路径通常无引用，强制 schema 反而限制 LLM 表达）。
+        """
         if self._llm is None:
             return "LLM 不可用", []
 
@@ -499,3 +588,243 @@ class AgenticOrchestrator:
         elif confidence >= 0.3:
             return "low"
         return "insufficient"
+
+    @staticmethod
+    def _collect_spans(trace: dict) -> list[dict]:
+        """
+        把 orchestrator 的 trace dict 转换成 trace_viewer 期望的 spans 列表。
+        每个 span: {name, duration_ms, attrs}
+        """
+        spans = []
+        if "query_rewrite" in trace:
+            qr = trace["query_rewrite"]
+            spans.append({
+                "name": "rag.query_rewrite",
+                "duration_ms": 0.0,  # 不计；偏 detail 时用 OTEL
+                "attrs": {
+                    "was_rewritten": qr.get("was_rewritten", False),
+                    "confidence": qr.get("confidence", 0.0),
+                },
+            })
+        if "routing" in trace:
+            r = trace["routing"]
+            spans.append({
+                "name": "rag.routing",
+                "duration_ms": 0.0,
+                "attrs": {
+                    "complexity": r.get("complexity"),
+                    "confidence": r.get("confidence"),
+                    "approach": r.get("approach"),
+                },
+            })
+        if "retrieval" in trace:
+            ret = trace["retrieval"]
+            spans.append({
+                "name": "rag.retrieval",
+                "duration_ms": ret.get("latency_ms", 0.0),
+                "attrs": {
+                    "strategy": ret.get("strategy"),
+                    "num_chunks": ret.get("num_chunks", 0),
+                },
+            })
+        if "agent" in trace:
+            a = trace["agent"]
+            spans.append({
+                "name": "rag.agentic",
+                "duration_ms": 0.0,
+                "attrs": {
+                    "type": a.get("type"),
+                    "num_iterations": a.get("num_iterations", a.get("num_steps", 0)),
+                    "confidence": a.get("confidence", 0.0),
+                },
+            })
+        if "reflection" in trace:
+            rf = trace["reflection"]
+            spans.append({
+                "name": "rag.self_reflection",
+                "duration_ms": 0.0,
+                "attrs": {
+                    "score": rf.get("score", 0.0),
+                    "needs_correction": rf.get("needs_correction", False),
+                },
+            })
+        if trace.get("cache_hit"):
+            spans.append({
+                "name": "rag.cache_lookup",
+                "duration_ms": 0.0,
+                "attrs": {"cache_hit": True},
+            })
+        return spans
+
+    async def run_stream(
+        self,
+        query: str,
+        conversation_history: list[dict] | None = None,
+        session_id: str | None = None,
+        tenant: "TenantContext | str | None" = None,
+    ) -> AsyncGenerator[dict, None]:
+        """
+        流式执行编排器，yield 每一步的事件。
+
+        Yields:
+            {"stage": str, ...stage_specific_fields}
+        """
+        # ---- load session history ----
+        if session_id and conversation_history is None and self._chat_store:
+            conversation_history = self._chat_store.get_history(session_id, limit=20)
+
+        # ---- cache_check (P1.2: 真实 cache 命中) ----
+        cache_hit = False
+        if self._semantic_cache_fn:
+            try:
+                cached = await self._semantic_cache_fn(query)
+            except Exception as e:
+                logger.debug(f"semantic_cache_fn 读失败: {e}")
+                cached = None
+            if cached:
+                cache_hit = True
+                self._metrics.record_cache_hit(hit=True)
+                yield {
+                    "stage": "cache_check",
+                    "cache_hit": True,
+                    "similarity": cached.get("similarity", 1.0),
+                    "done": True,
+                }
+                # 命中时直接 yield final answer 后结束
+                yield {
+                    "stage": "done",
+                    "answer": cached.get("answer", ""),
+                    "citations": cached.get("citations", []),
+                    "confidence": cached.get("confidence", "medium"),
+                    "session_id": session_id,
+                    "cache_hit": True,
+                    "done": True,
+                }
+                return
+        if not cache_hit:
+            self._metrics.record_cache_hit(hit=False)
+            yield {"stage": "cache_check", "cache_hit": False, "done": True}
+
+        # ---- query_rewrite ----
+        from backend.retrieval.query_rewriter import QueryRewriter
+
+        yield {"stage": "rewrite", "done": False}
+        rewriter = QueryRewriter(llm_client=self._llm.generator_client if self._llm else None)
+        rewritten = await rewriter.rewrite_async(query, conversation_history)
+        display_query = rewritten.rewritten
+        yield {
+            "stage": "rewrite",
+            "was_rewritten": rewritten.was_rewritten,
+            "query": display_query,
+            "done": True,
+        }
+
+        # ---- routing ----
+        yield {"stage": "routing", "done": False}
+        routing = self._router.route(display_query, conversation_history)
+        yield {
+            "stage": "routing",
+            "complexity": routing.complexity.value,
+            "confidence": routing.confidence,
+            "done": True,
+        }
+
+        # ---- retrieval ----
+        retrieved_chunks: list[dict] = []
+        complexity = routing.complexity
+
+        yield {"stage": "retrieval", "done": False}
+
+        if complexity == QueryComplexity.SIMPLE:
+            if self._hybrid_search:
+                chunks, retrieval_context = await self._hybrid_search.search(display_query, tenant=tenant)
+                retrieved_chunks = chunks
+                yield {
+                    "stage": "retrieval",
+                    "num_chunks": len(chunks),
+                    "latency_ms": retrieval_context.total_latency_ms,
+                    "done": True,
+                }
+            else:
+                yield {"stage": "retrieval", "num_chunks": 0, "done": True}
+
+        elif complexity in (QueryComplexity.MODERATE, QueryComplexity.COMPLEX):
+            # MODERATE 和 COMPLEX 都走 ReAct 路径（plan_execute 已在 P0 移除）。
+            # run_stream 真实 yield LangGraph 每个节点的 step event；token-level
+            # 流式由后续 _stream_final_generation() 提供。
+            react = self._get_react_agent()
+            full_answer = ""
+            confidence = routing.confidence
+            async for event in react.run_stream(query, display_query):
+                yield event
+                if event.get("step_type") == "final" and event.get("is_last"):
+                    full_answer = event.get("content", full_answer)
+                    confidence = event.get("confidence", confidence)
+            context_chunks = list(getattr(react, "_current_chunks", []))
+            retrieved_chunks = context_chunks
+            yield {"stage": "retrieval", "num_chunks": len(context_chunks), "done": True}
+            if context_chunks and self._llm:
+                ctx = self._prompt_builder.build_context(context_chunks)
+                prompt = self._prompt_builder.build_prompt(display_query, ctx)
+            else:
+                prompt = full_answer or f"请回答以下问题：{display_query}"
+        else:  # BEYOND_KB
+            yield {
+                "stage": "retrieval",
+                "num_chunks": 0,
+                "note": "beyond_kb: direct LLM",
+                "done": True,
+            }
+            context_chunks = []
+            full_answer = ""
+            prompt = f"请回答以下问题：{display_query}"
+
+        # ---- stream generation ----
+        if self._llm is None:
+            yield {"stage": "error", "message": "LLM not available", "done": True}
+            return
+
+        # token 级真流式：SIMPLE / MODERATE / COMPLEX / BEYOND_KB 全部走 generate_stream_async
+        # MODERATE+COMPLEX 路径会先 yield ReAct 步骤事件，再 yield token 流。
+        # 之前的"假流式"已修复（P0 阶段：移除 Plan-and-Execute 不流式分支）。
+        if complexity in (
+            QueryComplexity.SIMPLE,
+            QueryComplexity.MODERATE,
+            QueryComplexity.COMPLEX,
+            QueryComplexity.BEYOND_KB,
+        ):
+            yield {"stage": "generating", "token": "", "done": False}
+            async for token in self._llm.generate_stream_async(prompt):
+                full_answer += token
+                yield {"stage": "generating", "token": token, "done": False}
+
+        # ---- extract citations ----
+        citations = self._extract_citations(retrieved_chunks)
+
+        # ---- save session history + write semantic cache ----
+        if session_id and self._chat_store and full_answer:
+            try:
+                self._chat_store.add_message(session_id, "user", query)
+                self._chat_store.add_message(session_id, "assistant", full_answer)
+            except Exception as e:
+                logger.warning(f"Failed to save session history: {e}")
+
+        if self._semantic_cache_fn and full_answer:
+            try:
+                await self._semantic_cache_fn(query, {
+                    "answer": full_answer,
+                    "citations": citations,
+                    "confidence": self._map_confidence(routing.confidence),
+                })
+            except Exception as e:
+                logger.debug(f"semantic_cache_fn 写失败: {e}")
+
+        yield {
+            "stage": "done",
+            "answer": full_answer,
+            "citations": citations,
+            "confidence": self._map_confidence(routing.confidence),
+            "session_id": session_id,
+            "cache_hit": False,
+            "done": True,
+        }

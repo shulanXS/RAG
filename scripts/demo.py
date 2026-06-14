@@ -43,7 +43,6 @@ from backend.agentic import (
     QueryComplexity,
     QueryRouter,
     ReActAgent,
-    PlanExecuteAgent,
     AgenticOrchestrator,
 )
 from backend.generation import LLMClient
@@ -263,7 +262,7 @@ def main():
     parser.add_argument(
         "--agent",
         type=str,
-        choices=["simple", "react", "plan"],
+        choices=["simple", "react"],
         default="react",
         help="Agent 模式 (默认: react)",
     )

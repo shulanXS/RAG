@@ -21,12 +21,16 @@ paths:
 # 1. Embedding 模型配置
 # --------------------------------------------------------------------------
 # 决策依据: MTEB Retrieval 2026年4月 leaderboard
-#   - voyage-3-large: MTEB ~62, 英文+代码场景最优
-#   - text-embedding-3-large: MTEB ~59, 通用场景默认值
+#   - voyage-3-large: MTEB ~62, 英文+代码场景最优（闭源）
+#   - text-embedding-3-large: MTEB ~59, 通用场景默认值（闭源）
 #   - BGE-M3: MTEB ~58, 开源多语言首选 (Apache 2.0)
 # 权衡: BGE-M3 自托管零 API 成本，但需要 GPU 资源；商业模型按量付费
+#
+# P1 决策: 默认从 voyage 切到 bge — 作品集强调"开源可复现 benchmark"，
+# 闭源 voyage 在面试中会被追问"如果 voyage 涨价/下线你怎么办"，
+# bge-m3 给出明确的可选路径 (sentence-transformers 一行代码加载)。
 embedding:
-  backend: "voyage"          # 选项: voyage | openai | bge
+  backend: "bge"              # P1 默认改 bge; 选项: voyage | openai | bge
   voyage_model: "voyage-3-large"
   openai_model: "text-embedding-3-large"
   bge_model: "BAAI/bge-m3"
@@ -84,6 +88,11 @@ vector_db:
     b: 0.75                  # BM25 字段长度归一化参数
   # 批量写入配置
   batch_size: 64
+  # BM25 路径选择（二选一）:
+  #   - "qdrant_sparse": 使用 Qdrant native sparse vector (推荐，零额外服务)
+  #   - "external":       使用 rank_bm25 库（适合需要复杂 BM25 调参的场景）
+  # 默认 "qdrant_sparse" 避免双重 BM25 路径造成的 RRF 权重叠加问题。
+  bm25_mode: "qdrant_sparse"
 
 # --------------------------------------------------------------------------
 # 4. Reranker 配置
@@ -122,15 +131,19 @@ llm:
       coder: "deepseek-coder"
 
   # 生成模型
+  # P1 决策: 默认从 claude-3-7-sonnet 切到 claude-haiku-4-5 —
+  # 2026/6 Claude 4 系列已经发布，Haiku 4.5 在 SWE-bench/检索问答任务上
+  # 与 Sonnet 3.7 差距 < 3%，但成本是 1/15、延迟是 1/3。作品集 demo 阶段
+  # 选 Haiku 4.5 是成本-性能最优解。
   generator:
     provider: "anthropic"    # 选项: anthropic | openai | google | deepseek
-    model: "claude-3-7-sonnet-20250620"
+    model: "claude-haiku-4-5-20251001"
     max_tokens: 2048
     temperature: 0.3        # 低 temperature 保证回答稳定性
-  # 路由/分类模型 (轻量)
+  # 路由/分类模型 (轻量) — 也用 Haiku 4.5，统一栈
   router:
     provider: "anthropic"
-    model: "claude-3-5-haiku-20250620"
+    model: "claude-haiku-4-5-20251001"
     max_tokens: 256
     temperature: 0.1
   # Structured Output Schema
@@ -175,10 +188,7 @@ agentic:
   react:
     max_iterations: 5
     early_stop_threshold: 0.85  # 置信度达到此值时提前退出
-  # Plan-and-Execute 配置
-  plan_execute:
-    max_steps: 8
-    max_subqueries_per_step: 3
+  # P0 阶段移除 Plan-and-Execute 配置段（plan_execute.agent 已删除）
 
 # --------------------------------------------------------------------------
 # 8. 语义缓存配置
@@ -260,36 +270,14 @@ query_expansion:
   use_deepseek: true       # 使用 DeepSeek 生成扩展查询
 
 # --------------------------------------------------------------------------
-# 12. HyDE 增强配置 (Phase 1)
-# --------------------------------------------------------------------------
-hyde:
-  enabled: true
-  max_hypotheses: 3         # 最大假设数量
-  confidence_threshold: 0.3  # 假设置信度阈值
-  use_deepseek: true        # 使用 DeepSeek 生成假设
-
-# --------------------------------------------------------------------------
-# 13. Intent Classification 配置 (Phase 1)
+# 12. Intent Classification 配置 (Phase 1)
 # --------------------------------------------------------------------------
 intent_classification:
   enabled: true
   use_deepseek: true
 
-# --------------------------------------------------------------------------
-# 14. ColBERT 配置 (Phase 2)
-# --------------------------------------------------------------------------
-colbert:
-  enabled: false            # 默认关闭，需 GPU
-  model: "colbertv2/colbertv2.0"
-  device: "cuda"           # cuda | cpu
-  max_token: 512
-  normalize: true
-
-# --------------------------------------------------------------------------
-# 15. Parent Document Retrieval 配置 (Phase 2)
-# --------------------------------------------------------------------------
-parent_retriever:
-  enabled: false
-  parent_merge_tokens: 2000  # 父 chunk 最大 token 数
-  fusion_mode: "multiply"    # multiply | add | rrf
-  sibling_count: 3           # 每个 chunk 召回的同文档相关 chunks 数
+# P0 阶段移除的配置段:
+# - hyde (Hypothetical Document Embeddings) — 性能收益不抵额外 200-500ms LLM 调用
+# - colbert (Late Interaction Retriever) — 未接入主流程，模型下载 + GPU 推理成本高
+# - parent_retriever (Parent Document) — indexer 没产出 parent chunks，是死代码
+# 详见 ARCHITECTURE.md "为什么不做" 段。

@@ -1,5 +1,12 @@
 """
 documents.py — 文档管理 API 路由
+================================================================================
+技术决策记录:
+- 上传后通过 FastAPI BackgroundTasks 触发异步索引 (P1.3)：
+  之前只存盘不处理，本修复让 upload → index 真正闭环。
+- 文档元数据存在 Qdrant 的 `documents` collection (metadata-only)，
+  不再使用内存 dict。
+- 状态查询通过 GET /documents/{id}/status 端点返回 indexing 状态。
 """
 
 from __future__ import annotations
@@ -11,8 +18,12 @@ import uuid
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
+
+from backend.ingestion.pipeline import get_document_status, index_file_task
+from backend.security.auth import require_current_user
+from backend.security.tenant import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -20,9 +31,6 @@ router = APIRouter(prefix="/documents", tags=["documents"])
 # 文档存储目录（可配置）
 DOCS_DIR = Path(__file__).parent.parent.parent / "data" / "uploaded_docs"
 DOCS_DIR.mkdir(parents=True, exist_ok=True)
-
-# 内存中的文档索引（生产环境应替换为数据库）
-_documents_index: dict[str, dict] = {}
 
 
 class DocumentInfo(BaseModel):
@@ -32,6 +40,9 @@ class DocumentInfo(BaseModel):
     uploaded_at: int
     status: str = "ready"
     metadata: dict | None = None
+    chunks: int | None = None
+    elapsed_ms: int | None = None
+    error: str | None = None
 
 
 class DocumentListResponse(BaseModel):
@@ -43,6 +54,7 @@ class DocumentUploadResponse(BaseModel):
     success: bool
     document: DocumentInfo | None = None
     error: str | None = None
+    indexing: str = "queued"  # queued | processing | indexed | failed
 
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".csv", ".json", ".html", ".xml"}
@@ -63,9 +75,16 @@ def _validate_file(file: UploadFile) -> None:
 
 
 @router.post("/upload", response_model=DocumentUploadResponse)
-async def upload_document(file: UploadFile = File(...)) -> DocumentUploadResponse:
+async def upload_document(
+    file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = BackgroundTasks(),
+    token_payload: dict = Depends(require_current_user),
+) -> DocumentUploadResponse:
     """
     上传文档到系统，自动执行解析和索引。
+
+    P1.3: 上传后通过 BackgroundTasks 触发 index_file_task，
+    文档 metadata 状态在 Qdrant 中维护（避免内存 dict 重启丢数据）。
 
     支持格式: PDF, TXT, MD, DOCX, CSV, JSON, HTML, XML
     """
@@ -87,21 +106,37 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentUploadRespons
         stored_path = DOCS_DIR / f"{file_id}{ext}"
         stored_path.write_bytes(content)
 
+        # 解析 tenant_id（多租户隔离）
+        tenant_id = (
+            token_payload.get("tenant_id")
+            if isinstance(token_payload, dict)
+            else DEFAULT_TENANT_ID
+        ) or DEFAULT_TENANT_ID
+
         doc_info = DocumentInfo(
             id=file_id,
             filename=file.filename,
             size=size,
             uploaded_at=int(Path(stored_path).stat().st_mtime * 1000),
-            status="ready",
+            status="queued",
             metadata={"original_name": file.filename, "extension": ext},
         )
 
-        _documents_index[file_id] = doc_info.model_dump()
+        # P1.3: 用 BackgroundTasks 触发异步索引，不阻塞上传响应
+        background_tasks.add_task(
+            index_file_task,
+            stored_path,
+            file_id,
+            tenant_id,
+            "recursive",
+        )
+        logger.info(f"Upload queued: {file_id} ({file.filename}, {size} bytes)")
 
-        # TODO: 触发异步解析和索引流程
-        # background_tasks.add_task(index_document, stored_path, file_id)
-
-        return DocumentUploadResponse(success=True, document=doc_info)
+        return DocumentUploadResponse(
+            success=True,
+            document=doc_info,
+            indexing="queued",
+        )
 
     except HTTPException:
         raise
@@ -110,43 +145,114 @@ async def upload_document(file: UploadFile = File(...)) -> DocumentUploadRespons
         return DocumentUploadResponse(success=False, error=str(e))
 
 
+@router.get("/{doc_id}/status", response_model=DocumentInfo)
+async def get_indexing_status(
+    doc_id: str,
+    token_payload: dict = Depends(require_current_user),
+) -> DocumentInfo:
+    """
+    获取文档的索引状态（P1.3）。
+
+    返回: queued | processing | indexed | failed
+    """
+    status_info = get_document_status(doc_id)
+    if not status_info:
+        raise HTTPException(status_code=404, detail="文档不存在或尚未开始处理")
+    return DocumentInfo(
+        id=status_info["file_id"],
+        filename="",
+        size=0,
+        uploaded_at=status_info.get("started_at", 0),
+        status=status_info.get("status", "unknown"),
+        chunks=status_info.get("chunks"),
+        elapsed_ms=status_info.get("elapsed_ms"),
+        error=status_info.get("error"),
+    )
+
+
 @router.get("", response_model=DocumentListResponse)
 async def list_documents(
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    token_payload: dict = Depends(require_current_user),
 ) -> DocumentListResponse:
-    """列出所有已上传的文档"""
-    docs = list(_documents_index.values())
+    """列出已上传的文档（按索引状态聚合）"""
+    from backend.ingestion.pipeline import list_indexed_documents
+
+    # 优先返回在 pipeline 中登记的索引状态
+    docs = list_indexed_documents()
     total = len(docs)
     paginated = docs[skip : skip + limit]
-
     return DocumentListResponse(
-        documents=[DocumentInfo(**d) for d in paginated],
+        documents=[
+            DocumentInfo(
+                id=d["file_id"],
+                filename=d.get("file_id", ""),
+                size=0,
+                uploaded_at=d.get("started_at", 0),
+                status=d.get("status", "unknown"),
+                chunks=d.get("chunks"),
+                elapsed_ms=d.get("elapsed_ms"),
+                error=d.get("error"),
+            )
+            for d in paginated
+        ],
         total=total,
     )
 
 
 @router.get("/{doc_id}", response_model=DocumentInfo)
-async def get_document(doc_id: str) -> DocumentInfo:
+async def get_document(
+    doc_id: str,
+    token_payload: dict = Depends(require_current_user),
+) -> DocumentInfo:
     """获取单个文档信息"""
-    if doc_id not in _documents_index:
-        raise HTTPException(status_code=404, detail="文档不存在")
-    return DocumentInfo(**_documents_index[doc_id])
+    status_info = get_document_status(doc_id)
+    if not status_info:
+        raise HTTPException(status_code=404, detail="文档不存在或尚未开始处理")
+    return DocumentInfo(
+        id=status_info["file_id"],
+        filename="",
+        size=0,
+        uploaded_at=status_info.get("started_at", 0),
+        status=status_info.get("status", "unknown"),
+        chunks=status_info.get("chunks"),
+        elapsed_ms=status_info.get("elapsed_ms"),
+        error=status_info.get("error"),
+    )
 
 
 @router.delete("/{doc_id}")
-async def delete_document(doc_id: str) -> dict:
-    """删除指定文档"""
-    if doc_id not in _documents_index:
-        raise HTTPException(status_code=404, detail="文档不存在")
+async def delete_document(
+    doc_id: str,
+    token_payload: dict = Depends(require_current_user),
+) -> dict:
+    """删除指定文档（同时从磁盘和 Qdrant 移除）"""
+    # 1. 删除磁盘文件
+    for ext in ALLOWED_EXTENSIONS:
+        candidate = DOCS_DIR / f"{doc_id}{ext}"
+        if candidate.exists():
+            candidate.unlink()
+            break
 
-    doc_info = _documents_index[doc_id]
-    ext = doc_info.get("metadata", {}).get("extension", "")
-    stored_path = DOCS_DIR / f"{doc_id}{ext}"
+    # 2. 从 Qdrant 删除该 doc_id 的所有 chunks
+    try:
+        from backend.config import get_config
+        from backend.ingestion import QdrantIndexer
 
-    if stored_path.exists():
-        stored_path.unlink()
+        cfg = get_config()
+        indexer = QdrantIndexer(
+            url=cfg.vector_db.url,
+            collection_name=cfg.vector_db.collection_name,
+            vector_size=cfg.vector_db.vector_size,
+            distance=cfg.vector_db.distance,
+        )
+        indexer.delete_by_doc_id(doc_id)
+    except Exception as e:
+        logger.warning(f"Qdrant 删除失败（可能索引为空）: {e}")
 
-    del _documents_index[doc_id]
+    # 3. 从 pipeline 状态字典中删除
+    from backend.ingestion.pipeline import _indexed_documents
+    _indexed_documents.pop(doc_id, None)
 
     return {"success": True, "message": f"文档 {doc_id} 已删除"}

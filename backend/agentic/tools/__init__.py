@@ -4,10 +4,12 @@ tools/__init__.py — Agent Tools Module
 from backend.agentic.tools.base import BaseTool, ToolResult
 from backend.agentic.tools.calculator import CalculatorTool
 from backend.agentic.tools.datetime_tool import DateTimeTool
+from backend.agentic.tools.web_search import WebSearchTool
 
 __all__ = [
     "BaseTool",
     "ToolResult",
     "CalculatorTool",
     "DateTimeTool",
+    "WebSearchTool",
 ]

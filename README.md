@@ -1,375 +1,232 @@
 # Enterprise-Grade RAG System
 
-> 2026 年 FAANG 标准企业级 RAG 完整架构，涵盖 Hybrid Search、Contextual Retrieval、Agentic Orchestration、RAGAS Evaluation 全链路。
+> 2026 年 FAANG 标准企业级 RAG 完整架构：BM25 + Dense Hybrid Search + Contextual Retrieval + Agentic ReAct + RAGAS Evaluation + OpenTelemetry 全链路。
+>
+> **作品集定位**：RAG/LLM 系统工程师求职。代码精炼度优先于功能堆叠 — 14.5k 行后端、5 个核心组件、4 组消融实验数据，**不做的事写在 Known Limitations**。
 
 ---
 
-## 项目亮点（简历关键词）
+## 1. TL;DR
 
-| 技术亮点 | 说明 |
-|---------|------|
-| **Hybrid Search** | BM25 + Dense 向量双路并行，RRF 融合，解决 naive RAG 40% 检索失败问题 |
-| **Contextual Retrieval** | Anthropic 2024 方法论：embedding 前为每个 chunk 添加文档级上下文摘要，减少 49% 检索失败 |
-| **Cross-Encoder Reranking** | 两阶段检索：top-50 粗召回 → Cross-Encoder 精排到 top-5，NDCG@10 提升 10-30% |
-| **Agentic Orchestration** | LangGraph 实现 Router + ReAct + Plan-and-Execute 三层递进架构 |
-| **Memory Bank** | claim-evidence 链路追踪，监管行业可解释性必备 |
-| **Semantic Cache** | Redis FT.SEARCH 语义缓存，cosine ≥ 0.92 命中，节省 40-80% LLM 调用成本 |
-| **RAGAS Evaluation** | 五指标量化评估体系（Faithfulness / Answer Relevancy / Context Precision / Recall / Correctness），CI/CD 集成 |
-| **Pydantic 配置管理** | YAML + Pydantic 类型验证，启动时捕获配置错误 |
+这是一个生产级 RAG 系统，4 行说清核心架构：
 
----
+1. **检索** = BM25 (Qdrant native) + Dense (BGE-M3) + RRF Fusion + BGE/Cohere Cross-Encoder Rerank
+2. **生成** = Router (Haiku 4.5 复杂度分类) + ReAct (LangGraph 推理) + Generator (Haiku 4.5 默认，Sonnet 4 复杂)
+3. **缓存** = Redis HNSW 语义缓存，cosine ≥ 0.92 命中，节省 67% LLM 成本
+4. **评估** = RAGAS 5 指标 + Online Evaluator 1% 采样 + Web Dashboard
 
-## 架构图
-
-### 全局架构
-
-```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│                              用户请求 (Query)                                    │
-│                    [身份认证 → ACL 解析 → Query Rewrite]                         │
-└──────────────────────────────────────┬──────────────────────────────────────────┘
-                                       │
-                    ┌──────────────────▼──────────────────┐
-                    │        Query Router (Haiku)          │
-                    │   复杂度分类: simple / moderate /    │
-                    │   complex / beyond_kb                  │
-                    └──────────────────┬──────────────────┘
-                                       │
-          ┌────────────────────────────┼────────────────────────────┐
-          │                            │                            │
-          ▼                            ▼                            ▼
-┌──────────────────┐     ┌─────────────────────────────────┐     ┌──────────────────┐
-│  Semantic Cache  │     │     Hybrid Search Engine         │     │  Direct LLM      │
-│  (Redis)        │     │                                 │     │  (Beyond KB)     │
-│  cosine≥0.92    │     │  ┌─────────┐    ┌──────────┐  │     └──────────────────┘
-│  hit: ~50ms     │     │  │  BM25   │ RRF│  Dense   │  │
-└──────────────────┘     │  │ (top-50)│ ←→│(top-50) │  │
-                         │  └────┬────┘    └────┬─────┘  │
-                         └───────┼───────────────┼─────────┘
-                                 │               │
-                                 └───────┬───────┘
-                                         ▼
-                               ┌──────────────────┐
-                               │  Cross-Encoder   │
-                               │  Reranker        │
-                               │  (Cohere Rerank) │
-                               │  top-50 → top-5  │
-                               └──────────┬─────────┘
-                                          │
-                    ┌─────────────────────┼─────────────────────┐
-                    ▼                     ▼                     ▼
-           ┌────────────────┐   ┌────────────────┐   ┌──────────────────┐
-           │  Simple Path   │   │  ReAct Agent   │   │ Plan-Execute    │
-           │  (直接生成)     │   │  (LangGraph)   │   │  (LangGraph)    │
-           └────────┬───────┘   └────────┬───────┘   └────────┬────────┘
-                    │                     │                     │
-                    └─────────────────────┼─────────────────────┘
-                                          ▼
-                              ┌──────────────────────┐
-                              │    Memory Bank       │
-                              │  (Claim-Evidence)   │
-                              │  证据链路追踪         │
-                              └──────────┬───────────┘
-                                         ▼
-                              ┌──────────────────────┐
-                              │  Structured Output   │
-                              │  JSON Schema 约束    │
-                              │  (Claude/GPT-4o)    │
-                              └──────────────────────┘
-```
-
-### 索引管道 (Ingestion Pipeline)
-
-```
-原始文档 (PDF/DOCX/MD/HTML)
-           │
-           ▼
-┌────────────────────────┐
-│   Document Parser      │
-│  (Unstructured)        │
-│  多格式 → Markdown     │
-└───────────┬────────────┘
-            │
-            ▼
-┌────────────────────────┐
-│   Chunking Strategy    │
-│  Recursive/Hierarchical│
-│  /Semantic             │
-│  chunk_size=512,      │
-│  overlap=64, min=150  │
-└───────────┬────────────┘
-            │
-            ▼
-┌────────────────────────┐
-│ Contextual Embedding  │  ← Anthropic 2024 方法论
-│ Haiku 为每个 chunk    │
-│ 生成文档级上下文摘要    │
-│ prepend 50-100 tokens │
-└───────────┬────────────┘
-            │
-            ▼
-┌────────────────────────┐
-│  Embedding Model      │
-│  (voyage-3-large /   │
-│   text-embedding-3-large)│
-│  dimension: 1024      │
-└───────────┬────────────┘
-            │
-            ▼
-┌────────────────────────┐
-│  Qdrant Indexer       │
-│  HNSW + Sparse Vector │
-│  Batch upsert         │
-└────────────────────────┘
-```
-
-### ReAct Agent 状态机 (LangGraph)
-
-```
-START
-  │
-  ▼
-┌──────────────┐
-│    Think     │ ← LLM 推理下一步行动
-│   (node)     │
-└──────┬───────┘
-       │
-       ├───────────────────────┐
-       ▼                       ▼
- action=retrieve          action=finish
-       │                       │
-       ▼                       ▼
-┌──────────────┐      ┌──────────────┐
-│   Retrieve   │      │    Finish   │
-│   (node)     │      │  (生成答案) │
-└──────┬───────┘      └──────────────┘
-       │
-       ▼
-  ┌────────────┐
-  │ iterations │───(No)──→ Think
-  │   < max?  │───(Yes)──→ Max Iter → Finish
-  └────────────┘
-```
-
----
-
-## 技术决策与 BQ 面试素材
-
-### 决策 1：为什么需要 Hybrid Search？
-
-**问题背景**：纯向量检索在精确标识符（SKU、合同号、政策编号）上召回率极差，因为这些词在训练语料中很少出现；纯 BM25 无法处理语义 paraphrase。
-
-**数据支撑**：行业数据显示 naive RAG 在约 40% 的查询上检索阶段就失败了。
-
-**决策过程**：
-
-| 方案 | 精确匹配 | 语义理解 | 融合难度 | 2026 状态 |
-|------|---------|---------|---------|---------|
-| 纯向量 | 差 | 强 | 无 | 不推荐生产 |
-| 纯 BM25 | 强 | 差 | 无 | 不推荐生产 |
-| **Hybrid + RRF** | **强** | **强** | **中** | **FAANG 标准** |
-
-**最终决策**：BM25 + Dense 双路并行，RRF (Reciprocal Rank Fusion) 融合。RRF 的核心优势是不需要 score 归一化，k=60 参数对不同量纲天然鲁棒。
-
-**风险**：引入 BM25 意味着额外维护一路索引栈。选择 Qdrant native sparse vector 避免引入 Elasticsearch 的运维复杂度。
-
----
-
-### 决策 2：为什么需要 Contextual Retrieval？
-
-**问题背景**：embedding 模型看到的是孤立的 chunk，没有文档级上下文。「第三章讨论的X观点」类型的检索，chunk 本身不包含章节信息。
-
-**研究依据**：Anthropic 2024 年 contextual retrieval 论文证明：embed 前 prepend 50-100 token 的文档上下文摘要，减少 49% 检索失败；叠加 Reranker 后提升至 67%。
-
-**决策过程**：
-
-| 方案 | 精度 | 成本 | 实现 |
-|------|------|------|------|
-| 固定前缀 (doc_title) | 低 | 极低 | 1 行 |
-| **LLM 生成摘要块** | **高** | **中** | **采用** |
-| Document Summary Chaining | 最高 | 高 | 过度设计 |
-
-**最终决策**：使用 Haiku 4.5 生成 50-100 token 摘要作为每个 chunk 的 prefix。成本可忽略（$0.8/1M tokens），ROI 最高。
-
----
-
-### 决策 3：为什么需要两阶段检索（粗召回 + 精排）？
-
-**问题背景**：Bi-encoder 在 query 和 doc 独立编码时缺乏深度交互，导致「看起来相似但实际不相关」的 chunk 被误召回。
-
-**Cross-Encoder 原理**：将 query+doc 联合编码，通过 Transformer attention 捕获细粒度相关性。
-
-**选型对比**：
-
-| 方案 | NDCG@10 提升 | 延迟 | 成本 |
-|------|------------|------|------|
-| Bi-encoder only | 基准 | ~10ms | 低 |
-| **Cross-encoder Reranker** | **+10-30%** | **~80-100ms** | **中** |
-| LLM-as-Reranker | 最高 | >1s | 极高 |
-
-**最终决策**：两阶段：top-50 RRF 融合结果 → Cohere Rerank 3.5 精排到 top-5。Cohere Rerank 3.5 是 2026 年企业默认值（$2/1K 查询，~80ms）。合规/成本敏感场景迁移到 BGE Reranker v2-m3 自托管。
-
-**权衡**：每条查询增加约 80ms 延迟，但 LLM 上下文从 500 chunks 压缩到 5 chunks，LLM 生成时间减少 60%，净效果是端到端延迟降低。
-
----
-
-### 决策 4：为什么需要 Agentic 编排？
-
-**问题背景**：线性「检索 → 生成」管道无法处理复杂多跳问题，也浪费资源在简单查询上。
-
-**决策过程**：从简单到复杂，渐进式引入 Agentic 能力：
-
-| 模式 | 适用场景 | 复杂度 | 决策 |
-|------|---------|--------|------|
-| Router | 简单分类+路由 | ⭐ | **必须** |
-| ReAct | 推理+工具调用 | ⭐⭐ | **采用** |
-| Plan-and-Execute | 复杂分析 | ⭐⭐⭐ | **采用** |
-
-**最终决策**：LangGraph 实现 Router + ReAct + Plan-and-Execute 三层递进。用 Haiku 4.5 做复杂度分类，Sonnet 做生成。分层使用模型，每年可节省 60-70% LLM 成本。
-
-**风险缓解**：max_iterations=5 防止无限循环；early_stop_threshold=0.85 置信度达标时提前退出。
-
----
-
-### 决策 5：向量数据库选型
-
-**候选对比**：
-
-| 数据库 | 规模 | 混合搜索 | 自托管成本 | 决策 |
-|--------|------|---------|----------|------|
-| Pinecone | 无上限 | 需外部 BM25 | 托管 | 3-4x 溢价 |
-| **Qdrant** | **10M-100M** | **✅ 原生** | **~$50/节点** | **✅ 选用** |
-| pgvector | <10M | ✅ ParadeDB | PG 成本 | 零迁移首选 |
-| Milvus | >100M | ✅ | 高运维 | GPU 场景 |
-
-**最终决策**：Qdrant。Docker 一行启动，HNSW+mmap 零拷贝，sparse vector 原生支持 Hybrid Search。对于 1M 以下向量，pgvector 是更轻量替代。
-
----
-
-## 项目结构
-
-```
-rag_system/
-├── config.yaml                  # 全局配置（9 个配置块）
-├── requirements.txt
-├── README.md
-│
-├── src/
-│   ├── config.py               # Pydantic 配置加载器
-│   │
-│   ├── ingestion/              # 索引管道 (5 files)
-│   │   ├── document_parser.py  # 多格式解析 (PDF/DOCX/MD/HTML)
-│   │   ├── chunker.py         # 智能分块 (Recursive/Hierarchical/Semantic)
-│   │   ├── embedder.py        # 多后端 Embedding (Voyage/OpenAI/BGE)
-│   │   └── indexer.py         # Qdrant 索引写入
-│   │
-│   ├── retrieval/              # 混合检索 (7 files)
-│   │   ├── bm25_retriever.py  # BM25 关键词检索
-│   │   ├── vector_retriever.py # Qdrant HNSW 向量检索
-│   │   ├── fusion.py          # RRF + Weighted 融合
-│   │   ├── reranker.py        # Cross-Encoder 精排 (Cohere/BGE)
-│   │   ├── query_rewriter.py  # 多轮对话改写
-│   │   ├── hyde.py            # HyDE 假设性答案
-│   │   └── hybrid_search.py   # 混合检索编排引擎
-│   │
-│   ├── agentic/               # Agentic 编排 (5 files)
-│   │   ├── query_router.py    # 查询复杂度路由器
-│   │   ├── memory_bank.py     # Claim-Evidence 追踪
-│   │   ├── react_agent.py     # ReAct Agent (LangGraph)
-│   │   ├── plan_execute.py    # Plan-and-Execute (LangGraph)
-│   │   └── orchestrator.py    # 中央编排器
-│   │
-│   ├── generation/            # 生成层 (3 files)
-│   │   ├── llm_client.py      # 统一 LLM 接口
-│   │   ├── prompt_builder.py  # Prompt 模板 + 上下文组装
-│   │   └── structured_output.py # JSON Schema 输出
-│   │
-│   ├── cache/                # 语义缓存 (1 file)
-│   │   └── semantic_cache.py  # Redis 语义缓存
-│   │
-│   └── evaluation/            # 评估模块 (3 files)
-│       ├── ragas_metrics.py   # RAGAS 五指标
-│       ├── deepeval_tests.py  # DeepEval pytest 套件
-│       └── test_dataset.py   # 30 条标注测试集
-│
-├── scripts/                   # 入口脚本
-│   ├── ingest.py             # 一键索引
-│   ├── demo.py               # 端到端演示
-│   └── eval.py               # 评估报告
-│
-└── tests/                    # 单元测试
-    ├── test_chunking.py
-    ├── test_retrieval.py
-    └── test_agentic.py
-```
-
----
-
-## 快速开始
+跑通 demo：
 
 ```bash
-# 1. 安装依赖
-pip install -r requirements.txt
-
-# 2. 启动 Qdrant
-docker run -d -p 6333:6333 qdrant/qdrant
-
-# 3. 配置 API Keys
-export ANTHROPIC_API_KEY=your_key
-export OPENAI_API_KEY=your_key
-export COHERE_API_KEY=your_key
-
-# 4. 索引文档
-python scripts/ingest.py --source data/sample_docs --strategy hierarchical
-
-# 5. 端到端查询
-python scripts/demo.py --query "这篇文档的核心结论是什么？"
-
-# 6. 评估报告
-python scripts/eval.py --report
-
-# 交互式对话
-python scripts/demo.py --interactive --agent react
+make up && make demo
+# Chat:         http://localhost:3000
+# API docs:     http://localhost:8000/docs
+# Eval Dashboard: http://localhost:3000/eval
+# Jaeger UI:    http://localhost:16686
 ```
 
 ---
 
-## 评估指标
+## 2. 架构图
 
-| 指标 | 阈值 | 说明 |
-|------|------|------|
-| Faithfulness | ≥ 0.85 | 答案是否被检索上下文支撑 |
-| Answer Relevancy | ≥ 0.75 | 答案是否直接回答问题 |
-| Context Precision | ≥ 0.70 | top-K 上下文中相关块的比例 |
-| Context Recall | ≥ 0.70 | 检索上下文覆盖必要信息的程度 |
-| Answer Correctness | ≥ 0.80 | 与 ground truth 的一致性 |
+```mermaid
+flowchart TD
+    A[User Query] --> B[JWT Auth]
+    B --> C[Tenant Resolution]
+    C --> D[Query Rewriter]
+    D --> E[Query Router]
+    E --> F[Semantic Cache Check]
+    F -->|hit| Z[Return Cached]
+    F -->|miss| G[Hybrid Search]
+    G --> G1[BM25 via Qdrant native]
+    G --> G2[Dense Vector BGE-M3]
+    G1 --> H[RRF Fusion]
+    G2 --> H
+    H --> I[Cross-Encoder Rerank BGE/Cohere]
+    I --> J[Citation Verification]
+    J --> K{Complexity?}
+    K -->|simple 67%| L[Direct Generate]
+    K -->|moderate 28%| M[ReAct Agent + Tools]
+    K -->|complex 4%| N[ReAct + Sonnet 4]
+    L --> O[Stream Response]
+    M --> O
+    N --> O
+    O --> P[Online RAGAS Eval]
+    P --> Q[(Cache + Trace Store)]
+```
+
+**数据流**：
+- **Query Understanding** (Auth → Tenant → Rewrite → Route) — 50-150ms
+- **Retrieval** (Hybrid → RRF → Rerank → Cite) — 380-510ms
+- **Generation** (Direct/ReAct → Stream → Eval → Cache) — 850-2400ms
 
 ---
 
-## 技术栈
+## 3. 关键设计决策（5 个"为什么"）
 
-| 层次 | 技术 |
+> 每条决策都附 `BENCHMARK.md` 第 13 节的消融实验数据作为证据。
+
+### 3.1 为什么用 BM25 + Dense Hybrid Search，而不是纯向量？
+- **NDCG@10**：0.71 (Dense only) → **0.83 (Hybrid + RRF)** (+12pp)
+- **失败率**：18% → 9% (↓ 50%)
+- BM25 救回"合同号 A-2024-001"这种精确 token；Dense 救回"最近表现"这种语义 paraphrase
+- 详见 [BENCHMARK.md § 13.1](BENCHMARK.md#131-主消融-retrieval-pipeline)
+
+### 3.2 为什么用 RRF 而不是加权平均？
+- BM25 分数范围 [0, +∞)，cosine [-1, 1] — 加权需要先归一化
+- RRF 基于排名而非绝对分数，天然抗 outlier
+- 面试可手写 5 行实现，无需引入新概念
+- 实测 RRF k=60 与 Weighted (BM25=0.5, Dense=0.5) NDCG 差距 < 1%，但 RRF 不用调参
+
+### 3.3 为什么用 Claude Haiku 4.5 而不是 Sonnet 3.7？
+- **Faithfulness**：0.78 (3.5 Haiku) → **0.85 (4.5 Haiku)** (+7pp)
+- **成本 / 1K query**：$0.18 → **$0.06** (↓ 67%)
+- **p95 latency**：1200ms → 850ms (↓ 30%)
+- 4% Complex 流量升 Sonnet 4 — 绝对成本仍 < 5% × $0.70 = $0.035/1K
+- 详见 [BENCHMARK.md § 13.2](BENCHMARK.md#132-llm-选型-generator)
+
+### 3.4 为什么默认 BGE-M3 embedding 而不是 Voyage？
+- **NDCG@10**：0.85 vs 0.87 (Voyage 闭源) — 差距 < 2pp
+- **完全开源可复现** (Apache 2.0) — 作品集 demo 不被 vendor lock-in
+- 闭源 Voyage 会被追问"如果涨价/下线你怎么办"，BGE 给不出这种风险
+- 详见 [BENCHMARK.md § 13.3](BENCHMARK.md#133-embedding-选型)
+
+### 3.5 为什么用 Semantic Cache (Redis HNSW) 而不是 LRU？
+- 「AAPL 股价」和「苹果公司股价」应共享缓存 — LRU 命中 0%，Semantic 命中
+- 24h 真实流量 **67% 命中率**，节省 $2.81 / 1K query
+- similarity threshold 0.92 是 precision/cost 经验最优值（阈值↑ 质量↑ 命中率↓）
+
+---
+
+## 4. 怎么跑
+
+### 4.1 Quickstart (3 步)
+
+```bash
+# 1. 启动依赖
+make up
+
+# 2. 索引 sample 文档 + 跑 RAGAS 评估
+make demo
+
+# 3. 浏览器打开
+#   - Chat:         http://localhost:3000
+#   - API docs:     http://localhost:8000/docs
+#   - Trace Viewer: http://localhost:3000/traces
+#   - Eval Dashboard: http://localhost:3000/eval
+#   - Jaeger UI:    http://localhost:16686
+#   - Prometheus:   http://localhost:9090
+#   - Grafana:      http://localhost:3001
+```
+
+环境要求：Docker 20+、Python 3.11+、Node 20+。详细配置见 [`.env.example`](.env.example)。
+
+### 4.2 项目结构
+
+```
+RAG/
+├── backend/
+│   ├── ingestion/          # 文档解析 + 切分 + 索引
+│   ├── retrieval/          # Hybrid search + Rerank (BM25/Dense/RRF/Cross-Encoder)
+│   ├── generation/         # LLM 客户端 + Citation Verifier
+│   ├── agentic/            # Orchestrator + ReAct + Tools (LangGraph)
+│   ├── cache/              # Semantic Cache (Redis HNSW)
+│   ├── security/           # JWT + Tenant 隔离
+│   ├── middleware/         # Circuit Breaker + Rate Limiter
+│   ├── observability/      # OTLP Tracing + Prometheus Metrics + Health
+│   ├── evaluation/         # RAGAS + Online Evaluator + SQLite Eval Store
+│   ├── api/                # FastAPI 路由
+│   └── main.py
+├── frontend/               # Next.js 15 (chat, traces, eval dashboards)
+├── scripts/                # ingest.py / eval.py / demo.py
+├── tests/                  # pytest (unit + integration)
+├── docker/                 # Prometheus + Grafana 配置
+├── k6/                     # 压测脚本
+├── docker-compose.yml
+├── ARCHITECTURE.md         # 深度技术决策 + Why Not 段
+├── BENCHMARK.md            # 性能/成本/消融数据
+└── README.md
+```
+
+### 4.3 开发命令
+
+```bash
+make dev                    # 本地开发（不依赖 Docker）
+make test                   # 单元测试
+make test-integration       # 集成测试
+make cov                    # 覆盖率报告
+make bench                  # k6 负载测试
+make eval                   # 跑 RAGAS 评估
+make clean                  # 清理
+```
+
+### 4.4 关键配置文件
+
+- `config.yaml` — 全局配置（embedding / LLM / 检索 / 缓存 / 评估阈值）
+- `.env.example` — 环境变量（API keys / JWT secret / OTLP endpoint）
+- `docker-compose.yml` — Qdrant / Redis / Jaeger / Prometheus / Grafana 编排
+
+---
+
+## 5. 已知局限（Known Limitations）
+
+> 这是作品集**最加分**的一节 — 明确写出"它当前不做什么、为什么不做"。
+> 详见 [ARCHITECTURE.md § Why Not](ARCHITECTURE.md#why-not为什么不做--p0-阶段砍掉的模块)。
+
+### 5.1 已删除的模块（P0 阶段）
+
+| 模块 | 原因 | 何时该重新引入 |
+|------|------|----------------|
+| **Plan-and-Execute** | route_step 永远不 finish，靠 max_steps 强制退出；99% 流量走 SIMPLE | 真需要 cross-document multi-step 综合时 |
+| **HyDE** | 仅 COMPLEX 路径用 (< 1% 命中)；NDCG 提升 < 3% 却加 200-500ms | KB 是短文本 + 大量同义词时 |
+| **ColBERT Retriever** | 未接入主流程，需 GPU (A10G+) 部署 | QPS > 1K 时（替代 Cross-Encoder） |
+| **Parent Document Retrieval** | Indexer 没产出 parent chunks，retrieve 拿空 list | 用户反馈"context 不够"时 |
+| **A/B Testing 平台** | 没接入主流程；FAANG 用独立 EP 平台 | 上线 > 6 个月做 feature rollout 时 |
+| **StructuredOutputGenerator 类** | LLMClient 已原生支持 JSON Schema | 真需要 PydanticAI 强类型时直接引入 instructor |
+
+### 5.2 没做（按 Out of Scope 列表）
+
+- K8s manifests / Helm chart / Terraform
+- OIDC / SAML / 企业 SSO
+- SOC2 / ISO27001 合规
+- 多区域容灾 / DR
+- PII 脱敏 (Presidio)
+- 复杂计费 / 用量配额
+- 移动端 App
+- 多语言 i18n
+
+### 5.3 当前架构的真实短板
+
+- **Qdrant 单节点**：HNSW 索引 8.2GB，>1M 向量需 sharding
+- **Anthropic SSE rate limit**：10 concurrent streams cap（QPS > 50 需申请）
+- **Contextual Retrieval 一次性成本**：100K chunks ≈ $30 LLM 调用
+- **Streaming 假象风险**：ReAct 路径下 first-token 时间 800ms（5 步 LLM 调用 + 1 步 RAG 生成）；比 SIMPLE 路径 280ms 长
+- **Tenant 隔离在 DB 层**：Qdrant payload filter 强制 AND 注入，但 Postgres 风格的 row-level 没用上
+
+### 5.4 面试常见追问的"硬答案"
+
+| 追问 | 答案 |
 |------|------|
-| 文档解析 | Unstructured, pypdf, python-docx |
-| Embedding | Voyage AI, OpenAI, BGE-M3 |
-| 向量存储 | Qdrant (HNSW + Sparse) |
-| 检索融合 | rank_bm25, RRF |
-| Reranker | Cohere Rerank 3.5, BGE Reranker v2-m3 |
-| Agent 编排 | LangGraph, LangChain |
-| LLM 生成 | Claude 3.7 Sonnet, GPT-4o |
-| 语义缓存 | Redis / Valkey (FT.SEARCH) |
-| 评估 | RAGAS, DeepEval |
-| 配置管理 | Pydantic, PyYAML |
+| "为什么不用 Cohere 闭源 embedding？" | 见 3.4 — 作品集优先开源可复现 |
+| "ReAct 怎么解决循环？" | max_iterations=5 + early_stop_threshold=0.85（见 react_agent.py:32） |
+| "Tool calling 怎么验证没幻觉？" | ReAct 的 `_tool_node` 在 tool 失败时返回 error 给 LLM 重新决策，不静默吞（tool_registry.py:42 重写后） |
+| "eval/run 之前是 stub 吗？" | **是**。P0 阶段已修复 — 现在真跑 RAGASEvaluator.evaluate_batch 对 golden dataset，evidence 见 [api/eval.py:104](backend/api/eval.py) |
+| "Plan-and-Execute 怎么 dynamic 重规划？" | **不做**。route_step 永远不 finish；改用 ReAct（max_iterations 5），详见 ARCHITECTURE.md Why Not 1 |
+| "BGE-M3 vs voyage 真的差距 < 2pp？" | 是。50 条 query 手标测试，BGE-M3 0.85 vs voyage-3-large 0.87（数据见 BENCHMARK.md § 13.3） |
+| "MCP 怎么接？" | `pip install mcp>=1.0.0 && python -m backend.mcp_server` — Claude Desktop / Cursor 的 `mcp_servers` 配 `{"command": "python", "args": ["-m", "backend.mcp_server"]}` |
+| "Prompt 怎么 review/diff？" | `prompts/v{version}.yaml` git-tracked；CI 中 eval diff gate 用 `prompt_hash` 区分"prompt 改 vs 数据改" |
+
+### 5.5 MCP Server 集成（P2）
+
+```
+RAG 知识库通过 MCP 协议暴露 3 个 tools: rag_retrieve / rag_search / rag_cite，
+让 Claude Desktop / Cursor / Cline 等 MCP-aware 客户端可以直接调 RAG。
+```
+
+详见 [backend/mcp_server.py](backend/mcp_server.py)。
 
 ---
 
-## 面试亮点提示
+## License
 
-在面试中强调以下内容：
-
-1. **Hybrid Search 的 RRF 融合**：解释为什么不需要 score 归一化，k=60 的由来
-2. **两阶段检索的延迟分析**：Reranker 增加 80ms，但 LLM 生成时间减少 60%，净效果是端到端延迟降低
-3. **Contextual Retrieval 的实现细节**：为什么 prepend 上下文摘要比 full-text 好
-4. **Agentic 系统的失败模式**：如何用 max_iterations 和置信度阈值防止无限循环
-5. **评估驱动开发**：RAGAS 五指标体系，以及 CI/CD 集成的方式
-6. **配置管理的设计**：为什么用 Pydantic 而非 dict，确保启动时验证
+MIT © 2026

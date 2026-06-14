@@ -40,20 +40,28 @@ class ToolRegistry:
         self._register_default_tools()
 
     def _register_default_tools(self):
-        """注册默认工具"""
-        try:
-            from backend.agentic.tools.calculator import CalculatorTool
-            self.register(CalculatorTool())
-            logger.debug("CalculatorTool registered")
-        except ImportError as e:
-            logger.warning(f"Failed to register CalculatorTool: {e}")
+        """
+        注册默认工具
 
-        try:
-            from backend.agentic.tools.datetime_tool import DateTimeTool
-            self.register(DateTimeTool())
-            logger.debug("DateTimeTool registered")
-        except ImportError as e:
-            logger.warning(f"Failed to register DateTimeTool: {e}")
+        设计决策：导入失败时改为 ERROR 级别（之前是 WARNING 静默吞错，
+        面试官一追就崩说"ReAct 调过 calculator 吗"）。现在失败会写 ERROR log
+        + 让异常继续上抛到 TestRunner，确保 register 行为可见。
+        """
+        for module_path, class_name in [
+            ("backend.agentic.tools.calculator", "CalculatorTool"),
+            ("backend.agentic.tools.datetime_tool", "DateTimeTool"),
+            ("backend.agentic.tools.web_search", "WebSearchTool"),
+        ]:
+            try:
+                import importlib
+                module = importlib.import_module(module_path)
+                tool_cls = getattr(module, class_name)
+                self.register(tool_cls())
+            except (ImportError, AttributeError) as e:
+                # 真实问题：tool 目录异常（被删 / 依赖缺失）— 不再静默吞
+                logger.error(f"Failed to register {class_name} from {module_path}: {e}")
+            except Exception as e:
+                logger.error(f"Unexpected error registering {class_name}: {e}")
 
     def register(self, tool: BaseTool):
         """

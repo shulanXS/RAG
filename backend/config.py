@@ -75,6 +75,10 @@ class VectorDBConfig(BaseModel):
     sparse_k1: float = 1.5
     sparse_b: float = 0.75
     batch_size: int = 64
+    # BM25 路径选择:
+    # - "qdrant_sparse": 使用 Qdrant native sparse vector（推荐，零额外服务）
+    # - "external": 使用 rank_bm25 库（适合需要复杂 BM25 调参的场景）
+    bm25_mode: Literal["qdrant_sparse", "external"] = "qdrant_sparse"
 
 
 class RerankerConfig(BaseModel):
@@ -115,6 +119,10 @@ class LLMConfig(BaseModel):
     deepseek: DeepSeekApiConfig = Field(default_factory=DeepSeekApiConfig)
     generator: LLMGeneratorConfig = Field(default_factory=LLMGeneratorConfig)
     router: LLMRouterConfig = Field(default_factory=LLMRouterConfig)
+    use_structured_output: bool = Field(
+        default=True,
+        description="是否在非流式生成路径中启用 JSON Schema 约束输出",
+    )
 
 
 class HybridSearchConfig(BaseModel):
@@ -131,17 +139,12 @@ class ReActConfig(BaseModel):
     early_stop_threshold: float = 0.85
 
 
-class PlanExecuteConfig(BaseModel):
-    """Plan-and-Execute 配置"""
-    max_steps: int = 8
-    max_subqueries_per_step: int = 3
-
-
 class AgenticConfig(BaseModel):
     """Agentic 编排配置"""
     complexity_threshold: float = 0.6
     react: ReActConfig = Field(default_factory=ReActConfig)
-    plan_execute: PlanExecuteConfig = Field(default_factory=PlanExecuteConfig)
+    # P0 阶段移除 plan_execute 配置段 — Plan-and-Execute Agent 已删除。
+    # 详见 ARCHITECTURE.md 的"为什么不做"段。
 
 
 class SemanticCacheConfig(BaseModel):
@@ -192,6 +195,9 @@ class LoggingConfig(BaseModel):
     trace_enabled: bool = True
     log_retrieval_scores: bool = True
     log_citation_mapping: bool = True
+    # 日志轮转配置（避免日志撑爆磁盘）
+    max_bytes: int = 100 * 1024 * 1024  # 单个日志文件 100MB
+    backup_count: int = 5  # 保留 5 个历史日志文件
 
 
 class PathsConfig(BaseModel):

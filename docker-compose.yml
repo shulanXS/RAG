@@ -42,6 +42,55 @@ services:
       retries: 5
 
   # --------------------------------------------------------------------------
+  # Jaeger (OTLP tracing 后端) — P1.5
+  # --------------------------------------------------------------------------
+  jaeger:
+    image: jaegertracing/all-in-one:1.62
+    container_name: rag-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "4317:4317"     # OTLP gRPC ingest
+      - "4318:4318"     # OTLP HTTP ingest
+    volumes:
+      - jaeger_data:/badger
+
+  # --------------------------------------------------------------------------
+  # Prometheus (metrics 收集) — P1.5
+  # --------------------------------------------------------------------------
+  prometheus:
+    image: prom/prometheus:v2.54.0
+    container_name: rag-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+
+  # --------------------------------------------------------------------------
+  # Grafana (可视化面板) — P1.5
+  # --------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: rag-grafana
+    ports:
+      - "3001:3000"
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./docker/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./docker/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
+  # --------------------------------------------------------------------------
   # Backend API (FastAPI)
   # --------------------------------------------------------------------------
   backend:
@@ -59,6 +108,11 @@ services:
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
       - COHERE_API_KEY=${COHERE_API_KEY:-}
+      # P1.4 强校验
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      - JWT_PEPPER=${JWT_PEPPER:?JWT_PEPPER is required}
+      # P1.5 OTLP tracing 后端
+      - OTLP_ENDPOINT=http://jaeger:4317
     volumes:
       - ./logs:/app/logs
       - ./data:/app/data
@@ -67,12 +121,16 @@ services:
         condition: service_healthy
       redis:
         condition: service_healthy
+      # P4.4: tracing/metrics 服务已启动（不强依赖，启动失败也允许 backend 跑）
+      jaeger:
+        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/api/health/live"]
       interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 30s
+      # P1.5: Python 启动慢（模型加载、HTTP 连接），给 60s
+      start_period: 60s
     restart: unless-stopped
 
   # --------------------------------------------------------------------------
@@ -92,3 +150,6 @@ services:
 volumes:
   qdrant_data:
   redis_data:
+  jaeger_data:
+  prometheus_data:
+  grafana_data:

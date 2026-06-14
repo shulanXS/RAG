@@ -99,15 +99,19 @@ class RedisSemanticCache(SemanticCache if REDISVL_AVAILABLE else object):
         self._misses = 0
         self._total_requests = 0
 
-        # Redis 客户端（延迟初始化）
-        self._redis_client: redis.Redis | None = None
+        # Redis async 客户端（P1.2 升级：避免阻塞 event loop）
+        self._redis_client: "redis.asyncio.Redis | None" = None
         self._index: AsyncSearchIndex | None = None
 
-    def _get_client(self) -> "redis.Redis":
-        """延迟初始化 Redis 客户端"""
+    def _get_client(self) -> "redis.asyncio.Redis":
+        """延迟初始化 Redis async 客户端
+
+        P1.2: 之前使用同步 redis.Redis 在 async 上下文里会阻塞 event loop，
+        改造为 redis.asyncio.Redis，使 set/get 完全非阻塞。
+        """
         if self._redis_client is None:
-            import redis
-            self._redis_client = redis.Redis(
+            import redis.asyncio as aioredis
+            self._redis_client = aioredis.Redis(
                 host=self._host,
                 port=self._port,
                 decode_responses=False,
@@ -281,7 +285,8 @@ class RedisSemanticCache(SemanticCache if REDISVL_AVAILABLE else object):
             # 设置 Redis TTL（redisvl key 格式为 {index_name}:{id}）
             redis_client = self._get_client()
             redis_key = f"{self._index_name}:{doc_id}"
-            redis_client.expire(redis_key, self._ttl_seconds)
+            # P1.2: redis_client 是 redis.asyncio.Redis，expire 是 coroutine
+            await redis_client.expire(redis_key, self._ttl_seconds)
 
             logger.debug(f"语义缓存写入: key={doc_id}, ttl={self._ttl_seconds}s")
 

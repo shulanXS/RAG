@@ -26,8 +26,11 @@ query_rewriter.py — 多轮对话查询改写器 + 意图分类
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Literal
@@ -252,15 +255,62 @@ class QueryRewriter:
         self,
         llm_client=None,
         enable_intent_classification: bool = True,
+        cache_size: int = 500,
     ):
         """
         Args:
             llm_client: 可选，传入 LLM client 实例。如果不传，跳过重写。
             enable_intent_classification: 是否启用意图分类
+            cache_size: rewrite 结果的 LRU 缓存大小（避免相同 query 重复 LLM 调用）
         """
         self._llm = llm_client
         self._enable_intent_classification = enable_intent_classification
         self._classifier = QueryClassifier(llm_client) if enable_intent_classification else None
+        # LRU cache: (query, history_hash) -> RewrittenQuery
+        self._cache: OrderedDict[str, RewrittenQuery] = OrderedDict()
+        self._cache_size = cache_size
+        self._cache_hits = 0
+        self._cache_misses = 0
+
+    @staticmethod
+    def _make_cache_key(query: str, history: list[dict] | None) -> str:
+        """生成稳定 cache key：query + 最近 3 条历史的 content 哈希"""
+        h = hashlib.md5()
+        h.update(query.encode("utf-8"))
+        h.update(b"|")
+        if history:
+            for msg in history[-3:]:
+                h.update(str(msg.get("content", "")).encode("utf-8"))
+                h.update(b"|")
+        return h.hexdigest()
+
+    def _cache_get(self, key: str) -> RewrittenQuery | None:
+        """从 LRU 缓存获取，并把访问过的项移到末尾"""
+        if key not in self._cache:
+            return None
+        self._cache.move_to_end(key)
+        self._cache_hits += 1
+        return self._cache[key]
+
+    def _cache_put(self, key: str, value: RewrittenQuery) -> None:
+        """放入 LRU 缓存；超过容量时淘汰最旧的"""
+        if key in self._cache:
+            self._cache.move_to_end(key)
+        self._cache[key] = value
+        while len(self._cache) > self._cache_size:
+            self._cache.popitem(last=False)
+        self._cache_misses += 1
+
+    def get_cache_stats(self) -> dict:
+        total = self._cache_hits + self._cache_misses
+        hit_rate = self._cache_hits / total if total > 0 else 0.0
+        return {
+            "hits": self._cache_hits,
+            "misses": self._cache_misses,
+            "size": len(self._cache),
+            "max_size": self._cache_size,
+            "hit_rate": f"{hit_rate:.2%}",
+        }
 
     def rewrite(
         self,
@@ -399,7 +449,13 @@ class QueryRewriter:
         query: str,
         conversation_history: list[dict] | None = None,
     ) -> RewrittenQuery:
-        """异步版本的 rewrite"""
+        """异步版本的 rewrite（带 LRU 缓存）"""
+        cache_key = self._make_cache_key(query, conversation_history)
+        cached = self._cache_get(cache_key)
+        if cached is not None:
+            # 标记为缓存命中，供 trace/observability 使用
+            return cached
+
         query_type = None
 
         if self._classifier:
@@ -409,24 +465,30 @@ class QueryRewriter:
                 logger.warning(f"Intent classification failed: {e}")
 
         if not self._needs_rewriting(query):
-            return RewrittenQuery(
+            result = RewrittenQuery(
                 rewritten=query,
                 was_rewritten=False,
                 confidence=1.0,
                 original=query,
                 query_type=query_type,
             )
+            self._cache_put(cache_key, result)
+            return result
 
         if self._llm is None:
-            return RewrittenQuery(
+            result = RewrittenQuery(
                 rewritten=query,
                 was_rewritten=False,
                 confidence=0.5,
                 original=query,
                 query_type=query_type,
             )
+            self._cache_put(cache_key, result)
+            return result
 
-        return await self._llm_rewrite_async(query, conversation_history or [], query_type)
+        result = await self._llm_rewrite_async(query, conversation_history or [], query_type)
+        self._cache_put(cache_key, result)
+        return result
 
     async def _llm_rewrite_async(
         self,

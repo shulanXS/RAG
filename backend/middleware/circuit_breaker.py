@@ -122,6 +122,81 @@ class CircuitBreaker:
             await self._on_failure()
             raise
 
+    async def call_async(
+        self,
+        runner: Callable[[], Awaitable[T]],
+    ) -> T:
+        """
+        通过熔断器执行一个零参 async 闭包。
+
+        与 call 的区别：传入的是「返回一个 awaitable 的函数」，
+        适用于「调用前还有额外逻辑」（如带重试）但仍想被熔断的场景。
+        """
+        async with self._lock:
+            state = self._get_state()
+
+            if state == CircuitState.OPEN:
+                raise CircuitOpenError(
+                    f"CircuitBreaker '{self._name}' is open. "
+                    f"Wait {self._recovery_remaining():.0f}s."
+                )
+
+            if state == CircuitState.HALF_OPEN:
+                if self._stats.successful_calls >= self._config.half_open_max_calls:
+                    raise CircuitOpenError(
+                        f"CircuitBreaker '{self._name}' is in half_open probe phase."
+                    )
+
+        try:
+            result = await runner()
+            await self._on_success()
+            return result
+        except Exception as e:
+            await self._on_failure()
+            raise
+
+    def _on_success_sync(self) -> None:
+        """
+        同步记录一次成功（流式端点专用）。
+
+        流式调用无法直接套用 call()/call_async()，因为 yield 不可在同步上下文等待。
+        调用方在流式迭代成功完成时调用本方法，失败时调用 _on_failure_sync。
+
+        P3.2 修复: 拆分 sync/async 实现。
+        - 优先尝试用 running loop schedule
+        - 否则用 thread-safe 直接修改统计（无 event loop 时）
+        """
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            # 当前在 event loop 中：把状态变更调度为协程
+            loop.create_task(self._on_success())
+        else:
+            # 同步上下文：直接修改统计（thread-safe 因为只读 _stats 自身）
+            self._stats.successful_calls += 1
+            self._stats.consecutive_failures = 0
+            self._stats.consecutive_successes += 1
+            self._stats.last_state_change = time.monotonic()
+
+    def _on_failure_sync(self) -> None:
+        """同步记录一次失败（流式端点专用）"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is not None and loop.is_running():
+            loop.create_task(self._on_failure())
+        else:
+            # 同步 fallback：直接修改统计
+            self._stats.failed_calls += 1
+            self._stats.consecutive_successes = 0
+            self._stats.consecutive_failures += 1
+            self._stats.last_state_change = time.monotonic()
+
     def _get_state(self) -> CircuitState:
         now = time.monotonic()
 

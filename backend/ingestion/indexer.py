@@ -31,6 +31,11 @@ from qdrant_client.http import models
 from qdrant_client.http.models import Distance, VectorParams
 
 from backend.ingestion.chunker import Chunk
+from backend.security.tenant import (
+    DEFAULT_TENANT_ID,
+    ensure_tenant_payload_index,
+    with_tenant_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -84,15 +89,35 @@ class QdrantIndexer:
 
         Returns:
             True 表示创建了新 Collection，False 表示已存在
+
+        技术决策:
+        - 2026 推荐: 使用 Qdrant 1.10+ 的 TextIndexParams + Modifier.IDF 方案，
+          让 Qdrant 服务端自动计算 BM25 权重（indices & IDF），
+          不再需要应用层 rank_bm25 库。
+        - Modifier.IDF 是 BM25 排序质量的关键，缺失则退化为纯 TF。
         """
         try:
             self._client.get_collection(collection_name=self._collection_name)
             logger.info(f"Collection '{self._collection_name}' 已存在，跳过创建")
+            # 即使已存在，也确保 tenant_id payload 索引存在（幂等）
+            ensure_tenant_payload_index(self._client, self._collection_name)
             return False
         except qe.NotFound:
             pass
 
         # 创建 Collection（同时支持 dense 和 sparse 向量）
+        sparse_cfg = None
+        if with_sparse_index:
+            # Qdrant 1.10+ 原生 BM25: 服务端自动算 IDF + 词频归一化
+            sparse_cfg = {
+                "sparse": models.SparseVectorParams(
+                    index=models.SparseIndexParams(
+                        on_disk=False,
+                        modifier=models.Modifier.IDF,  # 真正的 BM25 关键
+                    ),
+                )
+            }
+
         self._client.create_collection(
             collection_name=self._collection_name,
             vectors_config={
@@ -106,14 +131,7 @@ class QdrantIndexer:
                     ),
                 ),
             },
-            sparse_vectors_config={
-                # Sparse 向量索引（BM25）- 2026 Qdrant 新特性
-                "sparse": models.SparseVectorParams(
-                    index=models.SparseIndexParams(
-                        min_minus_one=False,  # Qdrant 1.13+ 行为
-                    )
-                )
-            } if with_sparse_index else None,
+            sparse_vectors_config=sparse_cfg,
         )
 
         # 创建 Payload 索引（加速过滤查询）
@@ -137,6 +155,8 @@ class QdrantIndexer:
             field_name="token_count",
             field_schema=models.PayloadSchemaType.INTEGER,
         )
+        # 多租户隔离（P3-13）
+        ensure_tenant_payload_index(self._client, self._collection_name)
 
         logger.info(f"创建 Collection '{self._collection_name}' (vector_size={self._vector_size}, sparse={with_sparse_index})")
         return True
@@ -146,6 +166,7 @@ class QdrantIndexer:
         chunks: list[Chunk],
         embeddings: list[list[float]],
         doc_id: str,
+        tenant_id: str = DEFAULT_TENANT_ID,
     ) -> list[IndexedChunk]:
         """
         将分块及其 embedding 批量写入向量数据库。
@@ -154,6 +175,7 @@ class QdrantIndexer:
             chunks: 分块列表
             embeddings: 对应的 embedding 向量列表
             doc_id: 父文档 ID（用于过滤）
+            tenant_id: 多租户隔离 ID（P3-13），默认 "default"
 
         Returns:
             IndexedChunk 列表（包含 Qdrant 分配的 vector_id）
@@ -164,7 +186,7 @@ class QdrantIndexer:
         points: list[dict[str, Any]] = []
         for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
             point_id = f"{chunk.chunk_id}"
-            payload = {
+            base_payload = {
                 "doc_id": doc_id,
                 "chunk_id": chunk.chunk_id,
                 "chunk_index": chunk.chunk_index,
@@ -175,6 +197,7 @@ class QdrantIndexer:
                 "parent_doc_summary": chunk.parent_doc_summary,
                 "metadata": chunk.metadata,
             }
+            payload = with_tenant_payload(tenant_id, base_payload)
             points.append({
                 "id": point_id,
                 "vector": {"dense": embedding},
@@ -188,7 +211,7 @@ class QdrantIndexer:
             wait=True,  # 等待写入确认
         )
 
-        logger.info(f"索引完成: doc_id={doc_id}, {len(chunks)} 个 chunks")
+        logger.info(f"索引完成: doc_id={doc_id}, tenant={tenant_id}, {len(chunks)} 个 chunks")
         return [
             IndexedChunk(chunk=c, vector_id=p["id"])
             for c, p in zip(chunks, points)
@@ -198,30 +221,32 @@ class QdrantIndexer:
         self,
         chunks: list[Chunk],
         dense_embeddings: list[list[float]],
-        sparse_vectors: list[dict],
         doc_id: str,
+        tenant_id: str = DEFAULT_TENANT_ID,
+        precomputed_sparse: list[dict] | None = None,
     ) -> list[IndexedChunk]:
         """
         将分块同时写入 dense 和 sparse 向量索引（用于 Hybrid Search）。
 
         技术决策:
-        - Qdrant 的 sparse vector 是 2026 年的新特性，直接支持 BM25 风格检索
-        - 不需要外部 rank_bm25 库，避免额外的服务依赖
-        - sparse_vectors 格式: {"indices": [int], "values": [float]}
-
-        权衡取舍:
-        - 优势: 单次查询同时返回 dense 和 sparse 结果，Qdrant 内部 RRF 融合
-        - 劣势: sparse 索引占用额外存储空间，但远小于 dense 向量
+        - Qdrant 1.10+ sparse + Modifier.IDF：让 Qdrant 服务端算 BM25。
+        - 两种写入方式：
+          (1) 推荐：传 `models.Document(text=..., model="Qdrant/bm25")`，
+             Qdrant 服务端自动 build sparse vector（避免客户端预计算）。
+          (2) 兼容：传 precomputed `{"indices": [int], "values": [float]}`，
+             适用于已有外部 BM25 计算的迁移场景。
+        - 服务端融合：检索时由 Qdrant 在数据库内 RRF 融合 dense+sparse，
+          减少网络传输和 Python 层 RRF 代码。
         """
-        if len(chunks) != len(dense_embeddings) != len(sparse_vectors):
-            raise ValueError("chunks、dense_embeddings、sparse_vectors 数量必须一致")
+        if len(chunks) != len(dense_embeddings):
+            raise ValueError("chunks 与 dense_embeddings 数量必须一致")
+        if precomputed_sparse is not None and len(precomputed_sparse) != len(chunks):
+            raise ValueError("precomputed_sparse 与 chunks 数量必须一致")
 
         points: list[dict[str, Any]] = []
-        for i, (chunk, dense_emb, sparse_vec) in enumerate(
-            zip(chunks, dense_embeddings, sparse_vectors)
-        ):
+        for i, (chunk, dense_emb) in enumerate(zip(chunks, dense_embeddings)):
             point_id = f"{chunk.chunk_id}"
-            payload = {
+            base_payload = {
                 "doc_id": doc_id,
                 "chunk_id": chunk.chunk_id,
                 "chunk_index": chunk.chunk_index,
@@ -232,11 +257,23 @@ class QdrantIndexer:
                 "parent_doc_summary": chunk.parent_doc_summary,
                 "metadata": chunk.metadata,
             }
+            payload = with_tenant_payload(tenant_id, base_payload)
+
+            # 选择 sparse vector 表达方式
+            if precomputed_sparse is not None:
+                sparse_vec = precomputed_sparse[i]
+            else:
+                # 让 Qdrant 服务端从 text 字段自动生成 BM25 sparse vector
+                sparse_vec = models.Document(
+                    text=chunk.text,
+                    model="Qdrant/bm25",
+                )
+
             points.append({
                 "id": point_id,
                 "vector": {
                     "dense": dense_emb,
-                    "sparse": sparse_vec,  # Qdrant native sparse vector
+                    "sparse": sparse_vec,
                 },
                 "payload": payload,
             })
@@ -247,7 +284,7 @@ class QdrantIndexer:
             wait=True,
         )
 
-        logger.info(f"索引完成 (with sparse): doc_id={doc_id}, {len(chunks)} 个 chunks")
+        logger.info(f"索引完成 (with sparse): doc_id={doc_id}, tenant={tenant_id}, {len(chunks)} 个 chunks")
         return [
             IndexedChunk(chunk=c, vector_id=p["id"])
             for c, p in zip(chunks, points)
@@ -258,6 +295,10 @@ class QdrantIndexer:
         删除指定文档的所有 chunks。
 
         用于增量更新: 文档变更时，先删后建。
+
+        Returns:
+            返回删除操作的 operation_id（Qdrant 不返回删除行数），
+            实际行数可由调用方通过 scroll 重算。
         """
         result = self._client.delete(
             collection_name=self._collection_name,
@@ -270,8 +311,8 @@ class QdrantIndexer:
                 ]
             ),
         )
-        logger.info(f"删除文档: doc_id={doc_id}")
-        return len(result.points)
+        logger.info(f"删除文档: doc_id={doc_id}, operation_id={getattr(result, 'operation_id', None)}")
+        return getattr(result, "operation_id", 0) or 0
 
     def get_collection_info(self) -> dict[str, Any]:
         """获取 Collection 统计信息"""
@@ -283,7 +324,13 @@ class QdrantIndexer:
             "status": info.status,
         }
 
-    def upsert_chunk(self, chunk: Chunk, embedding: list[float], doc_id: str) -> str:
+    def upsert_chunk(
+        self,
+        chunk: Chunk,
+        embedding: list[float],
+        doc_id: str,
+        tenant_id: str = DEFAULT_TENANT_ID,
+    ) -> str:
         """
         Upsert 单个 chunk。
 
@@ -291,12 +338,13 @@ class QdrantIndexer:
             chunk: 分块对象
             embedding: 对应的 embedding 向量
             doc_id: 父文档 ID
+            tenant_id: 多租户 ID
 
         Returns:
             chunk_id
         """
         point_id = f"{chunk.chunk_id}"
-        payload = {
+        base_payload = {
             "doc_id": doc_id,
             "chunk_id": chunk.chunk_id,
             "chunk_index": chunk.chunk_index,
@@ -307,6 +355,7 @@ class QdrantIndexer:
             "parent_doc_summary": chunk.parent_doc_summary,
             "metadata": chunk.metadata,
         }
+        payload = with_tenant_payload(tenant_id, base_payload)
         self._client.upsert(
             collection_name=self._collection_name,
             points=[{
@@ -316,7 +365,7 @@ class QdrantIndexer:
             }],
             wait=True,
         )
-        logger.debug(f"Upsert chunk: chunk_id={chunk.chunk_id}, doc_id={doc_id}")
+        logger.debug(f"Upsert chunk: chunk_id={chunk.chunk_id}, doc_id={doc_id}, tenant={tenant_id}")
         return chunk.chunk_id
 
     def delete_chunk(self, chunk_id: str) -> bool:
@@ -466,36 +515,56 @@ class QdrantIndexer:
         expected_version: str,
     ) -> int:
         """
-        检测有多少 chunk 使用了旧版本 embedding。
+        检测有多少 chunk 使用了旧版本 embedding（与 expected_version 不一致）。
 
         用于在模型更新后评估重 embedding 的规模。
+
+        算法:
+        - 统计 total = 全量 chunk 数
+        - 统计 matched = payload 中 embedding_version == expected_version 的 chunk 数
+        - 返回 (total - matched) 即「需要重 embedding 的 chunk 数」
 
         Args:
             expected_version: 期望的 embedding 版本
 
         Returns:
-            使用旧版本的 chunk 数量
+            旧版本（需要重 embedding）的 chunk 数量
         """
         from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
         try:
-            results, _ = self._client.scroll(
-                collection_name=self._collection_name,
-                scroll_filter=Filter(
-                    must=[
-                        FieldCondition(
-                            key="embedding_version",
-                            match=MatchValue(value=expected_version),
-                        )
-                    ]
-                ),
-                limit=1,
-                with_payload=True,
-            )
             total = self.get_chunk_count()
-            # 统计结果为 0 说明无新版本 chunk
-            return total
-        except Exception:
+            if total == 0:
+                return 0
+
+            # 1) 统计匹配 expected_version 的 chunk 数（scroll 必须传 limit，但分页累加）
+            matched = 0
+            offset = None
+            page_size = 1000
+            while True:
+                results, next_offset = self._client.scroll(
+                    collection_name=self._collection_name,
+                    scroll_filter=Filter(
+                        must=[
+                            FieldCondition(
+                                key="embedding_version",
+                                match=MatchValue(value=expected_version),
+                            )
+                        ]
+                    ),
+                    limit=page_size,
+                    offset=offset,
+                    with_payload=False,
+                    with_vectors=False,
+                )
+                matched += len(results)
+                if next_offset is None:
+                    break
+                offset = next_offset
+
+            return max(0, total - matched)
+        except Exception as e:
+            logger.warning(f"detect_embedding_version_drift 异常: {e}")
             return 0
 
     def reindex_legacy_chunks(

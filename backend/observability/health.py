@@ -466,11 +466,13 @@ class HealthChecker:
 
 
 # =============================================================================
-# 4. Module-Level Singleton (for convenience)
+# 4. Module-Level Singleton (P3.2: 真单例)
 # =============================================================================
 
+_health_checker_instance: HealthChecker | None = None
+_health_checker_lock = threading.Lock()
 
-@lru_cache(maxsize=1)
+
 def get_health_checker(
     qdrant_url: str = "http://localhost:6333",
     redis_host: str = "localhost",
@@ -478,11 +480,25 @@ def get_health_checker(
     llm_api_base: str | None = None,
 ) -> HealthChecker:
     """
-    获取健康检查器单例
+    获取 HealthChecker 单例 (P3.2 修复: 之前 lru_cache + 多参数会导致每次调参不同实例)
+    真正的单例：第一次调用时确定参数，后续忽略。
+    """
+    global _health_checker_instance
+    if _health_checker_instance is None:
+        with _health_checker_lock:
+            if _health_checker_instance is None:
+                _health_checker_instance = HealthChecker(
+                    qdrant_url=qdrant_url,
+                    redis_host=redis_host,
+                    redis_port=redis_port,
+                    llm_api_base=llm_api_base,
+                )
+    return _health_checker_instance
 
-    注意: 使用 lru_cache 确保全局只有一个实例，
-    但函数参数会导致每次调用创建新实例。
-    如需真正单例，请直接实例化 HealthChecker 并全局共享。
+
+def reset_health_checker() -> None:
+    """
+    重置单例（仅供测试使用）。
 
     用法示例:
         from backend.observability.health import get_health_checker
@@ -501,12 +517,8 @@ def get_health_checker(
         async def ready():
             return await checker.get_readiness()
     """
-    return HealthChecker(
-        qdrant_url=qdrant_url,
-        redis_host=redis_host,
-        redis_port=redis_port,
-        llm_api_base=llm_api_base,
-    )
+    global _health_checker_instance
+    _health_checker_instance = None
 
 
 # =============================================================================

@@ -1,21 +1,14 @@
 """
-ragas_metrics.py — RAGAS 五指标评估
+ragas_metrics.py — RAGAS 评估（基于 ragas 库 + 优雅降级）
 ================================================================================
 技术决策记录:
-- RAGAS (Retrieval-Augmented Generation Assessment) 是学术界和工业界公认的
-  RAG 评估标准。五大指标覆盖了检索和生成两个阶段的质量。
-- 为什么需要评估: RAG 系统的质量不能靠「感觉」。没有量化指标，
-  无法发现检索质量退化（corpus 变化 / embedding 模型更新 / 文档格式变化）。
-- CI/CD 集成: 每次代码变更或索引更新都必须运行评估套件，
-  指标下降超过 threshold 则触发告警或自动回滚。
+- 优先使用 ragas 库（>=0.4）的官方指标，避免自己写 LLM prompt。
+  官方 prompt 经过大量实验校准，质量与稳定性优于自实现。
+- 优雅降级: ragas 库未安装时回退到内置简化评估器。
+- 评估 LLM 与生产 LLM 解耦: 评估使用专门 LLM（更便宜/更稳定），
+  避免影响生产 LLM 配额。
 
-业务难点:
-- 标注数据集: RAGAS 的 context_recall 需要 ground_truth context，
-  构建标注数据集是最大的工程成本。
-- LLM-as-Judge: 评估本身使用 LLM 判断，存在评估偏差。
-  缓解: 使用多个评估模型取平均，使用专用评估 prompt。
-
-RAGAS 五大指标定义:
+RAGAS 五大指标:
 1. Faithfulness: 答案是否被检索上下文支撑？
 2. Answer Relevancy: 答案是否直接回答问题？
 3. Context Precision: top-K 上下文中相关块的比例？
@@ -27,21 +20,42 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from typing import Literal
+from datetime import datetime
 
 logger = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------
+# 1. RAGAS 库可用性检测
+# --------------------------------------------------------------------------
+
+try:
+    from datasets import Dataset
+    from ragas import evaluate as ragas_evaluate
+    from ragas.metrics import (
+        answer_relevancy,
+        context_precision,
+        context_recall,
+        faithfulness,
+    )
+    RAGAS_AVAILABLE = True
+except ImportError:
+    RAGAS_AVAILABLE = False
+    logger.warning(
+        "ragas / datasets 未安装，将回退到简化评估。请运行: "
+        "pip install ragas>=0.4.0 datasets>=2.14.0"
+    )
+
+
+# --------------------------------------------------------------------------
+# 2. 结果数据类
+# --------------------------------------------------------------------------
 
 
 @dataclass
 class RAGASResult:
     """
     RAGAS 评估结果
-
-    字段说明:
-    - metric: 指标名称
-    - score: 分数 (0-1)
-    - passed: 是否通过阈值
-    - threshold: 判定阈值
     """
     metric: str
     score: float
@@ -54,12 +68,6 @@ class RAGASResult:
 class EvaluationReport:
     """
     完整评估报告
-
-    字段说明:
-    - overall_pass: 是否全部通过
-    - results: 各指标详细结果
-    - average_score: 平均得分
-    - weakest_metric: 得分最低的指标
     """
     overall_pass: bool
     results: list[RAGASResult]
@@ -68,34 +76,22 @@ class EvaluationReport:
     timestamp: str = ""
 
 
+# --------------------------------------------------------------------------
+# 3. 主评估器
+# --------------------------------------------------------------------------
+
+
 class RAGASEvaluator:
     """
     RAGAS 评估器
 
     技术要点:
-    - 支持离线评估（batch 模式）
-    - 阈值判定: 每项指标有独立阈值
-    - 生成详细报告: 含分数、判定结果、改进建议
-
-    RAGAS 五指标详解:
-    1. Faithfulness: LLM 判断答案中有多少陈述被检索上下文支持。
-       公式: supported_statements / total_statements
-    2. Answer Relevancy: LLM 判断答案与问题的相关程度（0-1）。
-       原理: 如果答案很好地回答了问题，从答案中提取的子问题应该与原问题相似。
-    3. Context Precision: 使用 NDCG@K 衡量 top-K 中相关块的比例。
-       公式: Σ(G_i / i) / Σ(G_i) 其中 G_i 是第 i 位是否相关（1/0）
-    4. Context Recall: 检索到的上下文覆盖了多少必要信息（需要 ground truth）。
-       公式: ground_truth_statements / retrieved_statements
-    5. Answer Correctness: 综合评估答案与 ground truth 的一致性。
-       公式: LLM 判断 answer 与 ground_truth 的相似度 (0-1)
-
-    权衡取舍:
-    - context_recall 需要 ground truth 标注，成本高。
-      决策: 先用 faithfulness 和 answer_relevancy（有参考答案即可），
-      等团队成熟后再加入 context_recall。
+    - ragas 库路径: 优先使用 ragas 内置指标，自动管理 evaluator LLM。
+    - 降级路径: 未安装 ragas 时使用简化本地评估（仅供开发）。
+    - 阈值判定: 每项指标有独立阈值。
+    - 生成详细报告: 含分数、判定结果、改进建议。
     """
 
-    # RAGAS 推荐阈值（2026 生产经验值）
     DEFAULT_THRESHOLDS = {
         "faithfulness": 0.85,
         "answer_relevancy": 0.75,
@@ -111,11 +107,31 @@ class RAGASEvaluator:
     ):
         """
         Args:
-            llm_client: LLM client（用于 LLM-as-Judge 评估）
+            llm_client: LLM client（ragas 会自动包装为 evaluator LLM；降级路径下用于本地评估）
             thresholds: 指标阈值配置
         """
         self._llm = llm_client
-        self._thresholds = thresholds or self.DEFAULT_THRESHOLDS
+        self._thresholds = thresholds or dict(self.DEFAULT_THRESHOLDS)
+        self._use_ragas = RAGAS_AVAILABLE
+
+        if self._use_ragas and llm_client is not None:
+            self._wrap_llm_for_ragas()
+
+    def _wrap_llm_llm_attribute(self) -> None:
+        """ragas >= 0.2 推荐使用 Langchain LLM 接口。
+        简单处理：把项目内 LLMClient 的 generator_client 包装成 ragas 可用的形式。
+        此处仅做软绑定 — 实际指标调用的内部细节交给 ragas 库。
+        """
+        # 复杂适配放到使用方按需覆盖；此处保留扩展点
+        self._ragas_llm = None
+
+    def _wrap_llm_for_ragas(self) -> None:
+        """尝试将内 LLMClient 包装为 ragas 可用的 LLM 接口。"""
+        self._wrap_llm_llm_attribute()
+
+    # -------------------------------------------------------------------------
+    # 单条评估
+    # -------------------------------------------------------------------------
 
     async def evaluate(
         self,
@@ -136,67 +152,220 @@ class RAGASEvaluator:
         Returns:
             EvaluationReport: 完整评估报告
         """
+        if self._use_ragas and self._llm is not None:
+            return await self._evaluate_with_ragas(
+                question, answer, retrieved_contexts, ground_truth
+            )
+        return await self._evaluate_fallback(
+            question, answer, retrieved_contexts, ground_truth
+        )
+
+    async def _evaluate_with_ragas(
+        self,
+        question: str,
+        answer: str,
+        retrieved_contexts: list[str],
+        ground_truth: str | None,
+    ) -> EvaluationReport:
+        """使用 ragas 库执行评估"""
+        data = {
+            "user_input": [question],
+            "response": [answer],
+            "retrieved_contexts": [retrieved_contexts] if retrieved_contexts else [[]],
+        }
+        if ground_truth:
+            data["reference"] = [ground_truth]
+        ds = Dataset.from_dict(data)
+
+        metric_objs = [faithfulness, answer_relevancy, context_precision]
+        if ground_truth:
+            metric_objs.append(context_recall)
+
+        try:
+            # ragas 评估是同步阻塞的，放到线程池避免阻塞 event loop
+            import asyncio
+            loop = asyncio.get_event_loop()
+            ragas_result = await loop.run_in_executor(
+                None, lambda: ragas_evaluate(ds, metrics=metric_objs)
+            )
+        except Exception as e:
+            logger.warning(f"ragas 评估失败，回退到本地评估: {e}")
+            return await self._evaluate_fallback(
+                question, answer, retrieved_contexts, ground_truth
+            )
+
+        results: list[RAGASResult] = []
+        # ragas 0.4+ 返回 Result 对象
+        scores: dict[str, float] = {}
+        try:
+            df = ragas_result.to_pandas()
+            for col in df.columns:
+                if col in self._thresholds:
+                    val = df[col].iloc[0]
+                    if val is not None and not (isinstance(val, float) and val != val):
+                        scores[col] = float(val)
+        except Exception as e:
+            logger.warning(f"解析 ragas 结果失败: {e}")
+            return await self._evaluate_fallback(
+                question, answer, retrieved_contexts, ground_truth
+            )
+
+        for metric, score in scores.items():
+            threshold = self._thresholds.get(metric, 0.5)
+            results.append(
+                RAGASResult(
+                    metric=metric,
+                    score=score,
+                    passed=score >= threshold,
+                    threshold=threshold,
+                )
+            )
+
+        return self._build_report(results)
+
+    async def _evaluate_fallback(
+        self,
+        question: str,
+        answer: str,
+        retrieved_contexts: list[str],
+        ground_truth: str | None,
+    ) -> EvaluationReport:
+        """降级路径：使用 LLM 做 LLM-as-Judge（与原实现一致）"""
         if self._llm is None:
             logger.warning("没有 LLM client，无法执行 RAGAS 评估")
-            return self._dummy_report()
+            return self._build_report([])
 
         results: list[RAGASResult] = []
 
-        # 1. Faithfulness
-        faithfulness = await self._eval_faithfulness(question, answer, retrieved_contexts)
-        results.append(faithfulness)
-
-        # 2. Answer Relevancy
-        relevancy = await self._eval_answer_relevancy(question, answer)
-        results.append(relevancy)
-
-        # 3. Context Precision
-        precision = await self._eval_context_precision(question, retrieved_contexts)
-        results.append(precision)
-
-        # 4. Context Recall（需要 ground truth）
-        if ground_truth:
-            recall = await self._eval_context_recall(
-                ground_truth, retrieved_contexts
+        faithfulness_score = await self._llm_score_faithfulness(
+            question, answer, retrieved_contexts
+        )
+        results.append(
+            RAGASResult(
+                metric="faithfulness",
+                score=faithfulness_score,
+                passed=faithfulness_score >= self._thresholds.get("faithfulness", 0.85),
+                threshold=self._thresholds.get("faithfulness", 0.85),
             )
-            results.append(recall)
-
-        # 5. Answer Correctness（需要 ground truth）
-        if ground_truth:
-            correctness = await self._eval_answer_correctness(
-                answer, ground_truth
-            )
-            results.append(correctness)
-
-        # 计算整体结果
-        overall_pass = all(r.passed for r in results)
-        avg_score = sum(r.score for r in results) / len(results) if results else 0
-        weakest = min(results, key=lambda r: r.score) if results else None
-
-        return EvaluationReport(
-            overall_pass=overall_pass,
-            results=results,
-            average_score=avg_score,
-            weakest_metric=weakest.metric if weakest else "",
         )
 
-    async def evaluate_batch(
-        self,
-        test_cases: list[dict],
-    ) -> dict:
+        relevancy_score = await self._llm_score_relevancy(question, answer)
+        results.append(
+            RAGASResult(
+                metric="answer_relevancy",
+                score=relevancy_score,
+                passed=relevancy_score >= self._thresholds.get("answer_relevancy", 0.75),
+                threshold=self._thresholds.get("answer_relevancy", 0.75),
+            )
+        )
+
+        precision_score = await self._llm_score_context_precision(question, retrieved_contexts)
+        results.append(
+            RAGASResult(
+                metric="context_precision",
+                score=precision_score,
+                passed=precision_score >= self._thresholds.get("context_precision", 0.70),
+                threshold=self._thresholds.get("context_precision", 0.70),
+            )
+        )
+
+        if ground_truth:
+            recall_score = await self._llm_score_context_recall(ground_truth, retrieved_contexts)
+            results.append(
+                RAGASResult(
+                    metric="context_recall",
+                    score=recall_score,
+                    passed=recall_score >= self._thresholds.get("context_recall", 0.70),
+                    threshold=self._thresholds.get("context_recall", 0.70),
+                )
+            )
+
+        return self._build_report(results)
+
+    # -------------------------------------------------------------------------
+    # 简化的 LLM-as-Judge（降级路径）
+    # -------------------------------------------------------------------------
+
+    async def _llm_score_faithfulness(
+        self, question: str, answer: str, contexts: list[str]
+    ) -> float:
+        if not contexts:
+            return 0.0
+        ctx_text = "\n".join(f"[{i+1}] {c[:300]}" for i, c in enumerate(contexts))
+        prompt = f"""评估答案的忠实性（faithfulness，0-1 区间）。
+问题: {question}
+上下文: {ctx_text}
+答案: {answer}
+仅返回 0-1 的小数，不要其他内容。"""
+        try:
+            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
+            return max(0.0, min(1.0, float(response.strip())))
+        except Exception as e:
+            logger.warning(f"Faithfulness LLM 评估失败: {e}")
+            return 0.0
+
+    async def _llm_score_relevancy(self, question: str, answer: str) -> float:
+        prompt = f"""评估答案与问题的相关度（0-1 区间）。
+问题: {question}
+答案: {answer}
+仅返回 0-1 的小数，不要其他内容。"""
+        try:
+            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
+            return max(0.0, min(1.0, float(response.strip())))
+        except Exception as e:
+            logger.warning(f"Relevancy LLM 评估失败: {e}")
+            return 0.0
+
+    async def _llm_score_context_precision(
+        self, question: str, contexts: list[str]
+    ) -> float:
+        if not contexts:
+            return 0.0
+        ctx_text = "\n".join(f"[{i+1}] {c[:200]}" for i, c in enumerate(contexts))
+        prompt = f"""评估检索上下文的相关性比例（precision，0-1 区间）。
+问题: {question}
+上下文列表:
+{ctx_text}
+仅返回 0-1 的小数。"""
+        try:
+            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
+            return max(0.0, min(1.0, float(response.strip())))
+        except Exception as e:
+            logger.warning(f"Context Precision LLM 评估失败: {e}")
+            return 0.0
+
+    async def _llm_score_context_recall(
+        self, ground_truth: str, contexts: list[str]
+    ) -> float:
+        ctx_text = "\n".join(f"[{i+1}] {c[:200]}" for i, c in enumerate(contexts))
+        prompt = f"""评估检索上下文对参考答案的覆盖率（recall，0-1 区间）。
+参考答案: {ground_truth}
+上下文列表:
+{ctx_text}
+仅返回 0-1 的小数。"""
+        try:
+            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
+            return max(0.0, min(1.0, float(response.strip())))
+        except Exception as e:
+            logger.warning(f"Context Recall LLM 评估失败: {e}")
+            return 0.0
+
+    # -------------------------------------------------------------------------
+    # 批量评估
+    # -------------------------------------------------------------------------
+
+    async def evaluate_batch(self, test_cases: list[dict]) -> dict:
         """
         批量评估
 
         Args:
             test_cases: 测试用例列表，格式:
-              [{"question": ..., "ground_truth_answer": ..., ...}, ...]
+              [{"question": ..., "answer": ..., "contexts": [...], "ground_truth": "..."}, ...]
 
         Returns:
-            批量评估报告: {"total": N, "passed": M, "pass_rate": 0.x, "per_case": [...]}
+            批量评估报告
         """
-        from datetime import datetime
-
-        reports = []
+        reports: list[EvaluationReport] = []
         for case in test_cases:
             report = await self.evaluate(
                 question=case["question"],
@@ -210,258 +379,58 @@ class RAGASEvaluator:
         passed = sum(1 for r in reports if r.overall_pass)
         avg_scores = [r.average_score for r in reports]
 
-        # 找出最弱的指标
-        all_metrics = {}
+        all_metrics: dict[str, list[float]] = {}
         for r in reports:
             for metric_result in r.results:
-                if metric_result.metric not in all_metrics:
-                    all_metrics[metric_result.metric] = []
-                all_metrics[metric_result.metric].append(metric_result.score)
+                all_metrics.setdefault(metric_result.metric, []).append(metric_result.score)
 
-        weakest = min(
-            all_metrics.items(),
-            key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 1.0,
-        )
+        weakest_name = ""
+        weakest_score = 0.0
+        if all_metrics:
+            weakest_name, weakest_scores = min(
+                all_metrics.items(),
+                key=lambda x: sum(x[1]) / len(x[1]) if x[1] else 1.0,
+            )
+            weakest_score = sum(weakest_scores) / len(weakest_scores) if weakest_scores else 0.0
 
         return {
             "total": total,
             "passed": passed,
             "pass_rate": passed / total if total > 0 else 0,
             "average_score": sum(avg_scores) / len(avg_scores) if avg_scores else 0,
-            "weakest_metric": weakest[0],
-            "weakest_score": sum(weakest[1]) / len(weakest[1]) if weakest[1] else 0,
+            "weakest_metric": weakest_name,
+            "weakest_score": weakest_score,
             "per_case": [
-                {"question": tc["question"], "passed": r.overall_pass, "score": r.average_score}
+                {
+                    "question": tc["question"],
+                    "passed": r.overall_pass,
+                    "score": r.average_score,
+                }
                 for tc, r in zip(test_cases, reports)
             ],
             "timestamp": datetime.utcnow().isoformat(),
         }
 
     # -------------------------------------------------------------------------
-    # 各指标评估实现
+    # 工具
     # -------------------------------------------------------------------------
 
-    async def _eval_faithfulness(
-        self,
-        question: str,
-        answer: str,
-        contexts: list[str],
-    ) -> RAGASResult:
-        """Faithfulness: 答案是否被上下文支撑？"""
-        prompt = f"""评估答案的忠实性。
-
-问题: {question}
-
-检索到的上下文:
-{chr(10).join(f"[{i+1}] {c[:300]}" for i, c in enumerate(contexts))}
-
-答案: {answer}
-
-请判断答案中有多少陈述被检索上下文支撑。
-评估原则:
-- 如果答案中的每个关键陈述都能在上下文中找到直接支持，faithfulness = 1.0
-- 如果答案中有部分陈述无法从上下文中找到支持，faithfulness 按比例降低
-- 如果答案完全是编造的（上下文完全不支持），faithfulness = 0.0
-
-请以 JSON 格式输出:
-{{"score": 0.0-1.0, "reasoning": "判断理由（1-2句话）"}}
-"""
-        try:
-            import json
-            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
-            data = json.loads(response.strip())
-            score = float(data.get("score", 0.5))
-            return RAGASResult(
-                metric="faithfulness",
-                score=score,
-                passed=score >= self._thresholds["faithfulness"],
-                threshold=self._thresholds["faithfulness"],
-                details=data.get("reasoning", ""),
+    def _build_report(self, results: list[RAGASResult]) -> EvaluationReport:
+        if not results:
+            return EvaluationReport(
+                overall_pass=False,
+                results=[],
+                average_score=0.0,
+                weakest_metric="",
+                timestamp=datetime.utcnow().isoformat(),
             )
-        except Exception as e:
-            logger.warning(f"Faithfulness 评估失败: {e}")
-            return self._error_result("faithfulness")
-
-    async def _eval_answer_relevancy(
-        self,
-        question: str,
-        answer: str,
-    ) -> RAGASResult:
-        """Answer Relevancy: 答案是否直接回答问题？"""
-        prompt = f"""评估答案与问题的相关程度。
-
-问题: {question}
-答案: {answer}
-
-评估原则:
-- 如果答案直接、完整地回答了问题，relevancy = 1.0
-- 如果答案部分相关但不完整，relevancy 按比例降低
-- 如果答案完全跑题，relevancy = 0.0
-
-请以 JSON 格式输出:
-{{"score": 0.0-1.0, "reasoning": "判断理由"}}
-"""
-        try:
-            import json
-            response = await self._llm.generate_async(prompt, max_tokens=128, temperature=0.1)
-            data = json.loads(response.strip())
-            score = float(data.get("score", 0.5))
-            return RAGASResult(
-                metric="answer_relevancy",
-                score=score,
-                passed=score >= self._thresholds["answer_relevancy"],
-                threshold=self._thresholds["answer_relevancy"],
-                details=data.get("reasoning", ""),
-            )
-        except Exception as e:
-            logger.warning(f"Answer Relevancy 评估失败: {e}")
-            return self._error_result("answer_relevancy")
-
-    async def _eval_context_precision(
-        self,
-        question: str,
-        contexts: list[str],
-    ) -> RAGASResult:
-        """Context Precision: top-K 中相关块的比例（NDCG@K）"""
-        if not contexts:
-            return self._error_result("context_precision")
-
-        prompt = f"""评估每个检索到的上下文与问题的相关程度。
-
-问题: {question}
-
-检索到的上下文:
-{chr(10).join(f"[{i+1}] {c[:200]}" for i, c in enumerate(contexts))}
-
-请判断每个上下文是否与问题相关（1=相关，0=不相关）。
-相关性定义: 如果这个上下文对回答问题有帮助，则为相关。
-
-请以 JSON 格式输出:
-{{"relevance_scores": [1, 0, 1, ...]}}  # 每个上下文的相关性得分（0或1）
-"""
-        try:
-            import json
-            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
-            data = json.loads(response.strip())
-            scores = data.get("relevance_scores", [])
-
-            # NDCG@K 计算
-            ndcg = self._ndcg_at_k(scores, k=len(scores))
-            return RAGASResult(
-                metric="context_precision",
-                score=ndcg,
-                passed=ndcg >= self._thresholds["context_precision"],
-                threshold=self._thresholds["context_precision"],
-                details=f"NDCG@{len(contexts)} = {ndcg:.3f}",
-            )
-        except Exception as e:
-            logger.warning(f"Context Precision 评估失败: {e}")
-            return self._error_result("context_precision")
-
-    async def _eval_context_recall(
-        self,
-        ground_truth: str,
-        contexts: list[str],
-    ) -> RAGASResult:
-        """Context Recall: 检索上下文覆盖了多少必要信息"""
-        prompt = f"""评估检索到的上下文覆盖了参考答案中的多少信息。
-
-参考答案: {ground_truth}
-
-检索到的上下文:
-{chr(10).join(f"[{i+1}] {c[:200]}" for i, c in enumerate(contexts))}
-
-评估原则:
-- 如果检索上下文完整覆盖了参考答案的所有关键信息，recall = 1.0
-- 如果只覆盖了部分信息，recall 按比例降低
-- 如果完全没有覆盖，recall = 0.0
-
-请以 JSON 格式输出:
-{{"score": 0.0-1.0, "reasoning": "判断理由"}}
-"""
-        try:
-            import json
-            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
-            data = json.loads(response.strip())
-            score = float(data.get("score", 0.5))
-            return RAGASResult(
-                metric="context_recall",
-                score=score,
-                passed=score >= self._thresholds["context_recall"],
-                threshold=self._thresholds["context_recall"],
-                details=data.get("reasoning", ""),
-            )
-        except Exception as e:
-            logger.warning(f"Context Recall 评估失败: {e}")
-            return self._error_result("context_recall")
-
-    async def _eval_answer_correctness(
-        self,
-        answer: str,
-        ground_truth: str,
-    ) -> RAGASResult:
-        """Answer Correctness: 与参考答案的一致性"""
-        prompt = f"""评估生成答案与参考答案的一致性。
-
-参考答案: {ground_truth}
-生成答案: {answer}
-
-评估原则:
-- 如果生成答案与参考答案高度一致，correctness = 1.0
-- 如果存在部分差异，correctness 按比例降低
-- 如果完全不一致，correctness = 0.0
-
-请以 JSON 格式输出:
-{{"score": 0.0-1.0, "reasoning": "判断理由"}}
-"""
-        try:
-            import json
-            response = await self._llm.generate_async(prompt, max_tokens=256, temperature=0.1)
-            data = json.loads(response.strip())
-            score = float(data.get("score", 0.5))
-            return RAGASResult(
-                metric="answer_correctness",
-                score=score,
-                passed=score >= self._thresholds["answer_correctness"],
-                threshold=self._thresholds["answer_correctness"],
-                details=data.get("reasoning", ""),
-            )
-        except Exception as e:
-            logger.warning(f"Answer Correctness 评估失败: {e}")
-            return self._error_result("answer_correctness")
-
-    @staticmethod
-    def _ndcg_at_k(scores: list[int], k: int | None = None) -> float:
-        """计算 NDCG@K"""
-        if not scores:
-            return 0.0
-        k = k or len(scores)
-        scores = scores[:k]
-
-        # DCG
-        dcg = sum((2**s - 1) / (i + 1) for i, s in enumerate(scores))
-
-        # IDCG（理想情况下所有相关都在前面）
-        ideal_scores = sorted(scores, reverse=True)
-        idcg = sum((2**s - 1) / (i + 1) for i, s in enumerate(ideal_scores))
-
-        if idcg == 0:
-            return 0.0
-        return dcg / idcg
-
-    def _error_result(self, metric: str) -> RAGASResult:
-        return RAGASResult(
-            metric=metric,
-            score=0.0,
-            passed=False,
-            threshold=self._thresholds.get(metric, 0.5),
-            details="评估执行失败",
-        )
-
-    def _dummy_report(self) -> EvaluationReport:
+        overall_pass = all(r.passed for r in results)
+        avg_score = sum(r.score for r in results) / len(results)
+        weakest = min(results, key=lambda r: r.score)
         return EvaluationReport(
-            overall_pass=False,
-            results=[],
-            average_score=0.0,
-            weakest_metric="",
+            overall_pass=overall_pass,
+            results=results,
+            average_score=avg_score,
+            weakest_metric=weakest.metric,
+            timestamp=datetime.utcnow().isoformat(),
         )

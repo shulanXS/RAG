@@ -1,0 +1,15 @@
+# =============================================================================
+# prometheus.yml — Prometheus 抓取 RAG 后端 /metrics 端点
+# =============================================================================
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: "rag-backend"
+    metrics_path: "/metrics"
+    static_configs:
+      - targets: ["backend:8000"]
+        labels:
+          service: "rag-api"
+          env: "dev"

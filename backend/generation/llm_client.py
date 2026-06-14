@@ -15,7 +15,7 @@ import asyncio
 import logging
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Literal, TypeVar
+from typing import Any, AsyncGenerator, AsyncIterator, Awaitable, Callable, Literal, TypeVar
 
 logger = logging.getLogger(__name__)
 
@@ -32,6 +32,15 @@ class LLMBackend(ABC):
     @abstractmethod
     def generate(self, prompt: str, **kwargs) -> str:
         ...
+
+    async def generate_stream_async(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """
+        流式生成，yield 每个 token 片段。
+        默认实现：调用 generate_async 返回完整结果后 yield。
+        子类可覆盖以提供真正的流式。
+        """
+        result = await self.generate_async(prompt, **kwargs)
+        yield result
 
 
 class AnthropicBackend(LLMBackend):
@@ -84,6 +93,39 @@ class AnthropicBackend(LLMBackend):
         if metrics_collector:
             self._record_usage(message.usage, metrics_collector)
         return message.content[0].text
+
+    async def generate_stream_async(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """
+        P2.1: Anthropic 真流式 — 使用 messages.stream() API。
+        之前 LLMClient.generate_stream_async 调用基类默认实现，
+        实际是一句话一次性 yield（不是 token 级流）。
+        """
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
+        temperature = kwargs.get("temperature", self._temperature)
+        system = kwargs.get("system", None)
+
+        from anthropic import AsyncAnthropic
+
+        if not hasattr(self, "_async_client") or self._async_client is None:
+            self._async_client = AsyncAnthropic()
+
+        try:
+            # 关键 API：messages.stream 才是真正的 SSE 流
+            async with self._async_client.messages.stream(
+                model=self._model,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                system=system,
+                messages=[{"role": "user", "content": prompt}],
+            ) as stream:
+                async for text in stream.text_stream:
+                    if text:
+                        yield text
+        except AttributeError:
+            # SDK 版本太老，messages.stream 不可用 → 退到非流式
+            result = await self.generate_async(prompt, **kwargs)
+            if result:
+                yield result
 
     def generate(self, prompt: str, **kwargs) -> str:
         max_tokens = kwargs.get("max_tokens", self._max_tokens)
@@ -159,6 +201,22 @@ class OpenAIBackend(LLMBackend):
             temperature=temperature,
         )
         return response.choices[0].message.content or ""
+
+    async def generate_stream_async(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """OpenAI 流式生成"""
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
+        temperature = kwargs.get("temperature", self._temperature)
+
+        stream = await self._async_client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=True,
+        )
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
 
 
 class GoogleGenAIBackend(LLMBackend):
@@ -294,6 +352,22 @@ class DeepSeekBackend(LLMBackend):
         )
         return response.choices[0].message.content or ""
 
+    async def generate_stream_async(self, prompt: str, **kwargs) -> AsyncIterator[str]:
+        """DeepSeek 流式生成（OpenAI 兼容 API）"""
+        max_tokens = kwargs.get("max_tokens", self._max_tokens)
+        temperature = kwargs.get("temperature", self._temperature)
+
+        stream = await self._async_client.chat.completions.create(
+            model=self._model,
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stream=True,
+        )
+        async for chunk in stream:
+            if chunk.choices and chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
 
 class LLMClient:
     """
@@ -369,6 +443,7 @@ class LLMClient:
         system: str | None = None,
         structured_schema: dict | None = None,
         use_breaker: bool = True,
+        use_retry: bool = True,
     ) -> str:
         """
         异步生成
@@ -381,6 +456,7 @@ class LLMClient:
             system: 系统提示
             structured_schema: 可选，JSON Schema 用于 Structured Output
             use_breaker: 是否启用熔断器
+            use_retry: 是否启用指数退避重试（默认 True）
         """
         client = self.generator_client
 
@@ -395,17 +471,31 @@ class LLMClient:
             _metrics_collector=self._metrics,
         )
 
+        async def _invoke() -> str:
+            return await client.generate_async(prompt, **call_kwargs)
+
         try:
+            if use_breaker and use_retry:
+                return await self._generator_breaker.call_async(
+                    self._invoke_with_retry, _invoke
+                )
             if use_breaker:
                 return await self._generator_breaker.call(
-                    client.generate_async,
-                    prompt,
-                    **call_kwargs,
+                    client.generate_async, prompt, **call_kwargs
                 )
+            if use_retry:
+                return await self._invoke_with_retry(_invoke)
             return await client.generate_async(prompt, **call_kwargs)
         except Exception as e:
-            logger.error(f"LLM generate failed, circuit breaker may be open: {e}")
+            logger.error(f"LLM generate failed, all retries exhausted or breaker open: {e}")
             return ""
+
+    @staticmethod
+    async def _invoke_with_retry(invoke: Callable[[], Awaitable[str]]) -> str:
+        """带指数退避重试的调用包装"""
+        from backend.generation.retry import with_retry, RetryConfig
+
+        return await with_retry(invoke, RetryConfig(max_attempts=3))
 
     def generate(
         self,
@@ -428,3 +518,48 @@ class LLMClient:
             structured_schema=structured_schema,
             _metrics_collector=self._metrics,
         )
+
+    async def generate_stream_async(
+        self,
+        prompt: str,
+        *,
+        max_tokens: int = 2048,
+        temperature: float = 0.3,
+        system: str | None = None,
+    ) -> AsyncIterator[str]:
+        """
+        流式生成，yield 每个 token 片段。
+
+        Args:
+            prompt: 用户提示
+            max_tokens: 最大生成 token 数
+            temperature: 温度参数
+            system: 系统提示（流式时忽略 structured_schema）
+
+        Yields:
+            每个 token 片段字符串
+        """
+        client = self.generator_client
+
+        call_kwargs = dict(
+            max_tokens=max_tokens,
+            temperature=temperature,
+            system=system,
+        )
+
+        # 流式端点的熔断接入：检查 OPEN 状态，CLOSED/HALF_OPEN 走原始流；
+        # 不在 try 内 yield 整个流，否则熔断器统计会因流中断而误判。
+        # 失败 / 成功统计在 _generator_breaker.call 内自动完成。
+        if self._generator_breaker.state.value == "open":
+            logger.warning("Circuit breaker open, returning empty stream")
+            return
+
+        try:
+            async for token in client.generate_stream_async(prompt, **call_kwargs):
+                yield token
+            # 流式成功完成：显式记录成功（call() 会自动记录）
+            self._generator_breaker._on_success_sync()
+        except Exception as e:
+            logger.error(f"LLM stream failed: {e}")
+            self._generator_breaker._on_failure_sync()
+            return
