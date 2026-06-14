@@ -214,7 +214,7 @@ make clean                  # 清理
 | "Plan-and-Execute 怎么 dynamic 重规划？" | **不做**。route_step 永远不 finish；改用 ReAct（max_iterations 5），详见 ARCHITECTURE.md Why Not 1 |
 | "BGE-M3 vs voyage 真的差距 < 2pp？" | 是。50 条 query 手标测试，BGE-M3 0.85 vs voyage-3-large 0.87（数据见 BENCHMARK.md § 13.3） |
 | "MCP 怎么接？" | `pip install mcp>=1.0.0 && python -m backend.mcp_server` — Claude Desktop / Cursor 的 `mcp_servers` 配 `{"command": "python", "args": ["-m", "backend.mcp_server"]}` |
-| "Prompt 怎么 review/diff？" | `prompts/v{version}.yaml` git-tracked；CI 中 eval diff gate 用 `prompt_hash` 区分"prompt 改 vs 数据改" |
+| "Prompt 怎么 review/diff？" | `backend/generation/prompts/v{version}.yaml` git-tracked；CI 中 eval diff gate 用 `prompt_hash` 区分"prompt 改 vs 数据改" |
 
 ### 5.5 MCP Server 集成（P2）
 

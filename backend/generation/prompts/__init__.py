@@ -1,10 +1,9 @@
 """
-prompts/__init__.py — Prompt 模板加载器
+backend.generation.prompts — Prompt 模板加载器
 ================================================================================
 技术决策 (P2 阶段):
-- Prompt 全部抽到 prompts/v*.yaml，git-tracked，方便 review/diff/rollback。
-- PromptBuilder 在启动时加载 prompts/v{version}.yaml，
-  version 可由环境变量 PROMPT_VERSION 覆盖（默认 latest）。
+- Prompt 全部抽到本目录的 v*.yaml 文件，git-tracked，方便 review/diff/rollback。
+- PromptBuilder 在启动时 load_prompts()，version 由 PROMPT_VERSION 控制。
 - 每次 LLM 调用时把 prompt_hash + template_version 写入 trace，
   CI 中 eval diff gate 用 prompt_hash 区分"prompt 改 vs 数据改"对 NDCG 的影响。
 """
@@ -69,10 +68,3 @@ def get_prompts_with_hash() -> tuple[dict[str, Any], str]:
     prompts = load_prompts()
     return prompts, get_prompt_hash(prompts)
 
-
-__all__ = [
-    "load_prompts",
-    "get_prompt_version",
-    "get_prompt_hash",
-    "get_prompts_with_hash",
-]

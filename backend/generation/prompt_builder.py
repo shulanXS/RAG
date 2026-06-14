@@ -2,7 +2,7 @@
 prompt_builder.py — Prompt 模板与上下文组装
 ================================================================================
 技术决策记录:
-- P2 阶段：prompt 内容从代码搬到 prompts/v{version}.yaml，git-tracked。
+- P2 阶段：prompt 内容从代码搬到 backend/generation/prompts/v{version}.yaml，git-tracked。
   PromptBuilder 在构造时 load_prompts()，version 由 PROMPT_VERSION 控制。
   prompt_hash 暴露给 trace，CI 跑 eval 时记录"prompt 改了 → NDCG 涨/跌"。
 - 引用标注格式: 在 Prompt 中明确要求每个关键陈述附带引用标记。
@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from prompts import load_prompts, get_prompt_hash
+from backend.generation.prompts import load_prompts, get_prompt_hash
 
 
 class PromptBuilder:
@@ -26,7 +26,7 @@ class PromptBuilder:
     - build_context(): 将检索到的 chunks 组装为带引用标注的上下文
     - build_prompt(): 将用户查询和上下文组装为完整的 LLM Prompt
     - 引用格式: [来源: doc_id / section_path]
-    - P2: prompt 文本从 prompts/v{version}.yaml 加载，便于 review/diff/rollback
+    - P2: prompt 文本从 backend/generation/prompts/v{version}.yaml 加载，便于 review/diff/rollback
 
     提示词设计原则:
     1. 角色定义: 明确 AI 的角色和职责

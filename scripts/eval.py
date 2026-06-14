@@ -297,7 +297,7 @@ def main():
         # P2: Eval diff gate — 对比上一次同 prompt_hash 的 run
         try:
             from backend.evaluation.eval_store import get_eval_store
-            from prompts import get_prompts_with_hash
+            from backend.generation.prompts import get_prompts_with_hash
             from backend.config import get_config as _gc
 
             cfg = _gc()

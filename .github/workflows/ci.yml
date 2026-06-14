@@ -154,7 +154,7 @@ jobs:
 
       - name: Verify prompt hash tracked in git
         run: |
-          python -c "from prompts import get_prompts_with_hash; p, h = get_prompts_with_hash(); print(f'prompt_version={p.get(\"version\")} hash={h}')"
+          python -c "from backend.generation.prompts import get_prompts_with_hash; p, h = get_prompts_with_hash(); print(f'prompt_version={p.get(\"version\")} hash={h}')"
 
       - name: Compare eval metrics vs main
         # 简化版：调用 scripts/eval.py，脚本内会自动做 diff_against_previous
@@ -162,7 +162,7 @@ jobs:
         run: |
           python -c "
           from backend.evaluation.eval_store import get_eval_store
-          from prompts import get_prompts_with_hash
+          from backend.generation.prompts import get_prompts_with_hash
           store = get_eval_store()
           _, ph = get_prompts_with_hash()
           print(f'eval_db={store._db_path}')
