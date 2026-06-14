@@ -50,7 +50,6 @@ class ToolRegistry:
         for module_path, class_name in [
             ("backend.agentic.tools.calculator", "CalculatorTool"),
             ("backend.agentic.tools.datetime_tool", "DateTimeTool"),
-            ("backend.agentic.tools.web_search", "WebSearchTool"),
         ]:
             try:
                 import importlib

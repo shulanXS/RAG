@@ -2,26 +2,29 @@
 documents.py — 文档管理 API 路由
 ================================================================================
 技术决策记录:
-- 上传后通过 FastAPI BackgroundTasks 触发异步索引 (P1.3)：
-  之前只存盘不处理，本修复让 upload → index 真正闭环。
-- 文档元数据存在 Qdrant 的 `documents` collection (metadata-only)，
-  不再使用内存 dict。
-- 状态查询通过 GET /documents/{id}/status 端点返回 indexing 状态。
+|- 上传后通过 Arq 任务队列 (P1-A2) 触发异步索引，任务持久化到 Redis Stream
+  (替换之前的 FastAPI BackgroundTasks，绑定 worker 进程会丢任务)
+|- 文档元数据持久化到 Qdrant DocumentRegistry (P1-A1)
+  不再使用内存 dict，重启/滚动发布后状态可追溯
+|- 状态查询通过 GET /documents/{id}/status 返回完整 audit record (P1-A3)
+  含 filename / size / tenant_id / content_hash / error
+|- 上传时做内容哈希去重 (P1-A4): 同一 (tenant_id, content_hash) 已索引则复用
 """
-
 from __future__ import annotations
 
+import hashlib
 import logging
-import os
-import shutil
-import uuid
+import time
 from pathlib import Path
 from typing import Annotated
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, UploadFile, File
+from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
-from backend.ingestion.pipeline import get_document_status, index_file_task
+from backend.ingestion.document_registry import (
+    DocumentRecord,
+    get_document_registry,
+)
 from backend.security.auth import require_current_user
 from backend.security.tenant import DEFAULT_TENANT_ID
 
@@ -34,15 +37,21 @@ DOCS_DIR.mkdir(parents=True, exist_ok=True)
 
 
 class DocumentInfo(BaseModel):
+    """P1-A3: 完整 audit record — 用户上传后能查到自己上传了什么"""
     id: str
-    filename: str
-    size: int
-    uploaded_at: int
-    status: str = "ready"
-    metadata: dict | None = None
+    filename: str = ""
+    size: int = 0
+    tenant_id: str = DEFAULT_TENANT_ID
+    status: str = "ready"  # queued | processing | indexed | failed
+    content_hash: str = ""
+    created_by: str = ""
+    uploaded_at: int = 0
     chunks: int | None = None
     elapsed_ms: int | None = None
+    started_at: int | None = None
+    finished_at: int | None = None
     error: str | None = None
+    deduplicated: bool = False  # P1-A4: 是否命中内容去重
 
 
 class DocumentListResponse(BaseModel):
@@ -54,7 +63,7 @@ class DocumentUploadResponse(BaseModel):
     success: bool
     document: DocumentInfo | None = None
     error: str | None = None
-    indexing: str = "queued"  # queued | processing | indexed | failed
+    indexing: str = "queued"  # queued | processing | indexed | failed | deduplicated
 
 
 ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".csv", ".json", ".html", ".xml"}
@@ -62,10 +71,9 @@ MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
 def _validate_file(file: UploadFile) -> None:
-    """验证文件类型和大小"""
+    """验证文件类型"""
     if not file.filename:
         raise HTTPException(status_code=400, detail="文件名不能为空")
-
     ext = Path(file.filename).suffix.lower()
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
@@ -74,19 +82,39 @@ def _validate_file(file: UploadFile) -> None:
         )
 
 
+def _record_to_info(rec: DocumentRecord, deduplicated: bool = False) -> DocumentInfo:
+    """P1-A1+A3: DocumentRecord → API 响应 DTO"""
+    return DocumentInfo(
+        id=rec.file_id,
+        filename=rec.filename,
+        size=rec.size,
+        tenant_id=rec.tenant_id,
+        status=rec.status,
+        content_hash=rec.content_hash,
+        created_by=rec.created_by,
+        uploaded_at=rec.started_at or rec.finished_at,
+        chunks=rec.chunks or None,
+        elapsed_ms=rec.elapsed_ms or None,
+        started_at=rec.started_at or None,
+        finished_at=rec.finished_at or None,
+        error=rec.error,
+        deduplicated=deduplicated,
+    )
+
+
 @router.post("/upload", response_model=DocumentUploadResponse)
 async def upload_document(
     file: UploadFile = File(...),
-    background_tasks: BackgroundTasks = BackgroundTasks(),
     token_payload: dict = Depends(require_current_user),
 ) -> DocumentUploadResponse:
     """
-    上传文档到系统，自动执行解析和索引。
+    上传文档到系统。
 
-    P1.3: 上传后通过 BackgroundTasks 触发 index_file_task，
-    文档 metadata 状态在 Qdrant 中维护（避免内存 dict 重启丢数据）。
-
-    支持格式: PDF, TXT, MD, DOCX, CSV, JSON, HTML, XML
+    P1-A1+A2+A3+A4:
+    - 上传时立刻写 DocumentRegistry (status=queued, 含完整 audit record)
+    - 内容哈希去重: 命中已索引文档则不重复处理
+    - 通过 Arq 任务队列 (Redis Stream) 触发持久化索引
+    - worker 重启 / 滚动发布不丢任务
     """
     try:
         _validate_file(file)
@@ -100,41 +128,78 @@ async def upload_document(
                 detail=f"文件大小超过限制 ({MAX_FILE_SIZE // 1024 // 1024}MB)",
             )
 
-        # 保存文件
-        file_id = str(uuid.uuid4())
-        ext = Path(file.filename).suffix.lower()
-        stored_path = DOCS_DIR / f"{file_id}{ext}"
-        stored_path.write_bytes(content)
-
         # 解析 tenant_id（多租户隔离）
         tenant_id = (
             token_payload.get("tenant_id")
             if isinstance(token_payload, dict)
             else DEFAULT_TENANT_ID
         ) or DEFAULT_TENANT_ID
+        created_by = (
+            token_payload.get("sub", "") if isinstance(token_payload, dict) else ""
+        )
 
-        doc_info = DocumentInfo(
-            id=file_id,
-            filename=file.filename,
+        # ---- P1-A4: 内容哈希去重 ----
+        content_hash = hashlib.sha256(content).hexdigest()
+        registry = get_document_registry()
+        existing = registry.find_by_content_hash(
+            content_hash=content_hash, tenant_id=tenant_id
+        )
+        if existing is not None:
+            logger.info(
+                f"[upload] 去重命中: tenant={tenant_id} hash={content_hash[:12]} "
+                f"-> 复用 file_id={existing.file_id}"
+            )
+            return DocumentUploadResponse(
+                success=True,
+                document=_record_to_info(existing, deduplicated=True),
+                indexing="deduplicated",
+            )
+
+        # ---- P1-A3: 完整 audit record ----
+        file_id = str(__import__("uuid").uuid4())
+        ext = Path(file.filename).suffix.lower()
+        stored_path = DOCS_DIR / f"{file_id}{ext}"
+        stored_path.write_bytes(content)
+
+        record = DocumentRecord(
+            file_id=file_id,
+            tenant_id=tenant_id,
+            filename=file.filename or "",
             size=size,
-            uploaded_at=int(Path(stored_path).stat().st_mtime * 1000),
             status="queued",
-            metadata={"original_name": file.filename, "extension": ext},
+            content_hash=content_hash,
+            created_by=created_by,
+            started_at=int(time.time()),
+        )
+        registry.upsert(record)
+        logger.info(
+            f"[upload] queued: file_id={file_id} ({file.filename}, {size} bytes, "
+            f"hash={content_hash[:12]})"
         )
 
-        # P1.3: 用 BackgroundTasks 触发异步索引，不阻塞上传响应
-        background_tasks.add_task(
-            index_file_task,
-            stored_path,
-            file_id,
-            tenant_id,
-            "recursive",
-        )
-        logger.info(f"Upload queued: {file_id} ({file.filename}, {size} bytes)")
+        # ---- P1-A2: Arq 任务队列 (持久化) ----
+        try:
+            from backend.workers.arq_pool import enqueue_index_task
+            await enqueue_index_task(
+                file_path=stored_path,
+                file_id=file_id,
+                tenant_id=tenant_id,
+                strategy="recursive",
+            )
+        except Exception as e:
+            # 入队失败时回退到直接执行 (开发环境无 Redis)
+            logger.warning(f"[upload] Arq 入队失败: {e}; fallback 到直接执行")
+            from backend.ingestion.pipeline import run_index_pipeline
+            await run_index_pipeline(
+                file_path=stored_path,
+                file_id=file_id,
+                tenant_id=tenant_id,
+                strategy="recursive",
+            )
 
         return DocumentUploadResponse(
             success=True,
-            document=doc_info,
+            document=_record_to_info(record),
             indexing="queued",
         )
 
@@ -150,53 +215,33 @@ async def get_indexing_status(
     doc_id: str,
     token_payload: dict = Depends(require_current_user),
 ) -> DocumentInfo:
-    """
-    获取文档的索引状态（P1.3）。
-
-    返回: queued | processing | indexed | failed
-    """
-    status_info = get_document_status(doc_id)
-    if not status_info:
+    """P1-A3: 获取文档完整 audit record (含 filename/size/tenant_id 等)"""
+    rec = get_document_registry().get(doc_id)
+    if rec is None:
         raise HTTPException(status_code=404, detail="文档不存在或尚未开始处理")
-    return DocumentInfo(
-        id=status_info["file_id"],
-        filename="",
-        size=0,
-        uploaded_at=status_info.get("started_at", 0),
-        status=status_info.get("status", "unknown"),
-        chunks=status_info.get("chunks"),
-        elapsed_ms=status_info.get("elapsed_ms"),
-        error=status_info.get("error"),
-    )
+    return _record_to_info(rec)
 
 
 @router.get("", response_model=DocumentListResponse)
 async def list_documents(
     skip: Annotated[int, Query(ge=0)] = 0,
     limit: Annotated[int, Query(ge=1, le=100)] = 20,
+    status: Annotated[str | None, Query()] = None,
     token_payload: dict = Depends(require_current_user),
 ) -> DocumentListResponse:
-    """列出已上传的文档（按索引状态聚合）"""
-    from backend.ingestion.pipeline import list_indexed_documents
-
-    # 优先返回在 pipeline 中登记的索引状态
-    docs = list_indexed_documents()
-    total = len(docs)
-    paginated = docs[skip : skip + limit]
+    """P1-A1: 列出当前租户的文档（按 tenant 过滤，支持 status 过滤）"""
+    tenant_id = (
+        token_payload.get("tenant_id", DEFAULT_TENANT_ID)
+        if isinstance(token_payload, dict)
+        else DEFAULT_TENANT_ID
+    )
+    records = get_document_registry().list_by_tenant(
+        tenant_id=tenant_id, status=status, limit=skip + limit
+    )
+    total = len(records)
+    paginated = records[skip : skip + limit]
     return DocumentListResponse(
-        documents=[
-            DocumentInfo(
-                id=d["file_id"],
-                filename=d.get("file_id", ""),
-                size=0,
-                uploaded_at=d.get("started_at", 0),
-                status=d.get("status", "unknown"),
-                chunks=d.get("chunks"),
-                elapsed_ms=d.get("elapsed_ms"),
-                error=d.get("error"),
-            )
-            for d in paginated
-        ],
+        documents=[_record_to_info(r) for r in paginated],
         total=total,
     )
 
@@ -206,20 +251,11 @@ async def get_document(
     doc_id: str,
     token_payload: dict = Depends(require_current_user),
 ) -> DocumentInfo:
-    """获取单个文档信息"""
-    status_info = get_document_status(doc_id)
-    if not status_info:
+    """P1-A3: 获取单条文档完整 audit record"""
+    rec = get_document_registry().get(doc_id)
+    if rec is None:
         raise HTTPException(status_code=404, detail="文档不存在或尚未开始处理")
-    return DocumentInfo(
-        id=status_info["file_id"],
-        filename="",
-        size=0,
-        uploaded_at=status_info.get("started_at", 0),
-        status=status_info.get("status", "unknown"),
-        chunks=status_info.get("chunks"),
-        elapsed_ms=status_info.get("elapsed_ms"),
-        error=status_info.get("error"),
-    )
+    return _record_to_info(rec)
 
 
 @router.delete("/{doc_id}")
@@ -227,13 +263,28 @@ async def delete_document(
     doc_id: str,
     token_payload: dict = Depends(require_current_user),
 ) -> dict:
-    """删除指定文档（同时从磁盘和 Qdrant 移除）"""
+    """删除指定文档（磁盘 + Qdrant chunks + DocumentRegistry）"""
+    rec = get_document_registry().get(doc_id)
+    tenant_id = (
+        token_payload.get("tenant_id", DEFAULT_TENANT_ID)
+        if isinstance(token_payload, dict)
+        else DEFAULT_TENANT_ID
+    )
+
     # 1. 删除磁盘文件
-    for ext in ALLOWED_EXTENSIONS:
-        candidate = DOCS_DIR / f"{doc_id}{ext}"
-        if candidate.exists():
-            candidate.unlink()
-            break
+    if rec is not None:
+        for ext in ALLOWED_EXTENSIONS:
+            candidate = DOCS_DIR / f"{doc_id}{ext}"
+            if candidate.exists():
+                candidate.unlink()
+                break
+    else:
+        # registry 找不到时仍尝试按已知 ext 模式找
+        for ext in ALLOWED_EXTENSIONS:
+            candidate = DOCS_DIR / f"{doc_id}{ext}"
+            if candidate.exists():
+                candidate.unlink()
+                break
 
     # 2. 从 Qdrant 删除该 doc_id 的所有 chunks
     try:
@@ -251,8 +302,7 @@ async def delete_document(
     except Exception as e:
         logger.warning(f"Qdrant 删除失败（可能索引为空）: {e}")
 
-    # 3. 从 pipeline 状态字典中删除
-    from backend.ingestion.pipeline import _indexed_documents
-    _indexed_documents.pop(doc_id, None)
+    # 3. 从 DocumentRegistry 删除
+    get_document_registry().delete(doc_id)
 
     return {"success": True, "message": f"文档 {doc_id} 已删除"}

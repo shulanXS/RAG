@@ -11,6 +11,7 @@
 
 .PHONY: help install dev test lint clean \
 	up down restart logs status \
+	restart-worker logs-worker \
 	backend-uvicorn frontend-dev \
 	ingest eval demo \
 	build build-backend build-frontend
@@ -42,6 +43,8 @@ help:
 	@echo "    restart         重启所有服务"
 	@echo "    logs            查看服务日志"
 	@echo "    status          查看服务状态"
+	@echo "    restart-worker  仅重启 Arq 索引 worker (P1-A1 收尾)"
+	@echo "    logs-worker     查看 Arq worker 日志"
 	@echo ""
 	@echo "  数据与评估"
 	@echo "    ingest          运行文档索引脚本"
@@ -123,6 +126,14 @@ logs-backend:
 logs-frontend:
 	docker-compose logs -f frontend
 
+# P1-A1 收尾: Arq 索引 worker 单服务管理
+restart-worker:
+	@echo "重启 Arq index-worker..."
+	docker-compose restart index-worker
+
+logs-worker:
+	docker-compose logs -f index-worker
+
 status:
 	docker-compose ps
 
@@ -184,6 +195,7 @@ demo:
 	@echo "  Jaeger UI:         http://localhost:16686"
 	@echo "  Prometheus:        http://localhost:9090"
 	@echo "  Grafana:           http://localhost:3001  (admin/admin)"
+	@echo "  Index Worker:      docker logs -f rag-index-worker"
 	@echo "  /metrics:          http://localhost:$(BACKEND_PORT)/metrics"
 	@echo "=================================================="
 	@echo ""

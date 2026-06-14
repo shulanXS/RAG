@@ -38,7 +38,7 @@ class TestQueryRouter:
     """QueryRouter 路由分类测试 — 覆盖无 LLM 退化 + JSON 解析 + 置信度升级"""
 
     def test_no_llm_defaults_to_moderate(self):
-        """无 LLM client 时降级到 MODERATE（保守策略）"""
+        """无 LLM client 时降级到 MODERATE（保守策略, P2-B6 用 signals 兜底）"""
         router = QueryRouter(llm_client=None, complexity_threshold=0.6)
         decision = router.route("合同编号 A-2024-001 的甲方是谁？")
 
@@ -46,7 +46,28 @@ class TestQueryRouter:
         assert decision.original_query == "合同编号 A-2024-001 的甲方是谁？"
         assert decision.complexity == QueryComplexity.MODERATE
         assert decision.confidence == 0.5
-        assert "defaulting" in decision.reasoning.lower()
+        # P2-B6: 无 LLM 时 reasoning 现在包含 "signals-based hint" 描述
+        assert "signals-based hint" in decision.reasoning.lower()
+        # P2-B6: RoutingDecision.signals 必填 (无 LLM 也有规则信号)
+        assert decision.signals is not None
+        assert decision.signals.query_length == 22
+
+    def test_no_llm_short_simple_query_yields_simple(self):
+        """P2-B6: 短查询无 LLM 时, signals 兜底为 SIMPLE"""
+        router = QueryRouter(llm_client=None, complexity_threshold=0.6)
+        decision = router.route("什么是RAG？")
+        # 长度 <= 15, entity_count <= 1, 无 multi-hop → simple
+        assert decision.complexity == QueryComplexity.SIMPLE
+        assert decision.signals is not None
+        assert decision.signals.has_quote is False
+
+    def test_routing_decision_carries_signals(self):
+        """P2-B6: RoutingDecision 增字段 signals, 不论 LLM 是否可用"""
+        router = QueryRouter(llm_client=None, complexity_threshold=0.6)
+        decision = router.route("Compare X and Y")
+        # multi-hop 关键词命中
+        assert decision.signals is not None
+        assert decision.signals.is_multi_hop is True
 
     def test_llm_json_parsed_simple(self):
         """LLM 返回 simple 分类时正常解析"""
@@ -270,8 +291,7 @@ class TestToolRegistry:
     def test_default_registry_has_calculator_and_datetime(self):
         """全局注册表默认包含 calculator + datetime"""
         reg = ToolRegistry()
-        # 显式 unregister web_search（避免 httpx 缺失导致 ERROR log）
-        reg.unregister("web_search")
+        # P1-B27: web_search 已删除
         tools = reg.list_tools()
 
         assert "calculator" in tools
@@ -280,7 +300,7 @@ class TestToolRegistry:
     def test_register_and_lookup(self):
         """register 后能 get 到"""
         reg = ToolRegistry()
-        reg.unregister("web_search")
+        # P1-B27: web_search 已删除
         custom_tool = CalculatorTool()  # name=calculator, 已存在
         # CalculatorTool 已注册, 重复 register 应覆盖
         reg.register(custom_tool)
@@ -289,7 +309,6 @@ class TestToolRegistry:
     def test_unregister_returns_true_on_existing(self):
         """取消已注册的工具返回 True"""
         reg = ToolRegistry()
-        reg.unregister("web_search")
         assert reg.unregister("calculator") is True
         assert reg.get("calculator") is None
 
@@ -301,7 +320,6 @@ class TestToolRegistry:
     def test_execute_calculator_via_registry(self):
         """通过 registry 间接调用 calculator 算 2+2"""
         reg = ToolRegistry()
-        reg.unregister("web_search")
         result = asyncio.run(reg.execute_by_name("calculator", {"expression": "2+2"}))
 
         assert result.success is True
@@ -318,7 +336,6 @@ class TestToolRegistry:
     def test_execute_datetime_via_registry(self):
         """通过 registry 间接调用 datetime now"""
         reg = ToolRegistry()
-        reg.unregister("web_search")
         result = asyncio.run(reg.execute_by_name("datetime", {"action": "now", "tz": "UTC"}))
 
         assert result.success is True
@@ -327,7 +344,6 @@ class TestToolRegistry:
     def test_get_tool_schemas_for_react(self):
         """get_tool_schemas 返回 OpenAI function calling 格式, 用于 ReAct agent"""
         reg = ToolRegistry()
-        reg.unregister("web_search")
         schemas = reg.get_tool_schemas()
 
         assert len(schemas) >= 2

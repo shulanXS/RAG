@@ -22,11 +22,124 @@ reranker.py — Cross-Encoder 重排序
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from abc import ABC, abstractmethod
+from collections import OrderedDict
 from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# P2-B3: Rerank LRU 缓存 + 错误分类
+# =============================================================================
+
+# 瞬时错误: 网络 / 限流 / 超时 — 走 cache fallback 路径
+TRANSIENT_ERROR_TYPES: tuple[type, ...] = (
+    TimeoutError,  # 内建 TimeoutError (AsyncIO)
+    ConnectionError,  # 网络断开
+)
+
+def is_transient_error(exc: BaseException) -> bool:
+    """
+    判断异常是否为"瞬时错误" (限流/超时/网络)。
+    用于在 rerank 失败时区分是否走 cache fallback。
+    """
+    # 通用瞬时错误
+    if isinstance(exc, TRANSIENT_ERROR_TYPES):
+        return True
+    # 字符串消息匹配 (兼容没暴露具体 exception type 的库)
+    msg = str(exc).lower()
+    transient_keywords = (
+        "rate limit", "rate_limit", "ratelimit", "too many requests",
+        "timeout", "timed out", "connection reset", "temporarily",
+        "service unavailable", "503", "429",
+    )
+    return any(kw in msg for kw in transient_keywords)
+
+
+def is_permanent_error(exc: BaseException) -> bool:
+    """判断异常是否为"永久错误" (auth / 参数错) — 不重试, 直接 RRF 兜底"""
+    msg = str(exc).lower()
+    permanent_keywords = (
+        "unauthorized", "401", "403", "forbidden",
+        "invalid api key", "invalid_api_key",
+        "bad request", "400", "valueerror", "typeerror",
+        "validation error", "schema",
+    )
+    return any(kw in msg for kw in permanent_keywords)
+
+
+@dataclass
+class RerankCacheStats:
+    """缓存命中统计"""
+    hits: int = 0
+    misses: int = 0
+    evictions: int = 0
+    errors: int = 0
+
+    @property
+    def hit_rate(self) -> float:
+        total = self.hits + self.misses
+        return self.hits / total if total else 0.0
+
+
+class _RerankCache:
+    """
+    P2-B3: Rerank 结果 LRU 缓存。
+
+    设计:
+    - key = md5(query + sorted(chunk_id_list))
+      顺序无关: RRF 输出的 chunk 顺序固定, 排序后作为 key 更稳
+    - value = list[RerankResult]
+    - 容量 256, OrderedDict 实现 LRU 淘汰
+    - 线程不安全 — 当前 rerank 路径都是 sync (to_thread), 单线程竞争下 OK
+    - 缓存命中 → 跳过 Rerank API 调用, 节省 80ms + $0.002/query
+    """
+
+    def __init__(self, capacity: int = 256):
+        self._capacity = capacity
+        self._store: OrderedDict[str, list[RerankResult]] = OrderedDict()
+        self._stats = RerankCacheStats()
+
+    @staticmethod
+    def make_key(query: str, chunk_ids: list[str]) -> str:
+        # 顺序无关 (排序后 join), 容忍 chunk 列表顺序波动
+        return hashlib.md5(
+            (query + "|" + "|".join(sorted(chunk_ids))).encode("utf-8")
+        ).hexdigest()
+
+    def get(self, key: str) -> list[RerankResult] | None:
+        if key in self._store:
+            self._store.move_to_end(key)
+            self._stats.hits += 1
+            return self._store[key]
+        self._stats.misses += 1
+        return None
+
+    def put(self, key: str, results: list[RerankResult]) -> None:
+        if key in self._store:
+            self._store.move_to_end(key)
+        self._store[key] = results
+        if len(self._store) > self._capacity:
+            self._store.popitem(last=False)
+            self._stats.evictions += 1
+
+    def get_stats(self) -> RerankCacheStats:
+        return self._stats
+
+    def clear(self) -> None:
+        self._store.clear()
+        self._stats = RerankCacheStats()
+
+
+# 全局默认 LRU 缓存 (单进程内复用)
+_default_cache = _RerankCache(capacity=256)
+
+
+def get_default_rerank_cache() -> _RerankCache:
+    return _default_cache
 
 
 @dataclass
@@ -99,6 +212,8 @@ class CohereReranker(CrossEncoderReranker):
         model: str = "rerank-3.5",
         max_chunks_per_doc: int = 10,
         truncation: str = "end",  # 截断位置: "start" | "end"
+        cache: _RerankCache | None = None,
+        cache_enabled: bool = True,
     ):
         try:
             import cohere
@@ -109,6 +224,11 @@ class CohereReranker(CrossEncoderReranker):
         self._model = model
         self._max_chunks = max_chunks_per_doc
         self._truncation = truncation
+        # P2-B3: LRU 缓存
+        self._cache = cache if cache is not None else (
+            get_default_rerank_cache() if cache_enabled else _RerankCache(capacity=0)
+        )
+        self._cache_enabled = cache_enabled
 
     def rerank(
         self,
@@ -119,6 +239,8 @@ class CohereReranker(CrossEncoderReranker):
         """
         使用 Cohere Rerank API 进行重排序。
 
+        P2-B3: 走 LRU 缓存; cache hit 时直接返回不调 API。
+
         技术要点:
         - Cohere API 会自动处理长文本截断（保留最重要部分）
         - 返回结果按相关性得分降序排列
@@ -126,6 +248,14 @@ class CohereReranker(CrossEncoderReranker):
         """
         if not chunks:
             return []
+
+        # P2-B3: cache lookup
+        if self._cache_enabled:
+            chunk_ids = [c["chunk_id"] for c in chunks]
+            cache_key = _RerankCache.make_key(query, chunk_ids)
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached[:top_k]
 
         # 准备 API 输入：仅传递文本，API 自动关联 chunk_id
         docs = [c["text"][:4000] for c in chunks]  # 截断到 4000 tokens
@@ -156,6 +286,10 @@ class CohereReranker(CrossEncoderReranker):
                 metadata=metadatas[idx],
             ))
 
+        # P2-B3: 写 cache
+        if self._cache_enabled and results:
+            self._cache.put(cache_key, results)
+
         logger.debug(f"Cohere Rerank: {len(chunks)} → {len(results)} chunks")
         return results
 
@@ -180,6 +314,8 @@ class BGEReranker(CrossEncoderReranker):
         model: str = "BAAI/bge-reranker-v2-m3",
         device: str = "cuda",
         use_fp16: bool = True,
+        cache: _RerankCache | None = None,
+        cache_enabled: bool = True,
     ):
         try:
             from sentence_transformers import CrossEncoder
@@ -195,6 +331,11 @@ class BGEReranker(CrossEncoderReranker):
             automodel_args={"torch_dtype": "auto"} if use_fp16 else {},
         )
         self._use_fp16 = use_fp16
+        # P2-B3: LRU 缓存
+        self._cache = cache if cache is not None else (
+            get_default_rerank_cache() if cache_enabled else _RerankCache(capacity=0)
+        )
+        self._cache_enabled = cache_enabled
 
     def rerank(
         self,
@@ -205,6 +346,8 @@ class BGEReranker(CrossEncoderReranker):
         """
         使用本地 BGE Reranker 进行重排序。
 
+        P2-B3: 走 LRU 缓存; cache hit 时跳过 GPU 推理。
+
         技术要点:
         - CrossEncoder 的输入是 [query, doc] 对列表
         - 自动处理 batch，batch_size 由模型自动决定
@@ -212,6 +355,14 @@ class BGEReranker(CrossEncoderReranker):
         """
         if not chunks:
             return []
+
+        # P2-B3: cache lookup
+        if self._cache_enabled:
+            chunk_ids = [c["chunk_id"] for c in chunks]
+            cache_key = _RerankCache.make_key(query, chunk_ids)
+            cached = self._cache.get(cache_key)
+            if cached is not None:
+                return cached[:top_k]
 
         # 构建 query-doc 对
         pairs = [
@@ -243,6 +394,10 @@ class BGEReranker(CrossEncoderReranker):
                 section_path=chunk.get("section_path", ""),
                 metadata=chunk.get("metadata", {}),
             ))
+
+        # P2-B3: 写 cache
+        if self._cache_enabled and results:
+            self._cache.put(cache_key, results)
 
         logger.debug(f"BGE Rerank: {len(chunks)} → {len(results)} chunks")
         return results

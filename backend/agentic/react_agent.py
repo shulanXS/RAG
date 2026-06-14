@@ -40,24 +40,26 @@ class ReActState(TypedDict, total=False):
     - reasoning: LLM 当前推理步骤
     - action: LLM 当前决定采取的行动
     - next_query: 用于下一步检索的查询（从 LLM reasoning 中提取）
-    - memory_bank_summary: Memory Bank 摘要
+    - memory_bank_summary: 已废弃 (P1-B1)，保留字段以兼容旧 trace
     - final_answer: 最终答案（当 action == "FINISH" 时）
     - confidence: 当前置信度
     - error: 错误信息
     - trace: 推理轨迹（用于展示和 debug）
+    - tool_observations: 工具执行结果列表 (P1-B8: 修复 LLM 看不到工具结果)
     """
     query: str
     rewritten_query: str
     iterations: int
     retrieved_chunks: list
     reasoning: str
-    action: Literal["retrieve", "think", "finish", "error"]
+    action: Literal["retrieve", "think", "finish", "error", "tool_call"]
     next_query: str
     memory_bank_summary: str
     final_answer: str | None
     confidence: float
     error: str | None
     trace: list[dict]
+    tool_observations: list[str]
 
 
 # =============================================================================
@@ -78,7 +80,7 @@ async def _iter_langgraph_events(stream):
         "observe": "observation",
         "retrieve": "action",
         "finish": "final",
-        "max_iter": "final",
+        "max_iter": "warning",
     }
 
     last_state: dict | None = None
@@ -143,14 +145,14 @@ REACT_SYSTEM_PROMPT = """你是一个企业知识助手的推理引擎。
 推理模式:
 1. think: 分析当前状态，决定下一步行动
 2. retrieve: 调用 retrieve 工具，从知识库获取相关上下文
-3. tool_call: 调用 calculator / datetime / web_search 等其他工具
+3. tool_call: 调用 calculator / datetime 等其他工具
 4. finish: 当置信度足够高时，生成最终答案
 
 输出格式 (JSON):
 {{
   "reasoning": "你的推理过程",
   "action": "think|retrieve|tool_call|finish",
-  "tool_name": "如果 action=tool_call，工具名称（calculator/datetime/web_search）",
+  "tool_name": "如果 action=tool_call，工具名称（calculator/datetime）",
   "tool_args": {{"如果 action=tool_call，工具参数"}},
   "next_query": "如果 action=retrieve，输入检索查询",
   "confidence": 0.0-1.0,
@@ -171,6 +173,9 @@ REACT_USER_PROMPT = """用户问题: {query}
 
 已检索到的上下文:
 {context}
+
+已执行的工具结果 (P1-B8: 之前 tool_call 的输出):
+{observations}
 
 请决定下一步行动。"""
 
@@ -351,6 +356,7 @@ class ReActAgent:
             "confidence": 0.0,
             "error": None,
             "trace": [],
+            "tool_observations": [],
         }
 
         try:
@@ -398,6 +404,7 @@ class ReActAgent:
             "confidence": 0.0,
             "error": None,
             "trace": [],
+            "tool_observations": [],
         }
 
         # 用 LangGraph 的 astream() 捕获节点级事件；
@@ -468,6 +475,13 @@ class ReActAgent:
 
         iters = state.get("iterations", 0)
         context = self._format_context(state.get("retrieved_chunks", []))
+        # P1-B8: 注入工具执行结果，让 LLM 在 think 时能看到之前 tool_call 的输出
+        observations = state.get("tool_observations", []) or []
+        obs_text = (
+            "\n".join(f"[obs{i+1}] {o}" for i, o in enumerate(observations))
+            if observations
+            else "(暂无工具结果)"
+        )
 
         # P2.4: 动态注入 ToolRegistry 的 schema
         if self._tool_registry is not None:
@@ -489,6 +503,7 @@ class ReActAgent:
             max_iterations=self._max_iters,
             confidence=state.get("confidence", 0.0),
             context=context or "(暂无上下文，请检索)",
+            observations=obs_text,
         )
 
         prompt = f"{REACT_SYSTEM_PROMPT.format(max_iterations=self._max_iters, early_stop_threshold=self._early_stop, tool_schemas=tool_schemas)}\n\n{user_prompt}"
@@ -557,7 +572,10 @@ class ReActAgent:
 
     async def _tool_node(self, state: ReActState) -> dict:
         """
-        P2.4: 工具执行节点 - 调用 calculator / datetime / web_search 等
+        P2.4: 工具执行节点 - 调用 calculator / datetime 等。
+        P1-B8: 修复 — 工具结果写入 `tool_observations` (state 一等字段)，
+        让后续 think 节点和 finish 节点真正能看到结果。
+        旧实现写 memory_bank_summary，但 _format_context 不读它。
         """
         if self._tool_registry is None:
             return {"reasoning": state.get("reasoning", "") + "\n[no tool registry]"}
@@ -572,10 +590,10 @@ class ReActAgent:
                 f"Tool {tool_name} → {obs}" if not isinstance(obs, str)
                 else f"Tool {tool_name} → {obs[:500]}"
             )
-            # 累积到 memory_bank_summary 让 LLM 在后续 think 时能看到
-            prev = state.get("memory_bank_summary", "")
+            # P1-B8: 写入 tool_observations，think/finish 节点会读它
+            prev = state.get("tool_observations", []) or []
             return {
-                "memory_bank_summary": (prev + "\n" + obs_text).strip(),
+                "tool_observations": [*prev, obs_text],
                 "reasoning": state.get("reasoning", "") + f"\n[tool: {tool_name}]",
             }
         except Exception as e:
@@ -583,18 +601,25 @@ class ReActAgent:
             return {"reasoning": state.get("reasoning", "") + f"\n[tool error: {e}]"}
 
     async def _finish_node(self, state: ReActState) -> dict:
-        """生成节点: 基于收集的上下文生成最终答案"""
+        """生成节点: 基于收集的上下文生成最终答案。
+        P1-B8: 注入 tool_observations，让 final answer 能引用工具结果。
+        """
         context = self._format_context(state.get("retrieved_chunks", []))
+        observations = state.get("tool_observations", []) or []
+        obs_text = "\n".join(f"- {o}" for o in observations) if observations else "(无)"
         query = state.get("rewritten_query", state.get("query", ""))
 
         if self._llm is None:
             answer = f"基于检索结果，无法给出精确答案。请提供更多信息。"
             return {"final_answer": answer}
 
-        prompt = f"""你是一个企业知识助手。请基于以下检索到的上下文信息回答用户问题。
+        prompt = f"""你是一个企业知识助手。请基于以下检索到的上下文信息和工具执行结果回答用户问题。
 
-上下文:
+检索到的上下文:
 {context}
+
+工具执行结果 (P1-B8: 此前的 tool_call 输出，例如 calculator / datetime):
+{obs_text}
 
 用户问题: {query}
 

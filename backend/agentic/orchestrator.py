@@ -21,7 +21,6 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING, AsyncGenerator
 
-from backend.agentic.memory_bank import SimpleMemoryBank
 from backend.agentic.query_router import QueryComplexity, QueryRouter
 from backend.agentic.react_agent import ReActAgent
 from backend.agentic.self_reflection import do_reflection
@@ -93,7 +92,6 @@ class AgenticOrchestrator:
         hybrid_search_engine=None,
         router: QueryRouter | None = None,
         llm_client: LLMClient | None = None,
-        session_id: str = "default",
         chat_store=None,
         semantic_cache_fn=None,
     ):
@@ -101,7 +99,6 @@ class AgenticOrchestrator:
         self._router = router or QueryRouter()
         self._llm = llm_client
         self._prompt_builder = PromptBuilder()
-        self._memory_bank = SimpleMemoryBank(session_id=session_id)
         self._metrics = create_metrics_collector()
         self._tracing = TracingManager()
         self._chat_store = chat_store
@@ -212,12 +209,29 @@ class AgenticOrchestrator:
             span.set_attribute("complexity", complexity.value)
             span.set_attribute("routing_confidence", routing.confidence)
             span.set_attribute("recommended_approach", routing.recommended_approach)
+            # P2-B7: signals 透出到 OTel span, 供 Jaeger 检索 / dashboard
+            if routing.signals is not None:
+                s = routing.signals
+                span.set_attribute("signals.has_pronoun", s.has_pronoun)
+                span.set_attribute("signals.is_multi_hop", s.is_multi_hop)
+                span.set_attribute("signals.entity_count", s.entity_count)
+                span.set_attribute("signals.query_length", s.query_length)
+                span.set_attribute("signals.has_quote", s.has_quote)
 
+        # P2-B7: signals.to_dict() 走真实 QuerySignals,
+        # 单元测试里 Mock 也会带 to_dict, 但调用安全 (Mock 自动返回 Mock)
+        signals_dict = None
+        if routing.signals is not None and hasattr(routing.signals, "to_dict"):
+            try:
+                signals_dict = routing.signals.to_dict()
+            except Exception:
+                signals_dict = None
         trace["routing"] = {
             "complexity": complexity.value,
             "confidence": routing.confidence,
             "reasoning": routing.reasoning,
             "approach": routing.recommended_approach,
+            "signals": signals_dict,
         }
 
         # ---- execute by complexity ----
@@ -231,7 +245,15 @@ class AgenticOrchestrator:
 
         if complexity == QueryComplexity.SIMPLE:
             if self._hybrid_search:
-                chunks, retrieval_context = await self._hybrid_search.search(display_query, tenant=tenant)
+                # P2-B7: 把 routing.signals 透传给 hybrid_search,
+                # search() 内部把 signals 写到 RetrievalContext (供 OTel / debug)
+                # 同时 complexity 用于 DynamicRRFFusion 选 k
+                chunks, retrieval_context = await self._hybrid_search.search(
+                    display_query,
+                    tenant=tenant,
+                    complexity=complexity.value,
+                    signals=routing.signals,
+                )
                 retrieved_chunks = chunks
                 mc.record_retrieval_latency(
                     "total",
@@ -244,6 +266,7 @@ class AgenticOrchestrator:
                     "latency_ms": retrieval_context.total_latency_ms,
                     "num_chunks": len(chunks),
                     "stages": retrieval_context.stage_breakdown,
+                    "fusion_k_used": retrieval_context.fusion_k_used,
                 }
                 answer, citations, citation_verification = await self._generate_answer(
                     display_query, chunks, verify_citation=False
@@ -300,12 +323,6 @@ class AgenticOrchestrator:
                 "gaps": gaps,
             }
 
-        # ---- memory_bank ----
-        if retrieved_chunks:
-            self._memory_bank.add_evidence(retrieved_chunks)
-            coverage = self._memory_bank.verify_coverage()
-            trace["memory_bank"] = coverage
-
         # ---- confidence mapping ----
         conf_level = self._map_confidence(confidence)
 
@@ -336,25 +353,8 @@ class AgenticOrchestrator:
             span.set_attribute("llm_model", self._llm.generator_model if self._llm else "unknown")
             span.set_attribute("answer_length", len(answer))
 
-        # P2.2: 写入 trace ring buffer
-        try:
-            import uuid
-            from backend.observability.trace_store import record_trace
-
-            spans_for_viewer = self._collect_spans(trace)
-            record_trace(
-                trace_id=str(uuid.uuid4()),
-                started_at_ms=int(start * 1000),
-                ended_at_ms=int((time.perf_counter()) * 1000),
-                complexity=complexity.value,
-                routing_confidence=routing.confidence,
-                cache_hit=cache_hit,
-                answer_length=len(answer),
-                spans=spans_for_viewer,
-            )
-        except Exception as e:
-            logger.debug(f"trace_record 失败: {e}")
-
+        # P1-B10+B22: 删除 _collect_spans 与 trace_store ring buffer 写入
+        # (OTel 端已有完整 trace，Jaeger UI 提供 trace 查询；不再维护自定义 ring buffer)
         return OrchestratorResult(
             answer=answer,
             citations=citations,

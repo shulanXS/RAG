@@ -47,7 +47,7 @@ class EmbeddingConfig(BaseModel):
 
 class ChunkingConfig(BaseModel):
     """分块策略配置"""
-    strategy: Literal["fixed", "hierarchical", "semantic", "recursive"] = "recursive"
+    strategy: Literal["hierarchical", "semantic", "recursive"] = "recursive"
     chunk_size: int = 512
     chunk_overlap: int = 64
     min_chunk_size: int = 150
@@ -129,8 +129,10 @@ class HybridSearchConfig(BaseModel):
     """混合搜索配置"""
     individual_top_k: int = 50
     rrf_k: int = 60
-    bm25_weight: float = 0.5
-    dense_weight: float = 0.5
+    # P2-B5: DynamicRRFFusion 总开关; 关闭后固定 k=rrf_k
+    dynamic_k_enabled: bool = True
+    # P2-B5: complexity → k 覆盖映射; None 用默认 DEFAULT_K_BY_COMPLEXITY
+    k_by_complexity: dict[str, int] | None = None
 
 
 class ReActConfig(BaseModel):

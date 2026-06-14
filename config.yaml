@@ -165,12 +165,13 @@ llm:
 hybrid_search:
   # BM25 和 dense 各自召回 top-n
   individual_top_k: 50
-  # RRF 融合参数: k=60 是学术和工业界共同验证的最优默认值
+  # RRF 融合默认 k (无 complexity 信号时使用)
   rrf_k: 60
-  # BM25 和 dense 结果融合权重 (0.0-1.0)
-  # 0.5 表示平等权重；偏向精确匹配可提高 BM25 权重
-  bm25_weight: 0.5
-  dense_weight: 0.5
+  # P2-B5: DynamicRRFFusion 总开关；false 则固定用 rrf_k=60
+  dynamic_k_enabled: true
+  # P2-B5: 按 query complexity 选 k 的覆盖映射；None 用代码默认
+  # 默认值: {simple: 30, moderate: 60, complex: 90, beyond_kb: 60}
+  k_by_complexity: null
 
 # --------------------------------------------------------------------------
 # 7. Agentic 编排配置

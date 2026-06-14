@@ -30,11 +30,12 @@ from typing import TYPE_CHECKING, Literal
 
 from backend.ingestion.embedder import Embedder
 from backend.retrieval.bm25_retriever import BM25Retriever
-from backend.retrieval.fusion import RRFFusion, FusionResult
+from backend.retrieval.fusion import RRFFusion, DynamicRRFFusion, DEFAULT_K_BY_COMPLEXITY, FusionResult
 from backend.retrieval.reranker import CrossEncoderReranker, get_reranker
 from backend.retrieval.vector_retriever import VectorRetriever
 
 if TYPE_CHECKING:
+    from backend.agentic.query_signals import QuerySignals
     from backend.security.tenant import TenantContext
 
 logger = logging.getLogger(__name__)
@@ -54,7 +55,7 @@ class RetrievalContext:
     - retrieved_chunks: 最终检索结果
     """
     query: str
-    total_latency_ms: float
+    total_latency_ms: float = 0.0
     bm25_latency_ms: float = 0.0
     dense_latency_ms: float = 0.0
     fusion_latency_ms: float = 0.0
@@ -64,6 +65,10 @@ class RetrievalContext:
     fusion_candidates: int = 0
     reranked_top_k: int = 0
     retrieved_chunks: list = None
+    # P2-B5: DynamicRRFFusion 实际选用的 k (随 complexity 变化)
+    fusion_k_used: int = 0
+    # P2-B7: 路由信号 (P2-B6 analyzer 的输出), 用于 OTel attribute
+    query_signals: dict | None = None
 
     def __post_init__(self):
         if self.retrieved_chunks is None:
@@ -134,13 +139,23 @@ class HybridSearchEngine:
         bm25_weight: float = 0.5,
         dense_weight: float = 0.5,
         bm25_mode: str = "qdrant_sparse",
+        fusion: DynamicRRFFusion | None = None,
+        dynamic_k_enabled: bool = True,
     ):
         self._embedder = embedder
         self._vector_retriever = vector_retriever
         self._bm25_retriever = bm25_retriever
         self._reranker = reranker
         self._individual_top_k = individual_top_k
-        self._rrf_fusion = RRFFusion(k=rrf_k)
+        # P2-B5: 默认用 DynamicRRFFusion, 通过 complexity 选 k。
+        # 显式传 fusion 可覆盖 (P2 不引入 ML, fusion 实例还是 DynamicRRFFusion)。
+        self._fusion = fusion or DynamicRRFFusion(
+            k_default=rrf_k,
+            k_by_complexity=DEFAULT_K_BY_COMPLEXITY,
+            enabled=dynamic_k_enabled,
+        )
+        # 保留旧字段以备外部代码访问 (P1 旧版本属性), 但实际用 self._fusion
+        self._rrf_fusion = self._fusion
         self._bm25_weight = bm25_weight
         self._dense_weight = dense_weight
         self._bm25_mode = bm25_mode
@@ -195,9 +210,13 @@ class HybridSearchEngine:
             reranker=reranker,
             individual_top_k=config.hybrid_search.individual_top_k,
             rrf_k=config.hybrid_search.rrf_k,
-            bm25_weight=config.hybrid_search.bm25_weight,
-            dense_weight=config.hybrid_search.dense_weight,
             bm25_mode=config.vector_db.bm25_mode,
+            dynamic_k_enabled=config.hybrid_search.dynamic_k_enabled,
+            fusion=DynamicRRFFusion(
+                k_default=config.hybrid_search.rrf_k,
+                k_by_complexity=config.hybrid_search.k_by_complexity,
+                enabled=config.hybrid_search.dynamic_k_enabled,
+            ),
         )
 
     async def search(
@@ -206,6 +225,8 @@ class HybridSearchEngine:
         query_vector: list[float] | None = None,
         acl_filter: dict | None = None,
         tenant: "TenantContext | str | None" = None,
+        complexity: str | None = None,
+        signals: "QuerySignals | None" = None,
     ) -> tuple[list[dict], RetrievalContext]:
         """
         执行混合检索
@@ -217,6 +238,12 @@ class HybridSearchEngine:
             tenant: 可选，租户上下文（TenantContext 或 str tenant_id）。
                     传入后会自动注入 tenant_id 过滤条件，
                     与 acl_filter 通过 AND 组合，确保跨租户数据不可见。
+            complexity: P2-B5: 可选，路由出来的 query complexity
+                       (simple/moderate/complex/beyond_kb)。
+                       传入后 DynamicRRFFusion 按此选 k。
+                       None 时用 k_default (60)。
+            signals: P2-B7: 可选，QuerySignals (pronoun/entity/length/quote 等)。
+                    仅写入 RetrievalContext, 供上层 OTel attributes / debug。
 
         Returns:
             (retrieved_chunks, retrieval_context)
@@ -229,7 +256,14 @@ class HybridSearchEngine:
               单一结果流，避免 RRF 融合时的 chunk_id 重复
             * "external":      保留 rank_bm25 + 应用层 RRF 融合（高级调参场景）
         - 无论哪种模式，最终都做 chunk_id 去重，避免 RRF 权重叠加。
+        - P2-B5: complexity 透传到 DynamicRRFFusion.fuse(..., complexity=...)
+        - P2-B7: signals 写入 context.query_signals, 上层 (OTel span) 读
         """
+        start = time.perf_counter()
+        context = RetrievalContext(query=query)
+        # P2-B7: 把 signals 早写到 context, 即使中途异常也保留
+        if signals is not None:
+            context.query_signals = signals.to_dict()
         start = time.perf_counter()
         context = RetrievalContext(query=query)
 
@@ -321,9 +355,16 @@ class HybridSearchEngine:
         # 步骤 3: RRF 融合（qdrant_sparse 模式下 fused_results 已经是单流）
         fusion_start = time.perf_counter()
         if self._bm25_mode != "qdrant_sparse":
-            fused_results: list[FusionResult] = self._rrf_fusion.fuse(result_sets)
+            # P2-B5: 把 complexity 透传到 DynamicRRFFusion
+            fused_results: list[FusionResult] = self._fusion.fuse(
+                result_sets, complexity=complexity
+            )
+        # 记录实际用的 k, 供 OTel span (B6) 与 metric 打点
+        k_used = self._fusion.k_for_complexity(complexity)
         context.fusion_candidates = len(fused_results)
         context.fusion_latency_ms = (time.perf_counter() - fusion_start) * 1000
+        # P2-B5: 暴露 k_used 到 RetrievalContext, 上层 B6 span 写 attributes 用
+        context.fusion_k_used = k_used
 
         # 取 RRF top-K 作为 Reranker 输入
         fusion_top_k = min(50, len(fused_results))
@@ -379,7 +420,23 @@ class HybridSearchEngine:
                     context.reranked_top_k = len(final_chunks)
 
             except Exception as e:
-                logger.warning(f"Reranker 调用失败，降级到 RRF 结果: {e}")
+                # P2-B3: 区分瞬时 / 永久错误, 不同路径降级
+                from backend.retrieval.reranker import (
+                    is_transient_error,
+                    is_permanent_error,
+                )
+                if is_transient_error(e):
+                    logger.warning(
+                        f"Reranker 瞬时错误 (rate limit / timeout): {e}; "
+                        f"降级到 RRF top-5"
+                    )
+                elif is_permanent_error(e):
+                    logger.error(
+                        f"Reranker 永久错误 (auth / bad input): {e}; "
+                        f"降级到 RRF top-5 (不重试)"
+                    )
+                else:
+                    logger.warning(f"Reranker 未知错误: {e}; 降级到 RRF top-5")
                 final_chunks = [
                     {
                         "chunk_id": r.chunk_id,
@@ -465,6 +522,7 @@ class HybridSearchEngine:
                         section_path=item.get("section_path", ""),
                         metadata=item.get("metadata", {}),
                         fused_score=float(item.get("score", 0.0)),
+                        rank=item.get("rank", 0),
                         individual_scores={source: float(item.get("score", 0.0))},
                         sources=[source],
                     )

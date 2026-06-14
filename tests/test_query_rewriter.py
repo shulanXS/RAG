@@ -10,7 +10,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from backend.retrieval.query_rewriter import (
-    QueryClassifier,
     QueryIntent,
     QueryRewriter,
     QueryType,
@@ -38,24 +37,6 @@ def test_cache_key_is_deterministic():
     assert k1 == k2
     k3 = rw._make_cache_key("hi", [{"role": "user", "content": "old"}])
     assert k1 != k3
-
-
-def test_intent_classifier_rule_based_factual():
-    classifier = QueryClassifier(llm_client=None)
-    qt = classifier._rule_based_classify("2024 Q3 营收")
-    assert qt.intent in (QueryIntent.FACTUAL, QueryIntent.DEFINITIONAL)
-
-
-def test_intent_classifier_rule_based_procedural():
-    classifier = QueryClassifier(llm_client=None)
-    qt = classifier._rule_based_classify("如何部署 RAG 系统")
-    assert qt.intent == QueryIntent.PROCEDURAL
-
-
-def test_intent_classifier_rule_based_conversational():
-    classifier = QueryClassifier(llm_client=None)
-    qt = classifier._rule_based_classify("你好")
-    assert qt.intent == QueryIntent.CONVERSATIONAL
 
 
 def test_rewriter_cache_get_put():

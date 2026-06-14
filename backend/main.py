@@ -29,7 +29,6 @@ from backend.api import (
     health_router,
     search_router,
     stream_router,
-    traces_router,
 )
 from backend.config import get_config
 from backend.middleware.rate_limiter import RateLimitMiddleware, get_rate_limiter
@@ -150,7 +149,6 @@ app.include_router(chat_router, prefix="/api")
 app.include_router(search_router, prefix="/api")
 app.include_router(documents_router, prefix="/api")
 app.include_router(stream_router, prefix="/api")
-app.include_router(traces_router, prefix="/api")  # P2.2 Trace Viewer
 app.include_router(eval_router, prefix="/api")  # P2.3 Evaluation dashboard
 
 

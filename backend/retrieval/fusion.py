@@ -2,28 +2,25 @@
 fusion.py — 多路检索结果融合
 ================================================================================
 技术决策记录:
-- RRF vs 加权平均: RRF (Reciprocal Rank Fusion) 是 2026 年工业界的事实标准。
+|- RRF (Reciprocal Rank Fusion) 是 2026 年工业界的事实标准。
   核心优势: 无需 score 归一化，对不同量纲（BM25 vs cosine similarity）天然鲁棒。
-  加权平均需要将不同算法的得分归一化到同一量纲，实际操作中容易出现偏差。
-- 为什么 k=60: 这是学术和工业界共同验证的最优值。
+|- 为什么 k=60: 这是学术和工业界共同验证的最优值。
   k 值越大，各路算法的权重越均衡；k 值越小，排名靠前的结果权重越高。
   k=60 在「头部结果权重」和「各路均衡」之间取得最佳平衡。
-- 场景化权重: 对于精确匹配查询（包含合同号/SKU），BM25 权重应更高；
-  对于语义理解查询，dense 权重应更高。当前实现使用固定权重，
-  进阶方案: 根据查询类型动态调整权重。
 
 业务难点:
-- 排名冲突处理: 当两路算法给出完全不同的排名时，RRF 通过排名倒数平滑处理。
-- 相关性信号冗余: 两路算法可能都检索到同一结果，RRF 天然处理这种情况
+|- 排名冲突处理: 当两路算法给出完全不同的排名时，RRF 通过排名倒数平滑处理。
+|- 相关性信号冗余: 两路算法可能都检索到同一结果，RRF 天然处理这种情况
   （同一文档在两路中的排名叠加）。
+
+P1-B30: WeightedFusion 与 FusionStrategy ABC 已删除（HybridSearchEngine
+默认走 RRF，weighted 永远无 caller；YAGNI）。
 """
 
 from __future__ import annotations
 
 import logging
-from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
-from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -51,19 +48,7 @@ class FusionResult:
     metadata: dict = field(default_factory=dict)
 
 
-class FusionStrategy(ABC):
-    """检索结果融合策略抽象基类"""
-
-    @abstractmethod
-    def fuse(
-        self,
-        result_sets: dict[str, list],
-    ) -> list[FusionResult]:
-        """融合多路检索结果"""
-        ...
-
-
-class RRFFusion(FusionStrategy):
+class RRFFusion:
     """
     Reciprocal Rank Fusion (RRF) — 2026 年工业界默认方案
 
@@ -80,6 +65,8 @@ class RRFFusion(FusionStrategy):
     - k 越小，头部结果权重越高；k 越大，各路越均衡
     - 当 rank_i(d) 相同时（即同一结果在不同路的排名相同），
       该结果的 RRF 得分最高（这是我们想要的）
+
+    P1-B30: 去掉 ABC 继承 — 唯一实现，无需抽象层。
     """
 
     def __init__(self, k: int = 60):
@@ -149,100 +136,71 @@ class RRFFusion(FusionStrategy):
         return fusion_results
 
 
-class WeightedFusion(FusionStrategy):
-    """
-    加权得分融合 — 备选方案
+# =============================================================================
+# P2-B5: DynamicRRFFusion — 按 query complexity 动态调整 k
+# =============================================================================
 
-    技术决策:
-    - 适用于两路算法得分分布已知且稳定的情况
-    - 需要手动归一化（Min-Max 或 Z-Score）
-    - 实测效果不如 RRF 稳定（当一路算法得分分布突变时，权重失效）
-    - 保留作为 RRF 的备选方案
+# 默认的 complexity → k 映射
+# - simple:   k=30 (小 k → 看重头部; simple 查询通常 BM25 命中率高)
+# - moderate: k=60 (默认)
+# - complex:  k=90 (大 k → 各路均衡; complex 偏 dense 语义)
+# - beyond_kb:k=60 (不区分, 不查知识库)
+DEFAULT_K_BY_COMPLEXITY: dict[str, int] = {
+    "simple": 30,
+    "moderate": 60,
+    "complex": 90,
+    "beyond_kb": 60,
+}
+
+
+class DynamicRRFFusion:
+    """
+    P2-B5: 按 query complexity 动态选 k 的 RRF 融合器。
+
+    启发式:
+    - 简单查询 (pronoun / 短词) → BM25 头部结果更相关 → 小 k 强调头部
+    - 复杂查询 (multi-hop / analytical) → 需 dense 提权重 → 大 k 让 RRF 均衡融合
+    - moderate / beyond_kb → 默认 k=60
+
+    与原 RRFFusion 接口一致 (fuse 签名相同), 可直接替换。
+
+    Args:
+        k_default: 无 complexity 信号时的 fallback k (默认 60)
+        k_by_complexity: complexity → k 覆盖映射, None 用默认
+        enabled: config 开关, False 时退回 k_default
     """
 
     def __init__(
         self,
-        weights: dict[str, float] | None = None,
-        normalize: bool = True,
+        k_default: int = 60,
+        k_by_complexity: dict[str, int] | None = None,
+        enabled: bool = True,
     ):
-        """
-        Args:
-            weights: 各路权重，如 {"bm25": 0.5, "dense": 0.5}
-            normalize: 是否对各路得分做 Min-Max 归一化
-        """
-        self._weights = weights or {"default": 1.0}
-        self._normalize = normalize
+        self._k_default = k_default
+        self._k_by_complexity = k_by_complexity or DEFAULT_K_BY_COMPLEXITY
+        self._enabled = enabled
+
+    def k_for_complexity(self, complexity: str | None) -> int:
+        """根据 complexity 选 k (供上层 span attributes 记录)"""
+        if not self._enabled or not complexity:
+            return self._k_default
+        return self._k_by_complexity.get(complexity, self._k_default)
 
     def fuse(
         self,
         result_sets: dict[str, list],
+        complexity: str | None = None,
     ) -> list[FusionResult]:
-        if self._normalize:
-            result_sets = self._min_max_normalize(result_sets)
+        """
+        执行动态 k 的 RRF 融合。
 
-        doc_scores: dict[str, dict] = {}
-        for source_name, results in result_sets.items():
-            weight = self._weights.get(source_name, 1.0)
-            for result in results:
-                chunk_id = result.chunk_id
-                if chunk_id not in doc_scores:
-                    doc_scores[chunk_id] = {
-                        "doc_id": result.doc_id,
-                        "text": getattr(result, "text", ""),
-                        "section_path": getattr(result, "section_path", ""),
-                        "metadata": getattr(result, "metadata", {}),
-                        "weighted_score": 0.0,
-                        "sources": [],
-                        "individual_scores": {},
-                    }
-                score = getattr(result, "score", 0.0)
-                doc_scores[chunk_id]["weighted_score"] += score * weight
-                doc_scores[chunk_id]["sources"].append(source_name)
-                doc_scores[chunk_id]["individual_scores"][source_name] = score
+        Args:
+            result_sets: 形如 {"bm25": [...], "dense": [...]}
+            complexity: 路由出来的 query complexity (simple/moderate/complex/beyond_kb)
 
-        ranked = sorted(
-            doc_scores.items(),
-            key=lambda x: x[1]["weighted_score"],
-            reverse=True,
-        )
-
-        fusion_results: list[FusionResult] = []
-        for rank, (chunk_id, data) in enumerate(ranked, 1):
-            fusion_results.append(FusionResult(
-                chunk_id=chunk_id,
-                doc_id=data["doc_id"],
-                fused_score=data["weighted_score"],
-                rank=rank,
-                text=data["text"],
-                section_path=data["section_path"],
-                sources=data["sources"],
-                individual_scores=data["individual_scores"],
-                metadata=data["metadata"],
-            ))
-        return fusion_results
-
-    @staticmethod
-    def _min_max_normalize(
-        result_sets: dict[str, list],
-    ) -> dict[str, list]:
-        """对各路结果做 Min-Max 归一化"""
-        normalized: dict[str, list] = {}
-        for source_name, results in result_sets.items():
-            if not results:
-                normalized[source_name] = results
-                continue
-
-            scores = [getattr(r, "score", 0.0) for r in results]
-            min_s, max_s = min(scores), max(scores)
-            span = max_s - min_s
-
-            if span < 1e-9:
-                # 所有得分相同，无需归一化
-                normalized[source_name] = results
-                continue
-
-            for result in results:
-                result.score = (getattr(result, "score", 0.0) - min_s) / span
-
-            normalized[source_name] = results
-        return normalized
+        Returns:
+            按 RRF 得分降序的 FusionResult 列表
+        """
+        k = self.k_for_complexity(complexity)
+        inner = RRFFusion(k=k)
+        return inner.fuse(result_sets)

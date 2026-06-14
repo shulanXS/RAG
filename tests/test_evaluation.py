@@ -356,29 +356,12 @@ class TestP02_PromptHash:
         assert get_prompt_hash(a) != get_prompt_hash(b)
 
 
-class TestP1_MemoryBankModule:
-    """P1-1: 验证 memory_bank.py / self_reflection.py 已抽取到独立模块。"""
-
-    def test_memory_bank_module_exists(self):
-        from backend.agentic.memory_bank import SimpleMemoryBank, EvidenceUnit
-        assert SimpleMemoryBank is not None
-        assert EvidenceUnit is not None
+class TestP1_SelfReflectionModule:
+    """P1-1: self_reflection 已抽取到独立模块。memory_bank 已在 P1-B1 删除。"""
 
     def test_self_reflection_module_exists(self):
         from backend.agentic.self_reflection import do_reflection
         assert do_reflection is not None
-
-    def test_simple_memory_bank_basic(self):
-        from backend.agentic.memory_bank import SimpleMemoryBank
-        bank = SimpleMemoryBank(session_id="test")
-        chunks = [
-            {"chunk_id": "c1", "text": "first chunk", "doc_title": "doc1"},
-            {"chunk_id": "c2", "text": "second chunk"},
-        ]
-        ids = bank.add_evidence(chunks)
-        assert ids == ["ev_c1", "ev_c2"]
-        coverage = bank.verify_coverage()
-        assert coverage["total_chunks"] == 2
 
 
 class TestP1_OrchestratorSimplePath:

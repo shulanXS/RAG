@@ -1,221 +1,117 @@
 "use client";
 
 /**
- * Trace Viewer (P2.2)
- * - 列出最近 100 条 trace
- * - 详情页显示 waterfall (cache_check → query_rewrite → routing → retrieval → generation → reflection)
- * - 按 complexity 过滤
+ * Traces (P1-B22)
+ * - 2026-06-14: 重构为 Jaeger UI 跳转
+ * - 之前的自定义 trace viewer (基于内存 ring buffer) 已删除
+ * - 真实 span 时长由 OTel 上报到 Jaeger，统一在 Jaeger UI 查询
  */
 import { useEffect, useState } from 'react';
 
-interface TraceSummary {
-  trace_id: string;
-  started_at_ms: number;
-  ended_at_ms: number;
-  latency_ms: number;
-  complexity: string;
-  routing_confidence: number;
-  cache_hit: boolean;
-  answer_length: number;
-  span_count: number;
-}
-
-interface Span {
-  name: string;
-  duration_ms: number;
-  attrs: Record<string, any>;
-}
-
-interface TraceDetail extends TraceSummary {
-  spans: Span[];
-}
-
-const COMPLEXITY_COLORS: Record<string, string> = {
-  simple: '#10b981',
-  moderate: '#f59e0b',
-  complex: '#ef4444',
-  beyond_kb: '#6366f1',
-};
+const JAEGER_URL = 'http://localhost:16686';
 
 export default function TracesPage() {
-  const [traces, setTraces] = useState<TraceSummary[]>([]);
-  const [selected, setSelected] = useState<TraceDetail | null>(null);
-  const [filter, setFilter] = useState<string>('');
-  const [loading, setLoading] = useState(false);
   const [token, setToken] = useState<string>('');
+  const [jaegerReady, setJaegerReady] = useState<boolean | null>(null);
 
   useEffect(() => {
-    const t = localStorage.getItem('rag_token') || '';
-    setToken(t);
+    setToken(localStorage.getItem('rag_token') || '');
+    // 健康检查：Jaeger UI 是否可达
+    fetch(`${JAEGER_URL}/api/services`)
+      .then((r) => setJaegerReady(r.ok))
+      .catch(() => setJaegerReady(false));
   }, []);
 
-  async function loadTraces() {
-    if (!token) return;
-    setLoading(true);
-    try {
-      const url = filter ? `/api/traces?complexity=${filter}&limit=100` : '/api/traces?limit=100';
-      const res = await fetch(url, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await res.json();
-      setTraces(data.traces || []);
-    } catch (e) {
-      console.error('loadTraces failed', e);
-    } finally {
-      setLoading(false);
-    }
-  }
-
-  async function loadDetail(traceId: string) {
-    if (!token) return;
-    try {
-      const res = await fetch(`/api/traces/${traceId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      const data = await res.json();
-      setSelected(data);
-    } catch (e) {
-      console.error('loadDetail failed', e);
-    }
-  }
-
-  useEffect(() => {
-    loadTraces();
-    const t = setInterval(loadTraces, 5000);
-    return () => clearInterval(t);
-  }, [token, filter]);
-
   return (
-    <div style={{ display: 'flex', height: '100vh', fontFamily: 'system-ui, sans-serif' }}>
-      <aside style={{ width: 380, overflowY: 'auto', borderRight: '1px solid #e5e7eb' }}>
-        <div style={{ padding: 16, borderBottom: '1px solid #e5e7eb' }}>
-          <h2 style={{ margin: 0, fontSize: 18 }}>Traces</h2>
-          <div style={{ display: 'flex', gap: 8, marginTop: 12 }}>
-            {['', 'simple', 'moderate', 'complex'].map((c) => (
-              <button
-                key={c}
-                onClick={() => setFilter(c)}
-                style={{
-                  padding: '4px 8px',
-                  fontSize: 12,
-                  background: filter === c ? '#1f2937' : '#f3f4f6',
-                  color: filter === c ? '#fff' : '#000',
-                  border: 'none',
-                  borderRadius: 4,
-                  cursor: 'pointer',
-                }}
-              >
-                {c || 'all'}
-              </button>
-            ))}
-          </div>
+    <div
+      style={{
+        padding: 32,
+        fontFamily: 'system-ui, sans-serif',
+        maxWidth: 720,
+        margin: '0 auto',
+      }}
+    >
+      <h2 style={{ margin: 0 }}>Traces</h2>
+      <p style={{ color: '#6b7280', fontSize: 14, marginTop: 8 }}>
+        P1-B22: 之前的自定义 trace viewer 已删除。所有 span 通过 OpenTelemetry
+        上报到 Jaeger，统一在 Jaeger UI 查询。
+      </p>
+
+      <div
+        style={{
+          marginTop: 24,
+          padding: 16,
+          background: '#f9fafb',
+          borderRadius: 8,
+          border: '1px solid #e5e7eb',
+        }}
+      >
+        <div style={{ fontSize: 14, fontWeight: 500, marginBottom: 8 }}>
+          Jaeger UI 状态
         </div>
-        {loading && <p style={{ padding: 12, color: '#9ca3af' }}>loading...</p>}
-        {traces.map((t) => (
-          <div
-            key={t.trace_id}
-            onClick={() => loadDetail(t.trace_id)}
+        {jaegerReady === null && (
+          <div style={{ color: '#9ca3af' }}>检测中...</div>
+        )}
+        {jaegerReady === true && (
+          <div style={{ color: '#10b981' }}>✓ Jaeger 已就绪 (port 16686)</div>
+        )}
+        {jaegerReady === false && (
+          <div style={{ color: '#ef4444' }}>
+            ✗ Jaeger 不可达。请确认 docker-compose 中 jaeger 服务已启动。
+          </div>
+        )}
+        <div style={{ marginTop: 16, display: 'flex', gap: 8 }}>
+          <a
+            href={`${JAEGER_URL}/search?service=backend`}
+            target="_blank"
+            rel="noopener noreferrer"
             style={{
-              padding: 12,
-              borderBottom: '1px solid #f3f4f6',
-              cursor: 'pointer',
-              background: selected?.trace_id === t.trace_id ? '#eff6ff' : '#fff',
+              padding: '8px 16px',
+              background: '#1f2937',
+              color: '#fff',
+              borderRadius: 4,
+              textDecoration: 'none',
+              fontSize: 14,
             }}
           >
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-              <span
-                style={{
-                  fontSize: 11,
-                  padding: '2px 6px',
-                  background: COMPLEXITY_COLORS[t.complexity] || '#9ca3af',
-                  color: '#fff',
-                  borderRadius: 4,
-                }}
-              >
-                {t.complexity}
-              </span>
-              {t.cache_hit && (
-                <span style={{ fontSize: 10, color: '#10b981' }}>cache</span>
-              )}
-            </div>
-            <div style={{ fontSize: 12, color: '#6b7280', marginTop: 4 }}>
-              {t.latency_ms.toFixed(0)}ms · {t.span_count} spans · conf {t.routing_confidence.toFixed(2)}
-            </div>
-            <div style={{ fontSize: 10, color: '#9ca3af', marginTop: 2 }}>
-              {new Date(t.started_at_ms).toLocaleTimeString()} · {t.trace_id.slice(0, 8)}
-            </div>
-          </div>
-        ))}
-      </aside>
+            打开 Jaeger UI →
+          </a>
+          <a
+            href={`${JAEGER_URL}/search?service=backend&tags=%7B%22component%22%3A%22rag%22%7D`}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              padding: '8px 16px',
+              background: '#f3f4f6',
+              color: '#000',
+              borderRadius: 4,
+              textDecoration: 'none',
+              fontSize: 14,
+            }}
+          >
+            只看 RAG span
+          </a>
+        </div>
+      </div>
 
-      <main style={{ flex: 1, overflowY: 'auto', padding: 24 }}>
-        {!selected && <p style={{ color: '#9ca3af' }}>Select a trace to view details</p>}
-        {selected && (
-          <>
-            <h2 style={{ margin: 0 }}>Trace {selected.trace_id.slice(0, 12)}...</h2>
-            <div style={{ marginTop: 8, color: '#6b7280', fontSize: 14 }}>
-              complexity: {selected.complexity} · cache_hit: {String(selected.cache_hit)} · latency:{' '}
-              {selected.latency_ms.toFixed(0)}ms · answer length: {selected.answer_length}
-            </div>
-            <h3 style={{ marginTop: 24 }}>Waterfall</h3>
-            <div style={{ marginTop: 12 }}>
-              {selected.spans.length === 0 && (
-                <p style={{ color: '#9ca3af' }}>no spans</p>
-              )}
-              {selected.spans.map((s, i) => (
-                <div
-                  key={i}
-                  style={{
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 12,
-                    marginTop: 8,
-                    padding: 8,
-                    background: '#f9fafb',
-                    borderRadius: 4,
-                  }}
-                >
-                  <div style={{ width: 24, color: '#9ca3af', fontSize: 12 }}>{i + 1}</div>
-                  <div style={{ fontSize: 13, fontWeight: 500, width: 200 }}>{s.name}</div>
-                  <div
-                    style={{
-                      flex: 1,
-                      height: 8,
-                      background: '#e5e7eb',
-                      borderRadius: 4,
-                      overflow: 'hidden',
-                    }}
-                  >
-                    <div
-                      style={{
-                        width: `${Math.min(100, (s.duration_ms / Math.max(1, selected.latency_ms)) * 100)}%`,
-                        height: '100%',
-                        background: '#3b82f6',
-                      }}
-                    />
-                  </div>
-                  <div style={{ fontSize: 12, color: '#6b7280', width: 60, textAlign: 'right' }}>
-                    {s.duration_ms > 0 ? `${s.duration_ms.toFixed(0)}ms` : '—'}
-                  </div>
-                </div>
-              ))}
-            </div>
-            <h3 style={{ marginTop: 24 }}>Span Attributes</h3>
-            <pre
-              style={{
-                background: '#1f2937',
-                color: '#f9fafb',
-                padding: 16,
-                borderRadius: 4,
-                fontSize: 12,
-                overflow: 'auto',
-              }}
-            >
-              {JSON.stringify(selected.spans, null, 2)}
-            </pre>
-          </>
-        )}
-      </main>
+      <div
+        style={{
+          marginTop: 24,
+          padding: 16,
+          background: '#eff6ff',
+          borderRadius: 8,
+          fontSize: 13,
+          color: '#1e40af',
+        }}
+      >
+        <strong>迁移说明：</strong>
+        <ul style={{ marginTop: 8, marginBottom: 0, paddingLeft: 20 }}>
+          <li>旧路径 <code>/api/traces</code> 已删除 (P1-B22)</li>
+          <li>真实 span 时长由 OTel 记录，duration_ms 不会全是 0</li>
+          <li>production: 用 OTLP exporter 把 trace 推送到 Jaeger / Tempo / Honeycomb</li>
+          <li>本地 dev: <code>make up</code> 启动 docker-compose 后 Jaeger 自动运行</li>
+        </ul>
+      </div>
     </div>
   );
 }

@@ -255,7 +255,7 @@ def main():
     parser.add_argument(
         "--strategy",
         type=str,
-        choices=["fixed", "recursive", "hierarchical", "semantic"],
+        choices=["recursive", "hierarchical", "semantic"],
         default="recursive",
         help="分块策略 (默认: recursive)",
     )

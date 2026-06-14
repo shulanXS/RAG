@@ -563,7 +563,7 @@ class SemanticChunker(ChunkingStrategy):
 # =============================================================================
 
 def get_chunker(
-    strategy: Literal["fixed", "recursive", "hierarchical", "semantic"],
+    strategy: Literal["recursive", "hierarchical", "semantic"],
     config: dict,
     embedder=None,
 ) -> ChunkingStrategy:
@@ -574,6 +574,9 @@ def get_chunker(
     - 工厂模式 + 策略模式的组合是 2026 年生产代码的标配
     - 通过 config dict 传入参数，避免配置与策略实现耦合
     - embedder 参数仅 semantic chunker 需要，其他策略忽略
+
+    P1-B31: 移除 `"fixed"` 死分支 — 之前会 fallback 到 RecursiveChunker + warning，
+    静默退化。改为显式抛 ValueError 让未知策略尽早暴露。
     """
     chunk_size = config.get("chunk_size", 512)
     overlap = config.get("chunk_overlap", 64)
@@ -597,6 +600,8 @@ def get_chunker(
             embedder=embedder,
         )
     else:
-        # fixed: 最简单的固定字符数分块（不推荐生产使用）
-        logger.warning("使用 fixed 分块策略（非生产推荐），切换为 recursive")
-        return RecursiveChunker(chunk_size, overlap, min_size)
+        # 显式报错，避免静默退化
+        raise ValueError(
+            f"Unknown chunking strategy: {strategy!r}. "
+            f"Expected one of: 'recursive', 'hierarchical', 'semantic'."
+        )

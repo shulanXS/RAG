@@ -25,8 +25,7 @@ from backend.agentic.tools.datetime_tool import DateTimeTool
 @pytest.fixture
 def registry() -> ToolRegistry:
     reg = ToolRegistry()
-    # 只用同步可测的工具
-    reg.unregister("web_search")
+    # P1-B27: 之前的 web_search fixture 钩子已删除
     reg.register(CalculatorTool())
     reg.register(DateTimeTool())
     return reg
@@ -125,8 +124,7 @@ async def test_react_tool_registry_schemas_in_prompt(registry: ToolRegistry) -> 
     tool_names = {s["function"]["name"] for s in schemas}
     assert "calculator" in tool_names
     assert "datetime" in tool_names
-    # web_search 在 fixture 中被 unregister 了
-    assert "web_search" not in tool_names
+    # P1-B27: web_search 已删除
 
 
 @pytest.mark.asyncio

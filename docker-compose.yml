@@ -104,6 +104,7 @@ services:
       - QDRANT_URL=http://qdrant:6333
       - REDIS_HOST=redis
       - REDIS_PORT=6379
+      - REDIS_URL=redis://redis:6379/0
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
       - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
@@ -131,6 +132,43 @@ services:
       retries: 3
       # P1.5: Python 启动慢（模型加载、HTTP 连接），给 60s
       start_period: 60s
+    restart: unless-stopped
+
+  # --------------------------------------------------------------------------
+  # Arq Index Worker (P1-A1) — 独立进程消费 Redis Stream 上的索引任务
+  # 不暴露端口；只与 redis + qdrant 通信
+  # --------------------------------------------------------------------------
+  index-worker:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    container_name: rag-index-worker
+    command: ["python", "-m", "backend.workers.index_worker"]
+    environment:
+      - QDRANT_URL=http://qdrant:6333
+      - REDIS_URL=redis://redis:6379/0
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - VOYAGE_API_KEY=${VOYAGE_API_KEY:-}
+      - COHERE_API_KEY=${COHERE_API_KEY:-}
+      - JWT_SECRET_KEY=${JWT_SECRET_KEY:?JWT_SECRET_KEY is required}
+      - JWT_PEPPER=${JWT_PEPPER:?JWT_PEPPER is required}
+      - OTLP_ENDPOINT=http://jaeger:4317
+    volumes:
+      - ./logs:/app/logs
+      - ./data:/app/data
+    depends_on:
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_healthy
+    # Arq worker 没有 HTTP 端口，用 redis ping + 进程存活做 healthcheck
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.socket(); s.settimeout(2); s.connect(('redis', 6379))"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
     restart: unless-stopped
 
   # --------------------------------------------------------------------------

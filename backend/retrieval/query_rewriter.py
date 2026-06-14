@@ -89,151 +89,13 @@ class RewrittenQuery:
     - was_rewritten: 是否进行了改写（原查询即完整则返回原查询）
     - confidence: 重写置信度（0-1）
     - original: 原始查询
-    - query_type: 查询类型信息
+    - query_type: 查询类型信息（P1-B2: QueryClassifier 已删除，保留字段留待 P2 重做）
     """
     rewritten: str
     was_rewritten: bool
     confidence: float
     original: str
     query_type: QueryType | None = None
-
-
-class QueryClassifier:
-    """
-    查询意图分类器 — 基于 DeepSeek 的轻量级分类
-
-    能力:
-    1. 意图分类: factual/comparative/analytical/definitional/procedural/summarization
-    2. 知识边界判断: 是否超出知识库
-    3. 模糊检测: 是否需要用户澄清
-    4. 复杂度评估: 1-5 分
-    """
-
-    def __init__(self, llm_client=None):
-        self._llm = llm_client
-
-    async def classify(self, query: str) -> QueryType:
-        """
-        对查询进行多维度分类
-
-        Args:
-            query: 用户查询
-
-        Returns:
-            QueryType: 包含意图、复杂度、是否需要澄清等信息
-        """
-        if self._llm is None:
-            return self._rule_based_classify(query)
-
-        try:
-            return await self._llm_classify(query)
-        except Exception as e:
-            logger.warning(f"Query classification failed: {e}")
-            return self._rule_based_classify(query)
-
-    def _rule_based_classify(self, query: str) -> QueryType:
-        """基于规则的简单分类（降级方案）"""
-        q_lower = query.lower()
-
-        if any(w in q_lower for w in ["vs", "versus", "compare", "difference", "不同", "比较"]):
-            intent = QueryIntent.COMPARATIVE
-            complexity = 3
-        elif any(w in q_lower for w in ["你好", "hello", "hi", "hey", "thanks", "thank you", "谢谢", "再见"]):
-            intent = QueryIntent.CONVERSATIONAL
-            complexity = 1
-        elif any(w in q_lower for w in ["how to", "steps", "流程", "步骤", "如何做", "怎么", "部署", "安装", "配置"]):
-            intent = QueryIntent.PROCEDURAL
-            complexity = 2
-        elif any(w in q_lower for w in ["why", "how", "analyze", "原因", "分析", "为什么"]):
-            intent = QueryIntent.ANALYTICAL
-            complexity = 3
-        elif any(w in q_lower for w in ["what is", "define", "definition", "什么是", "定义"]):
-            intent = QueryIntent.DEFINITIONAL
-            complexity = 1
-        elif any(w in q_lower for w in ["summarize", "summary", "总结", "概括"]):
-            intent = QueryIntent.SUMMARIZATION
-            complexity = 2
-        elif query.strip().endswith("?") or query.strip().endswith("？"):
-            intent = QueryIntent.FACTUAL
-            complexity = 1
-        else:
-            intent = QueryIntent.FACTUAL
-            complexity = 1
-
-        is_beyond_kb = any(w in q_lower for w in ["current", "today", "latest", "最新", "今天", "实时"])
-        needs_clarification = len(query) < 10
-
-        return QueryType(
-            intent=intent,
-            is_beyond_kb=is_beyond_kb,
-            needs_clarification=needs_clarification,
-            estimated_complexity=complexity,
-            intent_confidence=0.3,
-        )
-
-    async def _llm_classify(self, query: str) -> QueryType:
-        """使用 LLM 进行分类"""
-        import json
-
-        prompt = f"""Analyze the following query and classify it according to these dimensions:
-
-1. INTENT: What type of information is the user looking for?
-   - factual: A specific fact, statistic, or piece of information
-   - comparative: Comparing two or more entities
-   - analytical: Analysis, explanation, or reasoning about a topic
-   - definitional: Definition or explanation of a concept
-   - procedural: Steps, processes, or how-to instructions
-   - summarization: Summary or overview of a topic
-   - conversational: Chat/greeting that doesn't need retrieval
-
-2. BEYOND_KB: Is this query asking about information that might be outside the knowledge base?
-   (e.g., current events, real-time data, opinions, subjective topics)
-   Answer: true or false
-
-3. NEEDS_CLARIFICATION: Is this query too vague or ambiguous to answer directly?
-   (e.g., single word queries, queries with unclear pronouns)
-   Answer: true or false
-
-4. COMPLEXITY: Estimated cognitive complexity (1-5)
-   1 = Simple fact lookup
-   2 = Definition or summary
-   3 = Multi-part or comparative question
-   4 = Analysis or explanation requiring reasoning
-   5 = Complex multi-hop reasoning
-
-Query: {query}
-
-Respond in JSON format:
-{{
-  "intent": "factual|comparative|analytical|definitional|procedural|summarization|conversational",
-  "is_beyond_kb": true|false,
-  "needs_clarification": true|false,
-  "clarification_questions": ["optional question 1", "optional question 2"],
-  "estimated_complexity": 1-5,
-  "intent_confidence": 0.0-1.0
-}}"""
-
-        response = await self._llm.generate(prompt, max_tokens=256, temperature=0.1)
-        data = json.loads(response.strip())
-
-        intent_map = {
-            "factual": QueryIntent.FACTUAL,
-            "comparative": QueryIntent.COMPARATIVE,
-            "analytical": QueryIntent.ANALYTICAL,
-            "definitional": QueryIntent.DEFINITIONAL,
-            "procedural": QueryIntent.PROCEDURAL,
-            "summarization": QueryIntent.SUMMARIZATION,
-            "conversational": QueryIntent.CONVERSATIONAL,
-        }
-
-        return QueryType(
-            intent=intent_map.get(data.get("intent", "factual"), QueryIntent.FACTUAL),
-            is_beyond_kb=data.get("is_beyond_kb", False),
-            needs_clarification=data.get("needs_clarification", False),
-            clarification_questions=data.get("clarification_questions", []),
-            estimated_complexity=int(data.get("estimated_complexity", 1)),
-            intent_confidence=float(data.get("intent_confidence", 0.5)),
-        )
 
 
 class QueryRewriter:
@@ -245,31 +107,29 @@ class QueryRewriter:
       英文代词（it/this/that/they/we），有代词则触发重写
     - LLM 重写: Haiku 4.5 调用，生成完整独立问题
     - Self-check: 让 LLM 验证重写是否保留原意，不保留则回退到原查询
-    - Intent Classification: 分析查询意图，指导后续检索策略
 
     风险考量:
     - 过度重写: 简单的事实型查询被不必要地重写，浪费 LLM 调用。
       缓解: 先检测代词，有代词才重写。
     - 重写错误: LLM 可能误解原意，生成完全不同的问题。
       缓解: 添加 self-check，置信度 < 0.7 时回退到原查询。
+
+    P1-B2: QueryClassifier 已删除（死代码，意图分类由 LLM 改写 prompt 完成）。
+    P1-B3: 反射式 `__init_subclass__` 已删除（无子类，YAGNI）。
     """
 
     def __init__(
         self,
         llm_client=None,
-        enable_intent_classification: bool = True,
         cache_size: int = 500,
     ):
         """
         Args:
             llm_client: 可选，传入 LLM client 实例。如果不传，跳过重写。
-            enable_intent_classification: 是否启用意图分类
-            cache_size: rewrite 结果的 LRU 缓存大小（避免相同 query 重复 LLM 调用）
+            cache_size: rewrite 结果的 LRU 缓存大小
         """
         self._llm = llm_client
-        self._enable_intent_classification = enable_intent_classification
-        self._classifier = QueryClassifier(llm_client) if enable_intent_classification else None
-        # LRU cache: (query, history_hash) -> RewrittenQuery
+        # LRU cache: query+history hash -> RewrittenQuery
         self._cache: OrderedDict[str, RewrittenQuery] = OrderedDict()
         self._cache_size = cache_size
         self._cache_hits = 0
@@ -322,32 +182,22 @@ class QueryRewriter:
     ) -> RewrittenQuery:
         """
         将多轮对话中的不完整查询改写为独立完整问题。
+        (同步版本，无 LRU 缓存；异步版本见 rewrite_async)
 
         Args:
             query: 当前用户查询
-            conversation_history: 对话历史，格式: [{"role": "user"/"assistant", "content": "..."}]
+            conversation_history: 对话历史
 
         Returns:
-            RewrittenQuery: 包含改写结果、置信度和查询类型
+            RewrittenQuery: 改写结果
         """
-        query_type = None
-
-        if self._classifier:
-            import asyncio
-            try:
-                query_type = asyncio.get_event_loop().run_until_complete(
-                    self._classifier.classify(query)
-                )
-            except Exception as e:
-                logger.warning(f"Intent classification failed: {e}")
-
         if not self._needs_rewriting(query):
             return RewrittenQuery(
                 rewritten=query,
                 was_rewritten=False,
                 confidence=1.0,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
 
         if self._llm is None:
@@ -356,10 +206,10 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.5,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
 
-        return self._llm_rewrite(query, conversation_history or [], query_type)
+        return self._llm_rewrite(query, conversation_history or [], None)
 
     def _needs_rewriting(self, query: str) -> bool:
         """
@@ -391,9 +241,9 @@ class QueryRewriter:
         self,
         query: str,
         history: list[dict],
-        query_type: QueryType | None,
+        query_type: QueryType | None = None,
     ) -> RewrittenQuery:
-        """使用 LLM 重写查询"""
+        """使用 LLM 重写查询（query_type 保留参数以兼容外部调用，实际不再使用）"""
         import json
 
         history_context = ""
@@ -440,7 +290,7 @@ class QueryRewriter:
                 was_rewritten=was_rewritten,
                 confidence=confidence,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
 
         except Exception as e:
@@ -450,7 +300,7 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.0,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
 
     async def rewrite_async(
@@ -465,21 +315,13 @@ class QueryRewriter:
             # 标记为缓存命中，供 trace/observability 使用
             return cached
 
-        query_type = None
-
-        if self._classifier:
-            try:
-                query_type = await self._classifier.classify(query)
-            except Exception as e:
-                logger.warning(f"Intent classification failed: {e}")
-
         if not self._needs_rewriting(query):
             result = RewrittenQuery(
                 rewritten=query,
                 was_rewritten=False,
                 confidence=1.0,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
             self._cache_put(cache_key, result)
             return result
@@ -490,12 +332,12 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.5,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
             self._cache_put(cache_key, result)
             return result
 
-        result = await self._llm_rewrite_async(query, conversation_history or [], query_type)
+        result = await self._llm_rewrite_async(query, conversation_history or [], None)
         self._cache_put(cache_key, result)
         return result
 
@@ -503,9 +345,9 @@ class QueryRewriter:
         self,
         query: str,
         history: list[dict],
-        query_type: QueryType | None,
+        query_type: QueryType | None = None,
     ) -> RewrittenQuery:
-        """异步 LLM 重写"""
+        """异步 LLM 重写（query_type 保留参数以兼容外部调用，实际不再使用）"""
         import json
 
         history_context = ""
@@ -547,7 +389,7 @@ class QueryRewriter:
                 was_rewritten=was_rewritten,
                 confidence=confidence,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )
 
         except Exception as e:
@@ -557,5 +399,5 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.0,
                 original=query,
-                query_type=query_type,
+                query_type=None,
             )

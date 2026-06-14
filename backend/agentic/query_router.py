@@ -23,7 +23,10 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import Enum
-from typing import Literal
+from typing import TYPE_CHECKING, Literal
+
+if TYPE_CHECKING:
+    from backend.agentic.query_signals import QuerySignals
 
 logger = logging.getLogger(__name__)
 
@@ -52,12 +55,15 @@ class RoutingDecision:
     - confidence: 分类置信度（0-1）
     - reasoning: LLM 的分类理由（用于 debug 和审计）
     - recommended_approach: 推荐的检索策略描述
+    - signals: P2-B6 提取的纯规则信号 (无 LLM, < 1ms)
+              下游 (B7 动态 RRF, OTel span) 都靠这个字段
     """
     complexity: QueryComplexity
     confidence: float
     reasoning: str
     recommended_approach: str
     original_query: str
+    signals: "QuerySignals | None" = None
 
 
 class QueryRouter:
@@ -121,16 +127,31 @@ class QueryRouter:
             history: 对话历史
 
         Returns:
-            RoutingDecision: 包含复杂度分类和置信度
+            RoutingDecision: 包含复杂度分类和置信度 + QuerySignals
         """
+        # P2-B6: 无论 LLM 是否可用, 都先跑一遍规则 analyzer
+        # (无 LLM 时用 signals.complexity_hint() 兜底)
+        from backend.agentic.query_signals import QueryAnalyzer
+        signals = QueryAnalyzer().analyze(query)
+
         if self._llm is None:
-            # 无 LLM 时，默认 Simple（保守策略：能用则用）
+            # 无 LLM 时, 用 signals 给的 hint 兜底 (避免无脑 MODERATE)
+            hint = signals.complexity_hint()
+            try:
+                complexity = QueryComplexity(hint)
+            except ValueError:
+                complexity = QueryComplexity.MODERATE
             return RoutingDecision(
-                complexity=QueryComplexity.MODERATE,
+                complexity=complexity,
                 confidence=0.5,
-                reasoning="No LLM client configured, defaulting to MODERATE",
-                recommended_approach="ReAct Agent",
+                reasoning=f"No LLM client; signals-based hint: {hint}",
+                recommended_approach=(
+                    "直接混合检索" if complexity == QueryComplexity.SIMPLE
+                    else "ReAct Agent" if complexity == QueryComplexity.MODERATE
+                    else "Plan-and-Execute"
+                ),
                 original_query=query,
+                signals=signals,
             )
 
         history_context = ""
@@ -140,9 +161,21 @@ class QueryRouter:
                 for h in history[-2:]
             )
 
+        # P2-B6: 把 signals 拼进 LLM prompt, 让 LLM 决策时能参考规则信号
+        # (pronoun / multi-hop / length 等结构化 hint 比纯文本稳)
+        signals_context = (
+            f"\n\n规则信号 (供参考):\n"
+            f"- 包含代词: {signals.has_pronoun}\n"
+            f"- 实体数: {signals.entity_count}\n"
+            f"- 多跳关键词: {signals.is_multi_hop}\n"
+            f"- 查询长度: {signals.query_length}\n"
+            f"- 包含引号: {signals.has_quote}"
+        )
+
         prompt = f"""{self.SYSTEM_PROMPT}
 
 {history_context}
+{signals_context}
 
 请分类以下查询:
 
@@ -192,14 +225,17 @@ class QueryRouter:
                 reasoning=reasoning,
                 recommended_approach=approach_map[complexity],
                 original_query=query,
+                signals=signals,
             )
 
         except Exception as e:
             logger.warning(f"路由失败: {e}，默认 MODERATE")
+            # P2-B6: 即使 LLM 异常也保留 signals (debug 价值)
             return RoutingDecision(
                 complexity=QueryComplexity.MODERATE,
                 confidence=0.0,
                 reasoning=f"路由异常: {e}",
                 recommended_approach="ReAct Agent",
                 original_query=query,
+                signals=signals,
             )
