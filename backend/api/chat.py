@@ -139,7 +139,8 @@ async def get_history(
 ) -> ChatHistoryResponse:
     """获取指定会话的聊天历史"""
     try:
-        messages = chat_store.get_history(session_id, limit=limit)
+        # P0-4: chat_store 改 async
+        messages = await chat_store.get_history(session_id, limit=limit)
         return ChatHistoryResponse(
             session_id=session_id,
             messages=messages,
@@ -158,7 +159,8 @@ async def delete_history(
 ) -> dict:
     """清空指定会话的历史"""
     try:
-        chat_store.clear_session(session_id)
+        # P0-4: chat_store 改 async
+        await chat_store.clear_session(session_id)
         return {"success": True, "message": f"Session {session_id} cleared"}
     except Exception as e:
         logger.exception(f"Failed to clear chat history: {e}")

@@ -16,18 +16,19 @@ orchestrator.py — 中央编排器
 
 from __future__ import annotations
 
-import json
 import logging
 import time
 from dataclasses import dataclass, field
 from typing import Any, Literal, TYPE_CHECKING, AsyncGenerator
 
+from backend.agentic.memory_bank import SimpleMemoryBank
 from backend.agentic.query_router import QueryComplexity, QueryRouter
 from backend.agentic.react_agent import ReActAgent
+from backend.agentic.self_reflection import do_reflection
 from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
 from backend.generation.citation_verifier import CitationVerifier
-from backend.observability.metrics import MetricsCollector
+from backend.observability.metrics import create_metrics_collector
 
 logger = logging.getLogger(__name__)
 from backend.observability.tracing import TracingManager
@@ -62,133 +63,6 @@ class OrchestratorResult:
     was_rewritten: bool = False
     cache_hit: bool = False
     citation_verification: dict | None = None
-
-
-# =============================================================================
-# 内联轻量级 Memory Bank（替代 714 行的外部模块）
-# =============================================================================
-
-
-@dataclass
-class EvidenceUnit:
-    source_id: str
-    text: str
-    doc_title: str = ""
-    section_path: str = ""
-    retrieval_score: float = 0.0
-    used_by_claims: list[str] = field(default_factory=list)
-
-
-class SimpleMemoryBank:
-    """
-    轻量级 Memory Bank — 仅保留核心引用追踪，移除 claim-evidence 链路
-    """
-    def __init__(self, session_id: str):
-        self._session_id = session_id
-        self._evidence: dict[str, EvidenceUnit] = {}
-
-    def add_evidence(self, chunks: list[dict]) -> list[str]:
-        evidence_ids = []
-        for chunk in chunks:
-            eid = f"ev_{chunk.get('chunk_id', '')}"
-            if eid not in self._evidence:
-                self._evidence[eid] = EvidenceUnit(
-                    source_id=chunk.get("chunk_id", ""),
-                    text=chunk.get("text", "")[:500],
-                    doc_title=chunk.get("doc_title", ""),
-                    section_path=chunk.get("section_path", ""),
-                    retrieval_score=chunk.get("rerank_score", chunk.get("rrf_score", 0.0)),
-                )
-            evidence_ids.append(eid)
-        return evidence_ids
-
-    def verify_coverage(self) -> dict:
-        used = set()
-        for ev in self._evidence.values():
-            used.update(ev.used_by_claims)
-        total = len(self._evidence)
-        return {
-            "total_chunks": total,
-            "used_chunks": len(used),
-            "coverage": len(used) / total if total > 0 else 1.0,
-        }
-
-
-# =============================================================================
-# 内联 Self-Reflection（替代独立的 364 行模块）
-# =============================================================================
-
-
-_REFLECTION_PROMPT = """你是一个答案质量审查专家。请对以下答案进行严格检查。
-
-用户问题: {query}
-
-检索到的上下文:
-{context}
-
-初始答案:
-{answer}
-
-请以 JSON 格式输出:
-{{
-  "overall_score": 0.0-1.0,
-  "needs_more_retrieval": true|false,
-  "requires_correction": true|false,
-  "gaps": ["缺口1", "缺口2"],
-  "hallucinated_claims": ["幻觉陈述1"]
-}}"""
-
-
-async def _do_reflection(
-    llm_client,
-    query: str,
-    answer: str,
-    contexts: list[dict],
-) -> tuple[float, list[str], str, bool]:
-    """
-    内联自我反思：评估答案质量，返回 (score, gaps, revised_answer, needs_correction)
-    """
-    if not contexts or not answer:
-        return 0.5, [], answer, False
-
-    ctx_text = "\n".join(
-        f"[{i+1}] {c.get('text', '')[:300]}"
-        for i, c in enumerate(contexts[:10])
-    )
-
-    prompt = _REFLECTION_PROMPT.format(
-        query=query,
-        context=ctx_text,
-        answer=answer,
-    )
-
-    try:
-        response = await llm_client.generate_async(prompt, max_tokens=512, temperature=0.1)
-        data = json.loads(response.strip())
-        score = float(data.get("overall_score", 0.5))
-        needs_correction = data.get("requires_correction", False)
-        gaps = data.get("gaps", [])
-
-        revised = answer
-        if needs_correction and score < 0.5:
-            revise_prompt = f"""基于以下审查意见修正答案。
-
-原始问题: {query}
-原答案: {answer}
-
-审查发现的问题: {', '.join(gaps[:3])}
-
-上下文: {ctx_text}
-
-要求: 只基于上下文修正，不要引入外部知识。如有无法回答的方面，明确标注。
-
-修正后的答案:"""
-            revised = await llm_client.generate_async(revise_prompt, max_tokens=1024, temperature=0.2)
-
-        return score, gaps, revised, needs_correction
-    except Exception as e:
-        logger.warning(f"Self-reflection failed: {e}")
-        return 0.5, [], answer, False
 
 
 # =============================================================================
@@ -228,7 +102,7 @@ class AgenticOrchestrator:
         self._llm = llm_client
         self._prompt_builder = PromptBuilder()
         self._memory_bank = SimpleMemoryBank(session_id=session_id)
-        self._metrics = MetricsCollector()
+        self._metrics = create_metrics_collector()
         self._tracing = TracingManager()
         self._chat_store = chat_store
         # P1.2: 接受 cache callable（read 模式无参 / write 模式有 payload）
@@ -308,7 +182,8 @@ class AgenticOrchestrator:
 
         # ---- load session history if not provided ----
         if session_id and conversation_history is None and self._chat_store:
-            conversation_history = self._chat_store.get_history(session_id, limit=20)
+            # P0-4: chat_store 改 async
+            conversation_history = await self._chat_store.get_history(session_id, limit=20)
 
         # ---- query_rewrite ----
         from backend.retrieval.query_rewriter import QueryRewriter
@@ -370,7 +245,9 @@ class AgenticOrchestrator:
                     "num_chunks": len(chunks),
                     "stages": retrieval_context.stage_breakdown,
                 }
-                answer, citations, citation_verification = await self._generate_answer(display_query, chunks)
+                answer, citations, citation_verification = await self._generate_answer(
+                    display_query, chunks, verify_citation=False
+                )
             else:
                 answer = "检索引擎未配置"
                 citations = []
@@ -398,11 +275,18 @@ class AgenticOrchestrator:
             answer, citations = await self._direct_generate(display_query)
             confidence = 0.9
 
-        # ---- self-reflection (内联，仅在有检索结果且非 BEYOND_KB 时触发) ----
+        # P0-3: Self-Reflection 仅在 MODERATE/COMPLEX 路径触发。
+        # SIMPLE 路径（67% 流量）跳过，节省 200-500ms LLM 调用。
         gaps: list[str] = []
-        if retrieved_chunks and answer and self._llm and self._llm.generator_client:
+        if (
+            complexity in (QueryComplexity.MODERATE, QueryComplexity.COMPLEX)
+            and retrieved_chunks
+            and answer
+            and self._llm
+            and self._llm.generator_client
+        ):
             with tm.create_span("rag.self_reflection") as span:
-                score, gaps, revised, needs_correction = await _do_reflection(
+                score, gaps, revised, needs_correction = await do_reflection(
                     self._llm.generator_client, query, answer, retrieved_chunks
                 )
                 if needs_correction and score < 0.5:
@@ -428,8 +312,9 @@ class AgenticOrchestrator:
         # ---- save session history ----
         if session_id and self._chat_store and answer:
             try:
-                self._chat_store.add_message(session_id, "user", query)
-                self._chat_store.add_message(session_id, "assistant", answer)
+                # P0-4: chat_store 改 async
+                await self._chat_store.add_message(session_id, "user", query)
+                await self._chat_store.add_message(session_id, "assistant", answer)
             except Exception as e:
                 logger.warning(f"Failed to save session history: {e}")
 
@@ -513,8 +398,15 @@ class AgenticOrchestrator:
         self,
         query: str,
         chunks: list[dict],
+        verify_citation: bool = True,
     ) -> tuple[str, list[dict], dict | None]:
-        """基于检索结果生成答案"""
+        """
+        基于检索结果生成答案。
+
+        P0-3: verify_citation 默认为 True，但 SIMPLE 路径调用时传 False，
+        节省 200-500ms citation verifier LLM 调用。
+        MODERATE / COMPLEX 路径默认 True。
+        """
         if self._llm is None:
             return "LLM 不可用", [], None
 
@@ -535,9 +427,9 @@ class AgenticOrchestrator:
             llm_latency,
         )
 
-        # 答实对齐验证
+        # P0-3: 答实对齐验证 — 仅在 verify_citation=True 时调用（MODERATE/COMPLEX）
         citation_verification = None
-        if chunks and self._llm:
+        if verify_citation and chunks and self._llm:
             try:
                 verify_result = await self._citation_verifier.verify(query, response, chunks)
                 citations = self._citation_verifier.to_citations(verify_result)
@@ -673,7 +565,8 @@ class AgenticOrchestrator:
         """
         # ---- load session history ----
         if session_id and conversation_history is None and self._chat_store:
-            conversation_history = self._chat_store.get_history(session_id, limit=20)
+            # P0-4: chat_store 改 async
+            conversation_history = await self._chat_store.get_history(session_id, limit=20)
 
         # ---- cache_check (P1.2: 真实 cache 命中) ----
         cache_hit = False
@@ -806,8 +699,9 @@ class AgenticOrchestrator:
         # ---- save session history + write semantic cache ----
         if session_id and self._chat_store and full_answer:
             try:
-                self._chat_store.add_message(session_id, "user", query)
-                self._chat_store.add_message(session_id, "assistant", full_answer)
+                # P0-4: chat_store 改 async
+                await self._chat_store.add_message(session_id, "user", query)
+                await self._chat_store.add_message(session_id, "assistant", full_answer)
             except Exception as e:
                 logger.warning(f"Failed to save session history: {e}")
 

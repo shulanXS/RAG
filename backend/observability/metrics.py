@@ -23,7 +23,6 @@ from __future__ import annotations
 
 import logging
 import threading
-from functools import lru_cache
 from typing import Literal
 
 from prometheus_client import Counter, Histogram, Gauge, REGISTRY, generate_latest
@@ -142,35 +141,16 @@ rag_up = Gauge(
 
 
 # =============================================================================
-# 3. MetricsCollector Singleton (P3.2 修复: 函数和类同名，改为单例 + 工厂)
+# 3. MetricsCollector Singleton
 # =============================================================================
+# P1-2: 删除旧名 `MetricsCollector()` 函数别名（同时是函数又是类名导致 IDE 跳转错）。
+# 工厂函数 `create_metrics_collector()` 返回 `MetricsCollectorImpl` 单例。
+# 4 个便捷函数（record_retrieval_latency/record_cache_hit/record_llm_tokens/record_error）
+# 也被删除 — 调用方已改为持有 collector 实例后直接调方法，重复封装消除。
 
 
 _metrics_collector_instance: "MetricsCollectorImpl | None" = None
 _metrics_collector_lock = threading.Lock()
-
-
-def create_metrics_collector() -> "MetricsCollectorImpl":
-    """
-    工厂方法: 创建/获取 MetricsCollectorImpl 单例。
-
-    P3.2 修复: 之前 @lru_cache + 同名函数导致混淆。改为：
-    - 工厂函数 create_metrics_collector() 返回单例
-    - 保留旧名 MetricsCollector() 作为别名以兼容现有调用
-    """
-    global _metrics_collector_instance
-    if _metrics_collector_instance is None:
-        with _metrics_collector_lock:
-            if _metrics_collector_instance is None:
-                _metrics_collector_instance = MetricsCollectorImpl()
-    return _metrics_collector_instance
-
-
-# 旧名兼容: 仍然支持 `from backend.observability.metrics import MetricsCollector`
-# 旧用法: `mc = MetricsCollector()`
-def MetricsCollector() -> "MetricsCollectorImpl":  # type: ignore[no-redef]  # noqa: N802
-    """DEPRECATED: use create_metrics_collector() instead. Kept for compat."""
-    return create_metrics_collector()
 
 
 class MetricsCollectorImpl:
@@ -328,42 +308,24 @@ class MetricsCollectorImpl:
             return "complex"
 
 
+def create_metrics_collector() -> "MetricsCollectorImpl":
+    """
+    工厂方法: 创建/获取 MetricsCollectorImpl 单例。
+
+    P1-2: 删除旧名 `MetricsCollector()` 函数别名（与 `MetricsCollectorImpl` 类同名导致
+    IDE 跳转错、ruff N802 长期警告）。所有调用方改为 `create_metrics_collector()`。
+    """
+    global _metrics_collector_instance
+    if _metrics_collector_instance is None:
+        with _metrics_collector_lock:
+            if _metrics_collector_instance is None:
+                _metrics_collector_instance = MetricsCollectorImpl()
+    return _metrics_collector_instance
+
+
 # =============================================================================
-# 4. Convenience Functions (for backward compatibility)
+# 4. Prometheus /metrics endpoint
 # =============================================================================
-
-
-def record_retrieval_latency(
-    stage: Literal["bm25", "dense", "fusion", "rerank", "embedding", "total"],
-    latency_seconds: float,
-    query_complexity: float | None = None,
-    num_chunks: int | None = None,
-) -> None:
-    """快捷函数：记录检索延迟"""
-    MetricsCollector().record_retrieval_latency(stage, latency_seconds, query_complexity, num_chunks)
-
-
-def record_cache_hit(hit: bool, similarity: float | None = None) -> None:
-    """快捷函数：记录缓存命中"""
-    MetricsCollector().record_cache_hit(hit, similarity)
-
-
-def record_llm_tokens(
-    model: str,
-    input_tokens: int = 0,
-    output_tokens: int = 0,
-) -> None:
-    """快捷函数：记录 LLM Token"""
-    MetricsCollector().record_llm_tokens(model, input_tokens, output_tokens)
-
-
-def record_error(
-    error_type: str,
-    component: str,
-    message: str | None = None,
-) -> None:
-    """快捷函数：记录错误"""
-    MetricsCollector().record_error(error_type, component, message)
 
 
 def get_metrics() -> bytes:

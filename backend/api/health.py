@@ -20,6 +20,7 @@ health.py — 健康检查 API 路由
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -67,9 +68,18 @@ def _build_health_checker() -> HealthChecker:
 
 
 async def _run_component_checks() -> dict[str, ComponentHealth]:
+    """
+    P1-5: 并发执行依赖检查。
+
+    原实现串行 `await checker.check_qdrant()` + `await checker.check_redis()`，
+    总耗时 = t_qdrant + t_redis（K8s probe 默认 10s 一次，单次 2-4s 阻塞 503 决策）。
+    改用 asyncio.gather 并发，总耗时 = max(t_qdrant, t_redis)。
+    """
     checker = _build_health_checker()
-    qdrant_status = await checker.check_qdrant()
-    redis_status = await checker.check_redis()
+    qdrant_status, redis_status = await asyncio.gather(
+        checker.check_qdrant(),
+        checker.check_redis(),
+    )
     return {
         "vector_db": ComponentHealth(
             status=qdrant_status.status.value,

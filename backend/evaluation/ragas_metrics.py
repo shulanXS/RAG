@@ -33,6 +33,7 @@ try:
     from datasets import Dataset
     from ragas import evaluate as ragas_evaluate
     from ragas.metrics import (
+        answer_correctness,
         answer_relevancy,
         context_precision,
         context_recall,
@@ -42,7 +43,7 @@ try:
 except ImportError:
     RAGAS_AVAILABLE = False
     logger.warning(
-        "ragas / datasets 未安装，将回退到简化评估。请运行: "
+        "ragas / datasets 未安装，评估不可用。请运行: "
         "pip install ragas>=0.4.0 datasets>=2.14.0"
     )
 
@@ -107,26 +108,19 @@ class RAGASEvaluator:
     ):
         """
         Args:
-            llm_client: LLM client（ragas 会自动包装为 evaluator LLM；降级路径下用于本地评估）
+            llm_client: 保留入参以保持向后兼容。ragas 0.4+ 自动管理 evaluator LLM。
             thresholds: 指标阈值配置
         """
         self._llm = llm_client
         self._thresholds = thresholds or dict(self.DEFAULT_THRESHOLDS)
-        self._use_ragas = RAGAS_AVAILABLE
-
-        if self._use_ragas and llm_client is not None:
-            self._wrap_llm_for_ragas()
+        # ragas 0.4+ 自行管理 evaluator LLM；self._llm 仅在调用方做 trace 关联时使用。
 
     def _wrap_llm_llm_attribute(self) -> None:
-        """ragas >= 0.2 推荐使用 Langchain LLM 接口。
-        简单处理：把项目内 LLMClient 的 generator_client 包装成 ragas 可用的形式。
-        此处仅做软绑定 — 实际指标调用的内部细节交给 ragas 库。
-        """
-        # 复杂适配放到使用方按需覆盖；此处保留扩展点
+        """保留扩展点 — 真实适配由调用方按需覆盖。"""
         self._ragas_llm = None
 
     def _wrap_llm_for_ragas(self) -> None:
-        """尝试将内 LLMClient 包装为 ragas 可用的 LLM 接口。"""
+        """扩展点。ragas 0.4+ 自行管理 evaluator LLM，无需手工包装。"""
         self._wrap_llm_llm_attribute()
 
     # -------------------------------------------------------------------------
@@ -141,7 +135,7 @@ class RAGASEvaluator:
         ground_truth: str | None = None,
     ) -> EvaluationReport:
         """
-        对单条查询进行 RAGAS 评估
+        对单条查询进行 RAGAS 评估。
 
         Args:
             question: 用户问题
@@ -151,12 +145,16 @@ class RAGASEvaluator:
 
         Returns:
             EvaluationReport: 完整评估报告
+
+        Raises:
+            RuntimeError: ragas 库不可用或评估失败（不允许静默回退到不可信实现）
         """
-        if self._use_ragas and self._llm is not None:
-            return await self._evaluate_with_ragas(
-                question, answer, retrieved_contexts, ground_truth
+        if not RAGAS_AVAILABLE:
+            raise RuntimeError(
+                "ragas >= 0.4 is required for RAGASEvaluator; "
+                "install via `pip install ragas>=0.4.0 datasets>=2.14.0`"
             )
-        return await self._evaluate_fallback(
+        return await self._evaluate_with_ragas(
             question, answer, retrieved_contexts, ground_truth
         )
 
@@ -179,6 +177,9 @@ class RAGASEvaluator:
 
         metric_objs = [faithfulness, answer_relevancy, context_precision]
         if ground_truth:
+            # P0-1: 把 answer_correctness 也加入（与 config.yaml 5 指标阈值保持一致）。
+            # 此前只跑 4 指标，answer_correctness 阈值永远不被比较 → 沉默失败。
+            metric_objs.append(answer_correctness)
             metric_objs.append(context_recall)
 
         try:
@@ -189,10 +190,7 @@ class RAGASEvaluator:
                 None, lambda: ragas_evaluate(ds, metrics=metric_objs)
             )
         except Exception as e:
-            logger.warning(f"ragas 评估失败，回退到本地评估: {e}")
-            return await self._evaluate_fallback(
-                question, answer, retrieved_contexts, ground_truth
-            )
+            raise RuntimeError(f"ragas 评估失败: {e}") from e
 
         results: list[RAGASResult] = []
         # ragas 0.4+ 返回 Result 对象
@@ -205,10 +203,7 @@ class RAGASEvaluator:
                     if val is not None and not (isinstance(val, float) and val != val):
                         scores[col] = float(val)
         except Exception as e:
-            logger.warning(f"解析 ragas 结果失败: {e}")
-            return await self._evaluate_fallback(
-                question, answer, retrieved_contexts, ground_truth
-            )
+            raise RuntimeError(f"解析 ragas 结果失败: {e}") from e
 
         for metric, score in scores.items():
             threshold = self._thresholds.get(metric, 0.5)
@@ -222,133 +217,6 @@ class RAGASEvaluator:
             )
 
         return self._build_report(results)
-
-    async def _evaluate_fallback(
-        self,
-        question: str,
-        answer: str,
-        retrieved_contexts: list[str],
-        ground_truth: str | None,
-    ) -> EvaluationReport:
-        """降级路径：使用 LLM 做 LLM-as-Judge（与原实现一致）"""
-        if self._llm is None:
-            logger.warning("没有 LLM client，无法执行 RAGAS 评估")
-            return self._build_report([])
-
-        results: list[RAGASResult] = []
-
-        faithfulness_score = await self._llm_score_faithfulness(
-            question, answer, retrieved_contexts
-        )
-        results.append(
-            RAGASResult(
-                metric="faithfulness",
-                score=faithfulness_score,
-                passed=faithfulness_score >= self._thresholds.get("faithfulness", 0.85),
-                threshold=self._thresholds.get("faithfulness", 0.85),
-            )
-        )
-
-        relevancy_score = await self._llm_score_relevancy(question, answer)
-        results.append(
-            RAGASResult(
-                metric="answer_relevancy",
-                score=relevancy_score,
-                passed=relevancy_score >= self._thresholds.get("answer_relevancy", 0.75),
-                threshold=self._thresholds.get("answer_relevancy", 0.75),
-            )
-        )
-
-        precision_score = await self._llm_score_context_precision(question, retrieved_contexts)
-        results.append(
-            RAGASResult(
-                metric="context_precision",
-                score=precision_score,
-                passed=precision_score >= self._thresholds.get("context_precision", 0.70),
-                threshold=self._thresholds.get("context_precision", 0.70),
-            )
-        )
-
-        if ground_truth:
-            recall_score = await self._llm_score_context_recall(ground_truth, retrieved_contexts)
-            results.append(
-                RAGASResult(
-                    metric="context_recall",
-                    score=recall_score,
-                    passed=recall_score >= self._thresholds.get("context_recall", 0.70),
-                    threshold=self._thresholds.get("context_recall", 0.70),
-                )
-            )
-
-        return self._build_report(results)
-
-    # -------------------------------------------------------------------------
-    # 简化的 LLM-as-Judge（降级路径）
-    # -------------------------------------------------------------------------
-
-    async def _llm_score_faithfulness(
-        self, question: str, answer: str, contexts: list[str]
-    ) -> float:
-        if not contexts:
-            return 0.0
-        ctx_text = "\n".join(f"[{i+1}] {c[:300]}" for i, c in enumerate(contexts))
-        prompt = f"""评估答案的忠实性（faithfulness，0-1 区间）。
-问题: {question}
-上下文: {ctx_text}
-答案: {answer}
-仅返回 0-1 的小数，不要其他内容。"""
-        try:
-            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
-            return max(0.0, min(1.0, float(response.strip())))
-        except Exception as e:
-            logger.warning(f"Faithfulness LLM 评估失败: {e}")
-            return 0.0
-
-    async def _llm_score_relevancy(self, question: str, answer: str) -> float:
-        prompt = f"""评估答案与问题的相关度（0-1 区间）。
-问题: {question}
-答案: {answer}
-仅返回 0-1 的小数，不要其他内容。"""
-        try:
-            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
-            return max(0.0, min(1.0, float(response.strip())))
-        except Exception as e:
-            logger.warning(f"Relevancy LLM 评估失败: {e}")
-            return 0.0
-
-    async def _llm_score_context_precision(
-        self, question: str, contexts: list[str]
-    ) -> float:
-        if not contexts:
-            return 0.0
-        ctx_text = "\n".join(f"[{i+1}] {c[:200]}" for i, c in enumerate(contexts))
-        prompt = f"""评估检索上下文的相关性比例（precision，0-1 区间）。
-问题: {question}
-上下文列表:
-{ctx_text}
-仅返回 0-1 的小数。"""
-        try:
-            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
-            return max(0.0, min(1.0, float(response.strip())))
-        except Exception as e:
-            logger.warning(f"Context Precision LLM 评估失败: {e}")
-            return 0.0
-
-    async def _llm_score_context_recall(
-        self, ground_truth: str, contexts: list[str]
-    ) -> float:
-        ctx_text = "\n".join(f"[{i+1}] {c[:200]}" for i, c in enumerate(contexts))
-        prompt = f"""评估检索上下文对参考答案的覆盖率（recall，0-1 区间）。
-参考答案: {ground_truth}
-上下文列表:
-{ctx_text}
-仅返回 0-1 的小数。"""
-        try:
-            response = await self._llm.generate_async(prompt, max_tokens=16, temperature=0.1)
-            return max(0.0, min(1.0, float(response.strip())))
-        except Exception as e:
-            logger.warning(f"Context Recall LLM 评估失败: {e}")
-            return 0.0
 
     # -------------------------------------------------------------------------
     # 批量评估

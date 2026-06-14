@@ -261,20 +261,13 @@ logging:
     log_citation_mapping: true
 
 # --------------------------------------------------------------------------
-# 11. Query Expansion 配置 (Phase 1)
+# 11. Query Expansion / Intent Classification 配置
 # --------------------------------------------------------------------------
-query_expansion:
-  enabled: true
-  max_expansions: 5         # 最大扩展子查询数量
-  min_expansions: 1        # 最少扩展数量
-  use_deepseek: true       # 使用 DeepSeek 生成扩展查询
-
-# --------------------------------------------------------------------------
-# 12. Intent Classification 配置 (Phase 1)
-# --------------------------------------------------------------------------
-intent_classification:
-  enabled: true
-  use_deepseek: true
+# P1-6: 删除 query_expansion / intent_classification 两段。
+# 原因: query_rewriter.py:260 内部的 QueryClassifier 构造器默认 `enable_intent_classification=True`，
+#       实际行为由 `QueryRewriter` 自己控制（与 config.yaml 无关）。
+#       query_expansion 在项目内无任何消费方 → 写而不用是死配置。
+#       README / ARCHITECTURE.md 已说明 query_rewriter 内部统一处理意图分类。
 
 # P0 阶段移除的配置段:
 # - hyde (Hypothetical Document Embeddings) — 性能收益不抵额外 200-500ms LLM 调用

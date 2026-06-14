@@ -234,14 +234,19 @@ class RateLimitMiddleware:
         await self.app(scope, receive, send_wrapper)
 
     def _extract_tenant_id(self, scope) -> str:
+        """
+        从 JWT 提取 tenant_id（user sub）。
+
+        P1-4: 原实现手写 base64 解 JWT payload，**不验证签名** — tenant_id 可被伪造。
+        改用 `backend.security.auth.decode_token`，统一用项目内的验签逻辑。
+        JWT 验签是 CPU bound（< 1ms），在 async middleware 中调用 sync 函数可接受。
+        """
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
         if auth.startswith("Bearer "):
-            import base64, json
             try:
-                payload = auth[7:].split(".")[1]
-                padded = payload + "=" * (4 - len(payload) % 4)
-                claims = json.loads(base64.urlsafe_b64decode(padded))
+                from backend.security.auth import decode_token
+                claims = decode_token(auth[7:])
                 return claims.get("sub", "anonymous")
             except Exception:
                 pass

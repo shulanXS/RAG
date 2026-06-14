@@ -391,7 +391,7 @@ class LLMClient:
         router_model: str = "claude-3-5-haiku-20250620",
     ):
         from backend.middleware.circuit_breaker import get_breaker, CircuitBreakerConfig
-        from backend.observability.metrics import MetricsCollector
+        from backend.observability.metrics import create_metrics_collector
 
         self.generator_client = self._create_backend(
             generator_provider, generator_model
@@ -411,7 +411,7 @@ class LLMClient:
             CircuitBreakerConfig(failure_threshold=3, recovery_timeout=30.0),
         )
 
-        self._metrics = MetricsCollector()
+        self._metrics = create_metrics_collector()
 
     @property
     def generator_model(self) -> str:

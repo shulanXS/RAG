@@ -1,5 +1,10 @@
 """
 backend/session/chat_store.py — Redis Chat History Store
+================================================================================
+技术决策:
+- P0-4: 改用 redis.asyncio.Redis，避免在 FastAPI async 请求中阻塞 event loop。
+  原实现用同步 redis.Redis，stream 输出会和 chat IO 抢 event loop 造成卡顿。
+- 与 rate_limiter.py P1.2 修复保持一致。
 """
 
 from __future__ import annotations
@@ -10,9 +15,9 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-# redisvl 可能不可用，用 redis-py 作为直接替代
+# redis-py 的 async 客户端（同步客户端 import 仅做依赖检查）
 try:
-    import redis
+    import redis.asyncio as aioredis
     REDIS_AVAILABLE = True
 except ImportError:
     REDIS_AVAILABLE = False
@@ -47,13 +52,14 @@ class ChatStore:
         self._db = db
         self._ttl_seconds = ttl_days * 86400
 
-        self._client = redis.Redis(
+        # P0-4: async client，所有方法必须 await
+        self._client = aioredis.Redis(
             host=self._host,
             port=self._port,
             db=self._db,
             decode_responses=False,
         )
-        logger.info(f"ChatStore initialized: redis://{self._host}:{self._port}/db{self._db}")
+        logger.info(f"ChatStore initialized (async): redis://{self._host}:{self._port}/db{self._db}")
 
     @classmethod
     def get_instance(cls, **kwargs) -> "ChatStore":
@@ -64,7 +70,7 @@ class ChatStore:
     def _key(self, session_id: str) -> str:
         return f"chat:history:{session_id}"
 
-    def add_message(
+    async def add_message(
         self,
         session_id: str,
         role: Literal["user", "assistant", "system"],
@@ -79,13 +85,14 @@ class ChatStore:
                 "metadata": metadata or {},
             }, ensure_ascii=False)
             key = self._key(session_id)
-            self._client.rpush(key, msg)
-            self._client.expire(key, self._ttl_seconds)
+            # P0-4: async API，需 await
+            await self._client.rpush(key, msg)
+            await self._client.expire(key, self._ttl_seconds)
             logger.debug(f"Added message to session {session_id}: role={role}, len={len(content)}")
         except Exception as e:
             logger.warning(f"Failed to add message to session {session_id}: {e}")
 
-    def get_history(
+    async def get_history(
         self,
         session_id: str,
         limit: int = 20,
@@ -104,8 +111,8 @@ class ChatStore:
         """
         try:
             key = self._key(session_id)
-            # 使用负索引从末尾获取
-            raw = self._client.lrange(key, -(limit + offset), -1 - offset if offset > 0 else -1)
+            # P0-4: async API
+            raw = await self._client.lrange(key, -(limit + offset), -1 - offset if offset > 0 else -1)
             messages = []
             for item in raw:
                 if isinstance(item, bytes):
@@ -116,37 +123,37 @@ class ChatStore:
             logger.warning(f"Failed to get history for session {session_id}: {e}")
             return []
 
-    def get_history_count(self, session_id: str) -> int:
+    async def get_history_count(self, session_id: str) -> int:
         """获取会话消息总数"""
         try:
             key = self._key(session_id)
-            return self._client.llen(key)
+            return await self._client.llen(key)
         except Exception:
             return 0
 
-    def clear_session(self, session_id: str) -> bool:
+    async def clear_session(self, session_id: str) -> bool:
         """清空指定会话的历史"""
         try:
             key = self._key(session_id)
-            self._client.delete(key)
+            await self._client.delete(key)
             logger.info(f"Cleared session: {session_id}")
             return True
         except Exception as e:
             logger.warning(f"Failed to clear session {session_id}: {e}")
             return False
 
-    def ping(self) -> bool:
+    async def ping(self) -> bool:
         """检查 Redis 连接是否正常"""
         try:
-            return self._client.ping()
+            return await self._client.ping()
         except Exception:
             return False
 
-    def get_stats(self, session_id: str) -> dict:
+    async def get_stats(self, session_id: str) -> dict:
         """获取指定会话的统计信息"""
         try:
             key = self._key(session_id)
-            total = self._client.llen(key)
+            total = await self._client.llen(key)
             return {
                 "session_id": session_id,
                 "total_messages": total,

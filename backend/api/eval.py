@@ -174,7 +174,15 @@ async def trigger_run(
                     ground_truth=case.get("ground_truth"),
                 )
 
-                # 累计
+                # P0-5: 修复 sample 错位 bug。
+                # 原实现: `for r in report.results: if r.metric in agg: agg[r.metric].append(r.score)`
+                # 然后 sample 字段用 `_metric(agg, key, -1, 0.0)` 取最后一个 append 的值 — 但
+                # 单 case 5 指标各 append 一次，`-1` 总是取到当前 case 最后一个被 append 的指标值
+                # (answer_correctness 或 context_recall)，导致所有 5 个字段被错写成同一个值。
+                # 修复: 直接从 report.results 取该 case 的指标值，不再走累积列表。
+                metrics_by_name = {r.metric: r.score for r in report.results}
+
+                # 累计（保留原累积语义，供 avg_faithfulness 等汇总字段用）
                 for r in report.results:
                     if r.metric in agg:
                         agg[r.metric].append(r.score)
@@ -188,11 +196,12 @@ async def trigger_run(
                     "timestamp": datetime.utcnow().isoformat(),
                     "query": case["question"],
                     "answer": answer[:1000],
-                    "faithfulness": _metric(agg, "faithfulness", -1, 0.0),
-                    "answer_relevancy": _metric(agg, "answer_relevancy", -1, 0.0),
-                    "context_precision": _metric(agg, "context_precision", -1, 0.0),
-                    "context_recall": _metric(agg, "context_recall", -1, 0.0),
-                    "answer_correctness": _metric(agg, "answer_correctness", -1, 0.0),
+                    # P0-5: 用当前 case 的 report.results 字典化值，而非累积列表 `-1` 元素
+                    "faithfulness": metrics_by_name.get("faithfulness", 0.0),
+                    "answer_relevancy": metrics_by_name.get("answer_relevancy", 0.0),
+                    "context_precision": metrics_by_name.get("context_precision", 0.0),
+                    "context_recall": metrics_by_name.get("context_recall", 0.0),
+                    "answer_correctness": metrics_by_name.get("answer_correctness", 0.0),
                     "overall_pass": overall_pass,
                     "latency_ms": getattr(rag_result, "latency_ms", 0.0) if 'rag_result' in dir() else 0.0,
                 })
@@ -279,10 +288,3 @@ async def get_run_status(
         "ended_at": record["ended_at"],
         "weakest_metric": record["weakest_metric"],
     }
-
-
-def _metric(agg: dict, key: str, idx: int, default: float) -> float:
-    """helper: 取最近一次累计的指标值"""
-    if not agg.get(key):
-        return default
-    return agg[key][idx] if -len(agg[key]) <= idx < len(agg[key]) else default
