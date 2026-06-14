@@ -138,19 +138,22 @@ class QueryClassifier:
         if any(w in q_lower for w in ["vs", "versus", "compare", "difference", "不同", "比较"]):
             intent = QueryIntent.COMPARATIVE
             complexity = 3
-        elif any(w in q_lower for w in ["why", "how", "analyze", "原因", "分析", "为什么", "如何"]):
+        elif any(w in q_lower for w in ["你好", "hello", "hi", "hey", "thanks", "thank you", "谢谢", "再见"]):
+            intent = QueryIntent.CONVERSATIONAL
+            complexity = 1
+        elif any(w in q_lower for w in ["how to", "steps", "流程", "步骤", "如何做", "怎么", "部署", "安装", "配置"]):
+            intent = QueryIntent.PROCEDURAL
+            complexity = 2
+        elif any(w in q_lower for w in ["why", "how", "analyze", "原因", "分析", "为什么"]):
             intent = QueryIntent.ANALYTICAL
             complexity = 3
         elif any(w in q_lower for w in ["what is", "define", "definition", "什么是", "定义"]):
             intent = QueryIntent.DEFINITIONAL
             complexity = 1
-        elif any(w in q_lower for w in ["how to", "steps", "流程", "步骤", "如何做"]):
-            intent = QueryIntent.PROCEDURAL
-            complexity = 2
         elif any(w in q_lower for w in ["summarize", "summary", "总结", "概括"]):
             intent = QueryIntent.SUMMARIZATION
             complexity = 2
-        elif query.strip().endswith("?"):
+        elif query.strip().endswith("?") or query.strip().endswith("？"):
             intent = QueryIntent.FACTUAL
             complexity = 1
         else:
@@ -364,17 +367,23 @@ class QueryRewriter:
 
         技术决策:
         - 代词检测: 中英文代词是省略句的主要标志
-        - 字数检测: 少于 5 个词的查询很可能是不完整的追问
+        - 长度检测: 中文 ≤8 字 / 英文 <6 词 且 <30 字符 视为过短
         - 问号后追加内容: 「...吗？」类型的问题通常不需要重写
         """
         en_pronouns = r"\b(i|you|he|she|it|we|they|this|that|these|those|what|which)\b"
-        zh_pronouns = r"[这那它她他我你咱咱们的哪个哪个些哪个]"
+        zh_pronouns = r"[这那它她他我你咱咱们哪哪些]"
 
         has_pronoun = bool(
             re.search(en_pronouns, query.lower()) or re.search(zh_pronouns, query)
         )
 
-        is_short = len(query.split()) < 6 and len(query) < 15
+        # 中文: char ≤ 8 (中文按字符计, 不按空格 split)
+        # 英文: 词数 < 6 且 char < 30
+        has_chinese = bool(re.search(r"[\u4e00-\u9fff]", query))
+        if has_chinese:
+            is_short = len(query) <= 8
+        else:
+            is_short = len(query.split()) < 6 and len(query) < 30
 
         return has_pronoun or is_short
 

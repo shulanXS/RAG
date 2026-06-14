@@ -22,6 +22,7 @@ metrics.py — Prometheus metrics for RAG system
 from __future__ import annotations
 
 import logging
+import threading
 from functools import lru_cache
 from typing import Literal
 

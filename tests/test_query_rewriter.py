@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from backend.retrieval.query_rewriter import (
-    IntentClassifier,
+    QueryClassifier,
     QueryIntent,
     QueryRewriter,
     QueryType,
@@ -41,19 +41,19 @@ def test_cache_key_is_deterministic():
 
 
 def test_intent_classifier_rule_based_factual():
-    classifier = IntentClassifier(llm_client=None)
+    classifier = QueryClassifier(llm_client=None)
     qt = classifier._rule_based_classify("2024 Q3 营收")
     assert qt.intent in (QueryIntent.FACTUAL, QueryIntent.DEFINITIONAL)
 
 
 def test_intent_classifier_rule_based_procedural():
-    classifier = IntentClassifier(llm_client=None)
+    classifier = QueryClassifier(llm_client=None)
     qt = classifier._rule_based_classify("如何部署 RAG 系统")
     assert qt.intent == QueryIntent.PROCEDURAL
 
 
 def test_intent_classifier_rule_based_conversational():
-    classifier = IntentClassifier(llm_client=None)
+    classifier = QueryClassifier(llm_client=None)
     qt = classifier._rule_based_classify("你好")
     assert qt.intent == QueryIntent.CONVERSATIONAL
 
@@ -73,7 +73,7 @@ def test_rewriter_rewrites_with_history():
     rw = QueryRewriter(llm_client=None)
     history = [{"role": "user", "content": "RAG 系统有 3 个核心组件"}]
     # 无 LLM 的情况下应回退到原 query
-    result = rw.rewrite("第二点呢", history=history)
+    result = rw.rewrite("第二点呢", conversation_history=history)
     assert isinstance(result, RewrittenQuery)
     assert result.original == "第二点呢"
 

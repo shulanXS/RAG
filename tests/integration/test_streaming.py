@@ -16,6 +16,17 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# fastapi + pydantic v2 是集成测试依赖 (CI 环境会装, 离线开发可缺)
+# pydantic v2 提供 field_validator; v1 仅有 root_validator
+pytest.importorskip("pydantic")
+try:
+    import pydantic
+    if int(pydantic.__version__.split(".")[0]) < 2:
+        pytest.skip("requires pydantic>=2.0", allow_module_level=True)
+except (ImportError, ValueError):
+    pass
+fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
 
 @pytest.mark.asyncio
 async def test_anthropic_generate_stream_yields_tokens():

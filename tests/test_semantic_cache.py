@@ -9,6 +9,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# redisvl 是可选依赖 (CI 环境会装, 离线开发环境可缺)
+redisvl = pytest.importorskip("redisvl")
+
 
 @pytest.mark.asyncio
 async def test_semantic_cache_get_miss():

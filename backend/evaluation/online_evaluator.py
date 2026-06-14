@@ -142,14 +142,18 @@ class OnlineEvaluator:
             bool: 是否应该采样评估
         """
         if latency_ms > self._latency_threshold:
+            self._total_requests += 1
             return True
 
         if confidence < self._confidence_threshold:
+            self._total_requests += 1
             return True
 
         if confidence > 0.85 and latency_ms < 1000:
             return False
 
+        # 计数: 每次调用都递增, 用于采样率决策
+        self._total_requests += 1
         return self._total_requests % int(1 / self._sample_rate) == 0
 
     async def evaluate_and_store(

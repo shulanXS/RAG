@@ -28,6 +28,8 @@ from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
 from backend.generation.citation_verifier import CitationVerifier
 from backend.observability.metrics import MetricsCollector
+
+logger = logging.getLogger(__name__)
 from backend.observability.tracing import TracingManager
 
 if TYPE_CHECKING:
@@ -479,7 +481,7 @@ class AgenticOrchestrator:
             was_rewritten=was_rewritten,
             cache_hit=cache_hit,
             gaps=gaps,
-            citation_verification=citation_verification,
+            citation_verification=locals().get("citation_verification"),
         )
 
     # 精简的 JSON Schema — 与 LLMClient.generate_async(structured_schema=...) 配合

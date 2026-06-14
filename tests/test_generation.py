@@ -1,178 +1,370 @@
 """
-test_generation.py — Generation 模块测试
+test_generation.py — Generation 层核心测试
+================================================================================
+覆盖现存的 3 个组件:
+1. PromptBuilder — 真实 yaml 加载 + prompt 组装 (system/context/structured)
+2. CitationVerifier — answer 声明 grounding 验证（含降级路径）
+3. retry.with_retry — 指数退避 + 可重试/不可重试分类
+
+历史: P0 阶段删除 grounded_generator / citation_generator 后,
+此文件曾引用 2 个不存在的模块导致 pytest 100% 失败, 现重写为真测试。
 """
 
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import AsyncMock, MagicMock
+
 import pytest
-from backend.generation.grounded_generator import (
-    GroundedGenerator,
-    GroundedResult,
-    GroundedClaim,
+
+from backend.generation.citation_verifier import (
+    CitationVerificationResult,
+    CitationVerifier,
 )
-from backend.generation.citation_generator import (
-    SentenceLevelCitationExtractor,
-    CitationGenerationResult,
-    SentencedAnswer,
-    SentenceSource,
+from backend.generation.prompt_builder import PromptBuilder
+from backend.generation.retry import (
+    NON_RETRYABLE_EXCEPTIONS,
+    RetryConfig,
+    _compute_delay,
+    _is_retryable,
+    with_retry,
 )
 
 
-class TestGroundedGenerator:
-    """Grounded Generation 测试"""
+# =============================================================================
+# 1. PromptBuilder
+# =============================================================================
 
-    def test_fallback_generate_without_llm(self):
-        """无 LLM client 时降级生成"""
-        generator = GroundedGenerator(llm_client=None)
 
-        contexts = [
-            {"chunk_id": "c1", "text": "这是上下文内容", "doc_id": "d1"},
-            {"chunk_id": "c2", "text": "这是另一段上下文", "doc_id": "d1"},
+class TestPromptBuilder:
+    """PromptBuilder 真实 prompt 组装测试 — 读真实 yaml, 验证关键段"""
+
+    def test_prompt_version_is_set(self):
+        """prompt_version 应从 yaml 加载, 非空"""
+        builder = PromptBuilder()
+        assert builder.prompt_version
+        assert builder.prompt_version != "unknown"
+
+    def test_prompt_hash_is_stable(self):
+        """prompt_hash 应是 12 字符 hex (SHA256 前 12 位)"""
+        builder = PromptBuilder()
+        assert len(builder.prompt_hash) == 12
+        assert all(c in "0123456789abcdef" for c in builder.prompt_hash)
+
+    def test_prompt_hash_matches_content(self):
+        """同 yaml 两次构建 prompt_hash 一致 (deterministic)"""
+        b1 = PromptBuilder()
+        b2 = PromptBuilder()
+        assert b1.prompt_hash == b2.prompt_hash
+
+    def test_build_context_with_chunks(self):
+        """带 chunks 时输出 [N] 来源 标注 + 分隔符"""
+        builder = PromptBuilder()
+        chunks = [
+            {"doc_id": "doc-1", "section_path": "§1", "text": "first content"},
+            {"doc_id": "doc-2", "section_path": "", "text": "second"},
         ]
+        ctx = builder.build_context(chunks)
 
-        result = generator._fallback_generate("测试查询", contexts)
+        assert "[1] 来源: doc-1 / §1" in ctx
+        assert "[2] 来源: doc-2" in ctx  # 无 section 时不显示
+        assert "first content" in ctx
+        assert "---" in ctx  # 分隔符
 
-        assert isinstance(result, GroundedResult)
-        assert result.grounding_score < 1.0
-        assert "测试查询" in result.answer
+    def test_build_context_empty(self):
+        """无 chunks 时返回明确提示"""
+        builder = PromptBuilder()
+        assert "未检索到" in builder.build_context([])
 
-    def test_empty_contexts(self):
-        """空上下文测试"""
-        generator = GroundedGenerator(llm_client=None)
+    def test_build_context_truncates_long_text(self):
+        """>500 字符的 chunk 文本被截断到 500 + '..'."""
+        builder = PromptBuilder()
+        long_text = "x" * 1000
+        chunks = [{"doc_id": "d", "text": long_text}]
+        ctx = builder.build_context(chunks)
 
-        result = generator._fallback_generate("查询", [])
+        # 500 字符 + "..." = 截断后总长 503
+        assert "..." in ctx
+        assert len(ctx) < len(long_text) + 100  # 应明显短于原文
 
-        assert result.grounding_score == 0.0
-        assert "无法找到" in result.answer
-
-    def test_format_contexts(self):
-        """上下文格式化测试"""
-        generator = GroundedGenerator(llm_client=None)
-
-        contexts = [
-            {"chunk_id": "c1", "text": "第一段文本内容", "doc_id": "d1"},
-            {"chunk_id": "c2", "text": "第二段文本内容", "doc_id": "d1"},
-        ]
-
-        formatted = generator._format_contexts(contexts)
-
-        assert "[chunk_c1]" in formatted
-        assert "[chunk_c2]" in formatted
-        assert "第一段文本内容" in formatted
-
-    def test_context_truncation(self):
-        """上下文截断测试"""
-        generator = GroundedGenerator(llm_client=None, max_context_tokens=50)
-
-        long_text = "这是一段很长的文本内容。" * 50
-        contexts = [{"chunk_id": "c1", "text": long_text, "doc_id": "d1"}]
-
-        formatted = generator._format_contexts(contexts)
-
-        assert len(formatted) <= generator._max_context_tokens * 4 + 100
-
-
-class TestSentenceLevelCitationExtractor:
-    """Sentence-level Citation 测试"""
-
-    def test_sentence_split(self):
-        """句子切分测试"""
-        extractor = SentenceLevelCitationExtractor(llm_client=None)
-
-        text = "这是第一句。这是第二句！这是第三句？"
-        sentences = extractor._split_sentences(text)
-
-        assert len(sentences) >= 3
-        assert sentences[0] == "这是第一句"
-        assert sentences[1] == "这是第二句"
-
-    def test_create_sentenced_answer(self):
-        """SentencedAnswer 创建测试"""
-        extractor = SentenceLevelCitationExtractor(llm_client=None)
-
-        sentences = ["这是第一句", "但是", "这是一段有意义的内容"]
-        result = extractor._create_sentenced_answer(sentences)
-
-        assert len(result) == 3
-        assert result[1].is_citable is False  # 连接词
-
-    def test_keyword_match(self):
-        """关键词匹配测试"""
-        extractor = SentenceLevelCitationExtractor(llm_client=None)
-
-        sentence = "第一段文本内容包含关键信息"
-        contexts = [
-            {"chunk_id": "c1", "text": "第一段文本内容包含关键信息", "doc_id": "d1"},
-            {"chunk_id": "c2", "text": "完全不相关的内容", "doc_id": "d1"},
-        ]
-
-        sources = extractor._keyword_match(sentence, contexts)
-
-        assert len(sources) == 1
-        assert sources[0].chunk_id == "c1"
-
-    def test_empty_result(self):
-        """空结果测试"""
-        extractor = SentenceLevelCitationExtractor(llm_client=None)
-
-        result = extractor.extract("", [])
-
-        assert isinstance(result, CitationGenerationResult)
-        assert result.answer == ""
-        assert len(result.sentenced_answer) == 0
-
-    def test_to_json(self):
-        """JSON 序列化测试"""
-        extractor = SentenceLevelCitationExtractor(llm_client=None)
-
-        result = CitationGenerationResult(
-            answer="这是答案",
-            sentenced_answer=[
-                SentencedAnswer(
-                    text="这是句子",
-                    sources=[SentenceSource(chunk_id="c1", doc_id="d1", quote="引用的内容")],
-                    is_citable=True,
-                    is_verified=True,
-                )
-            ],
-            citations=[{"chunk_id": "c1", "doc_id": "d1", "quote": "引用的内容"}],
-            citation_map={"c1": {"chunk_id": "c1", "doc_id": "d1", "quote": "引用的内容", "appears_in": []}},
-            verification_results={"c1": True},
+    def test_build_prompt_includes_query_and_context(self):
+        """build_prompt 输出含 query, context, 引用要求, 置信度要求"""
+        builder = PromptBuilder()
+        prompt = builder.build_prompt(
+            query="X产品的价格",
+            context="[1] 价格: ¥100",
         )
 
-        json_output = extractor.to_json(result)
+        assert "X产品的价格" in prompt
+        assert "[1] 价格: ¥100" in prompt
+        assert "system" in prompt.lower() or "你" in prompt  # system prompt 段
 
-        assert json_output["answer"] == "这是答案"
-        assert len(json_output["sentences"]) == 1
-        assert len(json_output["citations"]) == 1
-
-
-class TestGroundedClaim:
-    """GroundedClaim 数据结构测试"""
-
-    def test_claim_creation(self):
-        claim = GroundedClaim(
-            text="这是声明内容",
-            source_chunk_id="c1",
-            source_doc_id="d1",
-            quote="引用的原文",
-            is_verifiable=True,
+    def test_build_prompt_with_citations_disabled(self):
+        """require_citations=False 时不含引用要求段"""
+        builder = PromptBuilder()
+        prompt_full = builder.build_prompt(
+            "q", "c", require_citations=True, require_confidence=True
+        )
+        prompt_no_cite = builder.build_prompt(
+            "q", "c", require_citations=False, require_confidence=False
         )
 
-        assert claim.text == "这是声明内容"
-        assert claim.source_chunk_id == "c1"
-        assert claim.is_verifiable is True
+        # 不含引用要求时应更短 (至少短 50 字符)
+        assert len(prompt_no_cite) < len(prompt_full) - 50
+
+    def test_build_structured_prompt_includes_schema(self):
+        """structured prompt 应包含 schema 的字段描述"""
+        builder = PromptBuilder()
+        schema = {
+            "type": "object",
+            "properties": {
+                "answer": {"type": "string", "description": "the answer"},
+                "score": {"type": "number"},
+            },
+        }
+        prompt = builder.build_structured_prompt("查询", "上下文", schema)
+
+        assert "answer" in prompt
+        assert "score" in prompt
+        assert "JSON" in prompt
+
+    def test_format_schema_enum(self):
+        """enum schema 被格式化为 '枚举(...)' 文本"""
+        builder = PromptBuilder()
+        text = builder._format_schema({
+            "type": "string",
+            "enum": ["high", "medium", "low"],
+        })
+        assert "枚举" in text or "high" in text
 
 
-class TestSentencedAnswer:
-    """SentencedAnswer 数据结构测试"""
+# =============================================================================
+# 2. CitationVerifier
+# =============================================================================
 
-    def test_sentenced_answer_creation(self):
-        answer = SentencedAnswer(
-            text="这是句子内容",
-            sources=[SentenceSource(chunk_id="c1", doc_id="d1", quote="引用")],
-            is_citable=True,
-            is_verified=False,
+
+class TestCitationVerifier:
+    """CitationVerifier 答实对齐验证测试"""
+
+    def test_no_llm_returns_fallback(self):
+        """无 LLM 时降级为简单 extraction, score=0"""
+        verifier = CitationVerifier(llm_client=None)
+        chunks = [{"doc_id": "d1", "chunk_id": "c1", "text": "content", "rerank_score": 0.9}]
+        result = asyncio.run(verifier.verify("q", "answer", chunks))
+
+        assert isinstance(result, CitationVerificationResult)
+        assert result.overall_groundedness_score == 0.0
+        assert result.num_total == len(chunks)
+        assert result.num_supported == 0
+        # fallback 中所有 citation 都是 is_grounded=False
+        for c in result.verified_citations:
+            assert c.is_grounded is False
+            assert "fallback" in c.reason
+
+    def test_empty_answer_returns_fallback(self):
+        """空 answer 时降级"""
+        verifier = CitationVerifier(llm_client=None)
+        result = asyncio.run(verifier.verify("q", "", [{"doc_id": "d", "text": "t"}]))
+        assert result.overall_groundedness_score == 0.0
+
+    def test_empty_chunks_returns_empty_result(self):
+        """无 chunks 时降级 (num_total=0)"""
+        verifier = CitationVerifier(llm_client=None)
+        result = asyncio.run(verifier.verify("q", "answer", []))
+        assert result.num_total == 0
+        assert result.overall_groundedness_score == 0.0
+
+    def test_llm_fully_grounded(self):
+        """LLM 返回所有 claims supported → score=1.0"""
+        mock_llm = AsyncMock()
+        mock_llm.generate_async.return_value = json.dumps({
+            "claims": [
+                {"text": "claim 1", "supported": True, "supporting_chunk_index": 1, "reason": "ok"},
+                {"text": "claim 2", "supported": True, "supporting_chunk_index": 2, "reason": "ok"},
+            ]
+        })
+
+        verifier = CitationVerifier(llm_client=mock_llm)
+        chunks = [
+            {"doc_id": "d1", "chunk_id": "c1", "text": "text 1", "rerank_score": 0.9},
+            {"doc_id": "d2", "chunk_id": "c2", "text": "text 2", "rerank_score": 0.8},
+        ]
+        result = asyncio.run(verifier.verify("q", "answer with claim 1 and 2", chunks))
+
+        assert result.overall_groundedness_score == 1.0
+        assert result.num_supported == 2
+        assert result.num_total == 2
+        assert len(result.unsupported_claims) == 0
+
+    def test_llm_partially_grounded(self):
+        """部分 claims supported → score < 1.0"""
+        mock_llm = AsyncMock()
+        mock_llm.generate_async.return_value = json.dumps({
+            "claims": [
+                {"text": "claim 1", "supported": True, "supporting_chunk_index": 1, "reason": "ok"},
+                {"text": "claim 2 (unsupported)", "supported": False, "supporting_chunk_index": None, "reason": "hallucination"},
+            ]
+        })
+
+        verifier = CitationVerifier(llm_client=mock_llm)
+        chunks = [{"doc_id": "d1", "text": "t1"}]
+        result = asyncio.run(verifier.verify("q", "answer", chunks))
+
+        assert result.overall_groundedness_score == 0.5
+        assert result.num_supported == 1
+        assert result.num_total == 2
+        assert "claim 2 (unsupported)" in result.unsupported_claims
+
+    def test_llm_invalid_json_returns_fallback(self):
+        """LLM 返回非 JSON 时降级 (不崩)"""
+        mock_llm = AsyncMock()
+        mock_llm.generate_async.return_value = "This is not JSON {oops"
+
+        verifier = CitationVerifier(llm_client=mock_llm)
+        result = asyncio.run(verifier.verify(
+            "q", "answer", [{"doc_id": "d", "text": "t"}]
+        ))
+
+        assert result.overall_groundedness_score == 0.0
+        assert "fallback" in result.verified_citations[0].reason
+
+    def test_to_citations_api_format(self):
+        """to_citations 转换为 API JSON 格式 (含 is_grounded / supported_claims)"""
+        verifier = CitationVerifier(llm_client=None)
+        result = asyncio.run(verifier.verify("q", "a", [{"doc_id": "d1", "text": "t1"}]))
+        citations = verifier.to_citations(result)
+
+        assert isinstance(citations, list)
+        assert len(citations) == 1
+        c = citations[0]
+        assert "doc_id" in c
+        assert "is_grounded" in c
+        assert "supported_claims" in c
+        assert "reason" in c
+
+
+# =============================================================================
+# 3. retry
+# =============================================================================
+
+
+class TestRetry:
+    """retry.with_retry + _is_retryable 单元测试"""
+
+    def test_is_retryable_value_error(self):
+        """ValueError 不可重试 (NON_RETRYABLE_EXCEPTIONS 白名单)"""
+        assert _is_retryable(ValueError("bad input")) is False
+        assert _is_retryable(TypeError("type mismatch")) is False
+        assert _is_retryable(KeyError("missing")) is False
+
+    def test_is_retryable_connection_error(self):
+        """ConnectionError / TimeoutError / OSError 可重试"""
+        assert _is_retryable(ConnectionError("refused")) is True
+        assert _is_retryable(TimeoutError("slow")) is True
+        assert _is_retryable(OSError("disk")) is True
+
+    def test_is_retryable_unknown_defaults_retryable(self):
+        """未分类异常默认可重试 (保守策略)"""
+        class WeirdError(Exception):
+            pass
+
+        assert _is_retryable(WeirdError("???")) is True
+
+    def test_non_retryable_constant(self):
+        """NON_RETRYABLE_EXCEPTIONS 是元组"""
+        assert isinstance(NON_RETRYABLE_EXCEPTIONS, tuple)
+        assert ValueError in NON_RETRYABLE_EXCEPTIONS
+
+    def test_compute_delay_increases_with_attempt(self):
+        """delay 随 attempt 指数增长 (无 jitter 时)"""
+        cfg = RetryConfig(base_delay=1.0, exponential_base=2.0, jitter=0.0)
+        d0 = _compute_delay(0, cfg)
+        d1 = _compute_delay(1, cfg)
+        d2 = _compute_delay(2, cfg)
+        # 1, 2, 4 — 严格递增
+        assert d0 == 1.0
+        assert d1 == 2.0
+        assert d2 == 4.0
+
+    def test_compute_delay_capped_at_max_delay(self):
+        """delay 上限是 max_delay"""
+        cfg = RetryConfig(base_delay=1.0, exponential_base=10.0, max_delay=5.0, jitter=0.0)
+        # attempt=10 → 10^10 = 1e10, 远超 max_delay=5
+        d = _compute_delay(10, cfg)
+        assert d == 5.0
+
+    def test_compute_delay_jitter_within_range(self):
+        """jitter 范围 = base * jitter (±50%)"""
+        cfg = RetryConfig(base_delay=2.0, exponential_base=2.0, jitter=0.5, max_delay=100.0)
+        # 多采样, 验证总在 [base - base*jitter, base + base*jitter] = [1, 3]
+        for _ in range(50):
+            d = _compute_delay(0, cfg)
+            assert 1.0 <= d <= 3.0
+
+    @pytest.mark.asyncio
+    async def test_with_retry_success_first_attempt(self):
+        """首次就成功 → 1 次调用, 不重试"""
+        call_count = 0
+
+        async def _call():
+            nonlocal call_count
+            call_count += 1
+            return "ok"
+
+        result = await with_retry(_call, RetryConfig(max_attempts=3))
+        assert result == "ok"
+        assert call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_with_retry_succeeds_after_failures(self):
+        """前 2 次 ConnectionError, 第 3 次成功"""
+        call_count = 0
+
+        async def _call():
+            nonlocal call_count
+            call_count += 1
+            if call_count < 3:
+                raise ConnectionError("flake")
+            return "recovered"
+
+        result = await with_retry(
+            _call,
+            RetryConfig(max_attempts=3, base_delay=0.001, jitter=0.0),  # 加速测试
         )
+        assert result == "recovered"
+        assert call_count == 3
 
-        assert answer.text == "这是句子内容"
-        assert len(answer.sources) == 1
-        assert answer.is_verified is False
+    @pytest.mark.asyncio
+    async def test_with_retry_gives_up_on_non_retryable(self):
+        """ValueError 不重试, 立即抛出"""
+        call_count = 0
+
+        async def _call():
+            nonlocal call_count
+            call_count += 1
+            raise ValueError("permanent")
+
+        with pytest.raises(ValueError, match="permanent"):
+            await with_retry(
+                _call,
+                RetryConfig(max_attempts=5, base_delay=0.001, jitter=0.0),
+            )
+        assert call_count == 1  # 只调 1 次就 raise
+
+    @pytest.mark.asyncio
+    async def test_with_retry_raises_after_max_attempts(self):
+        """可重试异常用尽 max_attempts 后抛出最后一次的异常"""
+        call_count = 0
+
+        async def _call():
+            nonlocal call_count
+            call_count += 1
+            raise ConnectionError(f"attempt {call_count}")
+
+        with pytest.raises(ConnectionError, match="attempt 3"):
+            await with_retry(
+                _call,
+                RetryConfig(max_attempts=3, base_delay=0.001, jitter=0.0),
+            )
+        assert call_count == 3

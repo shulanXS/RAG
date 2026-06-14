@@ -190,17 +190,6 @@ demo:
 	@$(MAKE) --no-print-directory dev
 
 # =============================================================================
-# 性能压测 (P4.5)
-# =============================================================================
-bench:
-	@echo "运行 k6 负载测试 (需要先 make up + 索引)..."
-	@if [ -z "$$API_URL" ]; then echo "Set API_URL=http://localhost:8000"; API_URL=http://localhost:8000; fi
-	@if [ -z "$$TOKEN" ]; then echo "Set TOKEN=<jwt>"; exit 1; fi
-	k6 run --out json=bench-results.json -e API_URL=$$API_URL -e TOKEN=$$TOKEN k6/load_test.js
-	@echo ""
-	@echo "✓ 压测完成，结果见 bench-results.json"
-
-# =============================================================================
 # 清理
 # =============================================================================
 clean:

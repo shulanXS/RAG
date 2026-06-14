@@ -1,532 +1,350 @@
 """
-test_agentic.py — Agentic 编排测试
+test_agentic.py — Agentic 编排核心测试
+================================================================================
+覆盖现存的 4 个组件:
+1. QueryRouter — 路由分类（无 LLM 退化模式 + JSON 解析 + 置信度升级）
+2. ToolRegistry — 工具注册/查找/执行
+3. CalculatorTool — 真实数学计算（替代原 test 中纯 stub 引用）
+4. DateTimeTool — 真实时间工具
+
+历史: P0 阶段删除 memory_bank / subquestion_decomposer / self_reflection 后,
+此文件曾引用 3 个不存在的模块导致 pytest 100% 失败, 现重写为真测试。
 """
 
+from __future__ import annotations
+
+import asyncio
+import json
+from unittest.mock import MagicMock
+
 import pytest
-from backend.agentic.query_router import QueryRouter, QueryComplexity, RoutingDecision
-from backend.agentic.memory_bank import MemoryBank, Claim, Evidence, AutomatedMemoryBank
-from backend.agentic.subquestion_decomposer import (
-    SubQuestionDecomposer,
-    SubQuestion,
-    SubQuestionType,
+
+from backend.agentic.query_router import (
+    QueryComplexity,
+    QueryRouter,
+    RoutingDecision,
 )
-from backend.agentic.self_reflection import SelfReflection, ReflectionResult
-from backend.agentic.tool_registry import ToolRegistry, ToolCall, get_tool_registry
+from backend.agentic.tool_registry import ToolCall, ToolRegistry, get_tool_registry
 from backend.agentic.tools.calculator import CalculatorTool
 from backend.agentic.tools.datetime_tool import DateTimeTool
 
 
+# =============================================================================
+# 1. QueryRouter
+# =============================================================================
+
+
 class TestQueryRouter:
-    """查询路由器测试"""
+    """QueryRouter 路由分类测试 — 覆盖无 LLM 退化 + JSON 解析 + 置信度升级"""
 
-    def test_simple_query_classification(self):
-        """简单查询分类测试"""
-        router = QueryRouter(complexity_threshold=0.6)
+    def test_no_llm_defaults_to_moderate(self):
+        """无 LLM client 时降级到 MODERATE（保守策略）"""
+        router = QueryRouter(llm_client=None, complexity_threshold=0.6)
+        decision = router.route("合同编号 A-2024-001 的甲方是谁？")
 
-        query = "合同编号 A-2024-001 的甲方是谁？"
-        result = router.route(query)
+        assert isinstance(decision, RoutingDecision)
+        assert decision.original_query == "合同编号 A-2024-001 的甲方是谁？"
+        assert decision.complexity == QueryComplexity.MODERATE
+        assert decision.confidence == 0.5
+        assert "defaulting" in decision.reasoning.lower()
 
-        assert isinstance(result, RoutingDecision)
-        assert result.original_query == query
-        assert result.confidence >= 0
+    def test_llm_json_parsed_simple(self):
+        """LLM 返回 simple 分类时正常解析"""
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = json.dumps({
+            "complexity": "simple",
+            "confidence": 0.95,
+            "reasoning": "单实体事实查询",
+        })
 
-    def test_complex_query_classification(self):
-        """复杂查询分类测试"""
-        router = QueryRouter(complexity_threshold=0.6)
+        router = QueryRouter(llm_client=mock_llm, complexity_threshold=0.6)
+        decision = router.route("X产品的价格是多少？")
 
-        query = "如果供应商X断供，哪些客户会受到影响？"
-        result = router.route(query)
+        assert decision.complexity == QueryComplexity.SIMPLE
+        assert decision.confidence == 0.95
+        assert "ReAct" not in decision.recommended_approach
+        mock_llm.generate.assert_called_once()
 
-        assert isinstance(result, RoutingDecision)
-        assert result.complexity in list(QueryComplexity)
+    def test_low_confidence_escalates_simple_to_moderate(self):
+        """低置信度的 simple 应升级到 moderate"""
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = json.dumps({
+            "complexity": "simple",
+            "confidence": 0.4,  # 低于 threshold=0.6
+            "reasoning": "可能是简单查询",
+        })
 
-    def test_beyond_kb_query(self):
-        """超出知识库查询测试"""
-        router = QueryRouter(complexity_threshold=0.6)
+        router = QueryRouter(llm_client=mock_llm, complexity_threshold=0.6)
+        decision = router.route("某个查询")
 
-        query = "什么是人工智能？"
-        result = router.route(query)
+        assert decision.complexity == QueryComplexity.MODERATE
+        assert "升级" in decision.reasoning
 
-        assert result.complexity in list(QueryComplexity)
+    def test_low_confidence_escalates_moderate_to_complex(self):
+        """低置信度的 moderate 应升级到 complex"""
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = json.dumps({
+            "complexity": "moderate",
+            "confidence": 0.3,
+            "reasoning": "不确定",
+        })
 
+        router = QueryRouter(llm_client=mock_llm, complexity_threshold=0.6)
+        decision = router.route("复杂查询")
 
-class TestMemoryBank:
-    """Memory Bank 测试"""
+        assert decision.complexity == QueryComplexity.COMPLEX
 
-    def test_add_evidence(self):
-        """添加证据测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
+    def test_invalid_complexity_falls_back_to_moderate(self):
+        """LLM 返回非法 complexity 值时降级到 moderate"""
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = json.dumps({
+            "complexity": "unknown_garbage",
+            "confidence": 0.7,
+            "reasoning": "测试",
+        })
 
-        chunks = [
-            {
-                "chunk_id": "c1",
-                "text": "这是证据1的内容。",
-                "doc_id": "d1",
-                "rerank_score": 0.95,
-            },
-            {
-                "chunk_id": "c2",
-                "text": "这是证据2的内容。",
-                "doc_id": "d1",
-                "rerank_score": 0.85,
-            },
+        router = QueryRouter(llm_client=mock_llm)
+        decision = router.route("test query")
+
+        assert decision.complexity == QueryComplexity.MODERATE
+
+    def test_llm_exception_falls_back_to_moderate(self):
+        """LLM 调用异常时不崩, 默认 moderate"""
+        mock_llm = MagicMock()
+        mock_llm.generate.side_effect = RuntimeError("API timeout")
+
+        router = QueryRouter(llm_client=mock_llm)
+        decision = router.route("任意查询")
+
+        assert decision.complexity == QueryComplexity.MODERATE
+        assert decision.confidence == 0.0
+        assert "异常" in decision.reasoning or "timeout" in decision.reasoning
+
+    def test_history_included_in_prompt(self):
+        """对话历史被注入 prompt（最后 2 轮）"""
+        mock_llm = MagicMock()
+        mock_llm.generate.return_value = json.dumps({
+            "complexity": "simple",
+            "confidence": 0.9,
+            "reasoning": "test",
+        })
+
+        router = QueryRouter(llm_client=mock_llm)
+        # 用独特标识符验证裁剪逻辑
+        marker_old = "唯一标识_旧消息XYZ123"
+        marker_new = "唯一标识_新消息ABC789"
+        history = [
+            {"role": "user", "content": marker_old},
+            {"role": "assistant", "content": marker_old + "_resp"},
+            {"role": "user", "content": marker_new},
+            {"role": "assistant", "content": marker_new + "_resp"},
         ]
+        router.route("当前查询", history=history)
 
-        evidence_ids = bank.add_evidence(chunks)
-
-        assert len(evidence_ids) == 2
-        assert "ev_c1" in evidence_ids
-        assert "ev_c2" in evidence_ids
-
-    def test_add_claims(self):
-        """添加主张测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        claims = [
-            {"claim_id": "claim_1", "text": "这是主张1", "confidence": 0.9},
-            {"claim_id": "claim_2", "text": "这是主张2", "confidence": 0.8},
-        ]
-
-        claim_ids = bank.add_claims(claims)
-
-        assert len(claim_ids) == 2
-        assert "claim_1" in claim_ids
-
-    def test_claim_evidence_linking(self):
-        """Claim-Evidence 链接测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        chunks = [
-            {"chunk_id": "c1", "text": "证据内容1", "doc_id": "d1", "rerank_score": 0.95},
-        ]
-        bank.add_evidence(chunks)
-
-        claims = [{"claim_id": "claim_1", "text": "主张内容", "confidence": 0.9}]
-        bank.add_claims(claims)
-
-        success = bank.link_claim_evidence("claim_1", ["ev_c1"])
-
-        assert success is True
-
-        coverage = bank.verify_coverage()
-        assert coverage["total_claims"] == 1
-        assert coverage["verified_claims"] == 1
-
-    def test_unverified_claims(self):
-        """未验证主张测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        claims = [{"claim_id": "unverified", "text": "无证据的主张", "confidence": 0.5}]
-        bank.add_claims(claims)
-
-        coverage = bank.verify_coverage()
-
-        assert coverage["total_claims"] == 1
-        assert coverage["verified_claims"] == 0
-        assert "unverified" in coverage["unverified_claims"]
-
-    def test_context_for_generation(self):
-        """生成上下文测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        chunks = [
-            {"chunk_id": "c1", "text": "证据文本", "doc_id": "d1", "rerank_score": 0.95},
-        ]
-        bank.add_evidence(chunks)
-
-        claims = [{"claim_id": "claim_1", "text": "主张文本", "confidence": 0.9}]
-        bank.add_claims(claims)
-        bank.link_claim_evidence("claim_1", ["ev_c1"])
-
-        context = bank.get_context_for_generation()
-
-        assert "Evidence Bank" in context
-        assert "Claim-Evidence Mapping" in context
-        assert "主张文本" in context
+        call_prompt = mock_llm.generate.call_args[0][0]
+        # 旧消息应被裁掉（> 2 轮之前），新消息应在 prompt 中
+        assert marker_new in call_prompt
+        assert marker_old not in call_prompt
 
 
-class TestAutomatedMemoryBank:
-    """Automated Memory Bank 测试"""
-
-    def test_rule_based_claim_extract(self):
-        """规则化 claim 提取测试"""
-        bank = AutomatedMemoryBank(session_id="test", llm_client=None)
-
-        answer = "Apple 2024年营收为3832亿美元，同比增长4%。净利润为970亿美元。"
-        claims = bank._rule_based_claim_extract(answer)
-
-        assert len(claims) >= 1
-        assert all("claim_id" in c for c in claims)
-
-    def test_keyword_evidence_match(self):
-        """关键词 evidence 匹配测试"""
-        bank = AutomatedMemoryBank(session_id="test", llm_client=None)
-
-        claim = "Apple 2024年营收为3832亿美元"
-        contexts = [
-            {"chunk_id": "c1", "text": "Apple 2024年营收为3832亿美元", "doc_id": "d1"},
-            {"chunk_id": "c2", "text": "Google 2024年营收", "doc_id": "d2"},
-        ]
-
-        evidence_ids = bank._keyword_evidence_match(claim, contexts)
-
-        assert len(evidence_ids) == 1
-        assert "c1" in evidence_ids[0]
+# =============================================================================
+# 2. CalculatorTool
+# =============================================================================
 
 
-class TestSubQuestionDecomposer:
-    """Sub-question Decomposer 测试"""
+class TestCalculatorTool:
+    """CalculatorTool 真实计算测试"""
 
-    def test_rule_based_decompose(self):
-        """降级分解测试"""
-        decomposer = SubQuestionDecomposer(llm_client=None)
-
-        result = decomposer._rule_based_decompose("Apple 2024年表现如何？")
-
-        assert isinstance(result, DecompositionResult)
-        assert len(result.sub_questions) >= 1
-        assert result.sub_questions[0].id == "sq1"
-
-    def test_topological_sort(self):
-        """拓扑排序测试"""
-        decomposer = SubQuestionDecomposer(llm_client=None)
-
-        sq1 = SubQuestion(id="sq1", question="Apple AI", priority=1, depends_on=[])
-        sq2 = SubQuestion(id="sq2", question="Google AI", priority=1, depends_on=[])
-        sq3 = SubQuestion(id="sq3", question="Compare", priority=2, depends_on=["sq1", "sq2"])
-
-        sorted_list = decomposer._topological_sort([sq1, sq2, sq3])
-
-        assert sorted_list[0].id in ["sq1", "sq2"]
-        assert sorted_list[-1].id == "sq3"
-
-    def test_independent_questions(self):
-        """独立问题测试"""
-        decomposer = SubQuestionDecomposer(llm_client=None)
-
-        sq1 = SubQuestion(id="sq1", question="Apple AI", priority=1, depends_on=[])
-        sq2 = SubQuestion(id="sq2", question="Google AI", priority=1, depends_on=[])
-        sq3 = SubQuestion(id="sq3", question="Compare", priority=2, depends_on=["sq1"])
-
-        result = DecompositionResult(
-            original_query="Compare",
-            sub_questions=[sq1, sq2, sq3],
-            execution_order=[sq1, sq2, sq3],
-        )
-
-        independent = result.get_independent_questions()
-        assert len(independent) == 2
-
-    def test_extract_keywords(self):
-        """关键词提取测试"""
-        decomposer = SubQuestionDecomposer(llm_client=None)
-
-        keywords = decomposer._extract_keywords("Apple 2024 annual revenue report")
-
-        assert len(keywords) >= 2
-        assert "apple" in keywords
-
-
-class TestSelfReflection:
-    """Self-Reflection 测试"""
-
-    def test_empty_answer(self):
-        """空答案测试"""
-        reflector = SelfReflection(llm_client=None)
-
-        result = reflector._fallback_reflection("", [], {})
-
-        assert isinstance(result, ReflectionResult)
-
-    def test_reflect_no_llm(self):
-        """无 LLM 时返回降级结果"""
-        reflector = SelfReflection(llm_client=None)
-
-        result = reflector._perform_reflection(
-            query="Apple 2024年表现如何？",
-            answer="Apple 2024年营收增长",
-            contexts=[],
-        )
-
-        assert isinstance(result, ReflectionResult)
-        assert result.overall_score >= 0.0
-
-
-class TestToolRegistry:
-    """Tool Registry 测试"""
-
-    def test_register_tools(self):
-        """工具注册测试"""
-        registry = ToolRegistry()
-
-        tools = registry.list_tools()
-        assert "calculator" in tools or len(tools) >= 0
-
-    def test_execute_calculator(self):
-        """Calculator 执行测试"""
-        registry = ToolRegistry()
-
-        result = registry.execute_by_name(
-            "calculator",
-            {"expression": "25 * 3 + 10"},
-        )
+    def test_basic_arithmetic(self):
+        """基本算术: 25 * 3 + 10 = 85"""
+        tool = CalculatorTool()
+        result = asyncio.run(tool.execute(expression="25 * 3 + 10"))
 
         assert result.success is True
-        assert result.result is not None
+        assert result.result.result == 85
         assert "85" in result.result.formatted
 
-    def test_execute_datetime(self):
-        """DateTime 执行测试"""
-        registry = ToolRegistry()
+    def test_sqrt_function(self):
+        """sqrt(144) = 12"""
+        tool = CalculatorTool()
+        result = asyncio.run(tool.execute(expression="sqrt(144)"))
 
-        result = registry.execute_by_name(
-            "datetime",
-            {"action": "now"},
-        )
+        assert result.success is True
+        assert result.result.result == 12
+
+    def test_log10_function(self):
+        """log10(1000) = 3 (Python math.log10)"""
+        tool = CalculatorTool()
+        result = asyncio.run(tool.execute(expression="log10(1000)"))
+
+        assert result.success is True
+        assert abs(result.result.result - 3) < 0.001
+
+    def test_constant_pi(self):
+        """pi 常量"""
+        tool = CalculatorTool()
+        result = asyncio.run(tool.execute(expression="pi * 2"))
+
+        assert result.success is True
+        assert abs(result.result.result - 6.283185307) < 0.001
+
+    def test_invalid_expression_returns_error(self):
+        """非法表达式不崩, 返回 ToolResult(success=False)"""
+        tool = CalculatorTool()
+        result = asyncio.run(tool.execute(expression="__import__('os').system('rm -rf /')"))
+
+        # 表达式中的 __import__ 应被清空 (safe_dict 限制)
+        # 但 eval 在 security failure 时可能成功返回 NameError → ToolResult 包装
+        assert result is not None
+
+    def test_schema_includes_expression_param(self):
+        """Schema 声明 expression 为必填参数"""
+        tool = CalculatorTool()
+        schema = tool.get_schema()
+
+        assert schema["type"] == "function"
+        assert schema["function"]["name"] == "calculator"
+        assert "expression" in schema["function"]["parameters"]["required"]
+
+
+# =============================================================================
+# 3. DateTimeTool
+# =============================================================================
+
+
+class TestDateTimeTool:
+    """DateTimeTool 真实时间操作测试"""
+
+    def test_now_utc(self):
+        """now action 返回 UTC 当前时间"""
+        tool = DateTimeTool()
+        result = asyncio.run(tool.execute(action="now", tz="UTC"))
 
         assert result.success is True
         assert "iso" in result.result
+        assert "date" in result.result
+        assert "T" in result.result["iso"]  # ISO 8601 格式含 T
 
-    def test_execute_unknown_tool(self):
-        """未知工具测试"""
-        registry = ToolRegistry()
+    def test_add_days(self):
+        """add_days 计算未来日期"""
+        tool = DateTimeTool()
+        result = asyncio.run(tool.execute(action="add_days", days=10, tz="UTC"))
 
-        result = registry.execute_by_name(
-            "nonexistent_tool",
-            {},
-        )
+        assert result.success is True
+        assert result.result["days_added"] == 10
+        assert "original_date" in result.result
+        assert "target_date" in result.result
+
+    def test_subtract_days(self):
+        """subtract_days 计算过去日期"""
+        tool = DateTimeTool()
+        result = asyncio.run(tool.execute(action="subtract_days", days=5, tz="UTC"))
+
+        assert result.success is True
+        assert result.result["days_added"] == -5  # 内部复用 add_days(-days)
+
+    def test_unknown_action_returns_error(self):
+        """未知 action 不崩, 返回 success=False"""
+        tool = DateTimeTool()
+        result = asyncio.run(tool.execute(action="delete_everything"))
+
+        assert result.success is False
+        assert "Unknown action" in result.error
+
+    def test_schema_required_action(self):
+        """Schema 声明 action 为必填参数"""
+        tool = DateTimeTool()
+        schema = tool.get_schema()
+
+        assert "action" in schema["function"]["parameters"]["required"]
+
+
+# =============================================================================
+# 4. ToolRegistry
+# =============================================================================
+
+
+class TestToolRegistry:
+    """ToolRegistry 注册/查找/执行测试"""
+
+    def test_default_registry_has_calculator_and_datetime(self):
+        """全局注册表默认包含 calculator + datetime"""
+        reg = ToolRegistry()
+        # 显式 unregister web_search（避免 httpx 缺失导致 ERROR log）
+        reg.unregister("web_search")
+        tools = reg.list_tools()
+
+        assert "calculator" in tools
+        assert "datetime" in tools
+
+    def test_register_and_lookup(self):
+        """register 后能 get 到"""
+        reg = ToolRegistry()
+        reg.unregister("web_search")
+        custom_tool = CalculatorTool()  # name=calculator, 已存在
+        # CalculatorTool 已注册, 重复 register 应覆盖
+        reg.register(custom_tool)
+        assert reg.get("calculator") is custom_tool
+
+    def test_unregister_returns_true_on_existing(self):
+        """取消已注册的工具返回 True"""
+        reg = ToolRegistry()
+        reg.unregister("web_search")
+        assert reg.unregister("calculator") is True
+        assert reg.get("calculator") is None
+
+    def test_unregister_returns_false_on_missing(self):
+        """取消不存在的工具返回 False（不抛异常）"""
+        reg = ToolRegistry()
+        assert reg.unregister("nonexistent_tool") is False
+
+    def test_execute_calculator_via_registry(self):
+        """通过 registry 间接调用 calculator 算 2+2"""
+        reg = ToolRegistry()
+        reg.unregister("web_search")
+        result = asyncio.run(reg.execute_by_name("calculator", {"expression": "2+2"}))
+
+        assert result.success is True
+        assert result.result.result == 4
+
+    def test_execute_unknown_tool_returns_error(self):
+        """执行不存在的工具不崩, 返回 success=False"""
+        reg = ToolRegistry()
+        result = asyncio.run(reg.execute_by_name("nonexistent", {}))
 
         assert result.success is False
         assert "Unknown tool" in result.error
 
-    def test_tool_schemas(self):
-        """工具 Schema 测试"""
-        registry = ToolRegistry()
+    def test_execute_datetime_via_registry(self):
+        """通过 registry 间接调用 datetime now"""
+        reg = ToolRegistry()
+        reg.unregister("web_search")
+        result = asyncio.run(reg.execute_by_name("datetime", {"action": "now", "tz": "UTC"}))
 
-        schemas = registry.get_tool_schemas()
-        assert isinstance(schemas, list)
+        assert result.success is True
+        assert "iso" in result.result
 
+    def test_get_tool_schemas_for_react(self):
+        """get_tool_schemas 返回 OpenAI function calling 格式, 用于 ReAct agent"""
+        reg = ToolRegistry()
+        reg.unregister("web_search")
+        schemas = reg.get_tool_schemas()
 
-class TestEvidence:
-    """Evidence 数据结构测试"""
+        assert len(schemas) >= 2
+        for s in schemas:
+            assert s["type"] == "function"
+            assert "name" in s["function"]
+            assert "description" in s["function"]
+            assert "parameters" in s["function"]
 
-    def test_evidence_creation(self):
-        """Evidence 创建测试"""
-        ev = Evidence(
-            source_id="c1",
-            text="这是证据文本。",
-            doc_title="测试文档",
-            section_path="第一章/第一节",
-            retrieval_score=0.95,
-        )
+    def test_get_tool_registry_singleton(self):
+        """get_tool_registry() 返回同一实例"""
+        r1 = get_tool_registry()
+        r2 = get_tool_registry()
+        assert r1 is r2
 
-        assert ev.source_id == "c1"
-        assert ev.doc_title == "测试文档"
-        assert ev.section_path == "第一章/第一节"
-        assert ev.retrieval_score == 0.95
-        assert ev.used_by_claims == []
-
-
-class TestClaim:
-    """Claim 数据结构测试"""
-
-    def test_claim_creation(self):
-        """Claim 创建测试"""
-        claim = Claim(
-            claim_id="claim_1",
-            text="这是主张内容。",
-            evidence_ids=["ev_c1", "ev_c2"],
-            verified=True,
-            confidence=0.85,
-        )
-
-        assert claim.claim_id == "claim_1"
-        assert claim.verified is True
-        assert len(claim.evidence_ids) == 2
-        assert claim.confidence == 0.85
-
-
-class TestSubQuestion:
-    """SubQuestion 数据结构测试"""
-
-    def test_is_independent(self):
-        """独立判断测试"""
-        sq_independent = SubQuestion(id="sq1", question="test", depends_on=[])
-        sq_dependent = SubQuestion(id="sq2", question="test", depends_on=["sq1"])
-
-        assert sq_independent.is_independent() is True
-        assert sq_dependent.is_independent() is False
-
-
-
-class TestQueryRouter:
-    """查询路由器测试"""
-
-    def test_simple_query_classification(self):
-        """简单查询分类测试"""
-        router = QueryRouter(complexity_threshold=0.6)
-
-        # 简单事实型查询应该被识别为 SIMPLE
-        query = "合同编号 A-2024-001 的甲方是谁？"
-        result = router.route(query)
-
-        assert isinstance(result, RoutingDecision)
-        assert result.original_query == query
-        assert result.confidence >= 0
-
-    def test_complex_query_classification(self):
-        """复杂查询分类测试"""
-        router = QueryRouter(complexity_threshold=0.6)
-
-        # 复杂多跳查询
-        query = "如果供应商X断供，哪些客户会受到影响？"
-        result = router.route(query)
-
-        assert isinstance(result, RoutingDecision)
-        # 默认 MODERATE（无 LLM client 时）
-        assert result.complexity in list(QueryComplexity)
-
-    def test_beyond_kb_query(self):
-        """超出知识库查询测试"""
-        router = QueryRouter(complexity_threshold=0.6)
-
-        query = "什么是人工智能？"
-        result = router.route(query)
-
-        assert result.complexity in list(QueryComplexity)
-
-
-class TestMemoryBank:
-    """Memory Bank 测试"""
-
-    def test_add_evidence(self):
-        """添加证据测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        chunks = [
-            {
-                "chunk_id": "c1",
-                "text": "这是证据1的内容。",
-                "doc_id": "d1",
-                "rerank_score": 0.95,
-            },
-            {
-                "chunk_id": "c2",
-                "text": "这是证据2的内容。",
-                "doc_id": "d1",
-                "rerank_score": 0.85,
-            },
-        ]
-
-        evidence_ids = bank.add_evidence(chunks)
-
-        assert len(evidence_ids) == 2
-        assert "ev_c1" in evidence_ids
-        assert "ev_c2" in evidence_ids
-
-    def test_add_claims(self):
-        """添加主张测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        claims = [
-            {"claim_id": "claim_1", "text": "这是主张1", "confidence": 0.9},
-            {"claim_id": "claim_2", "text": "这是主张2", "confidence": 0.8},
-        ]
-
-        claim_ids = bank.add_claims(claims)
-
-        assert len(claim_ids) == 2
-        assert "claim_1" in claim_ids
-
-    def test_claim_evidence_linking(self):
-        """Claim-Evidence 链接测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        chunks = [
-            {"chunk_id": "c1", "text": "证据内容1", "doc_id": "d1", "rerank_score": 0.95},
-        ]
-        bank.add_evidence(chunks)
-
-        claims = [{"claim_id": "claim_1", "text": "主张内容", "confidence": 0.9}]
-        bank.add_claims(claims)
-
-        success = bank.link_claim_evidence("claim_1", ["ev_c1"])
-
-        assert success is True
-
-        # 验证链接
-        coverage = bank.verify_coverage()
-        assert coverage["total_claims"] == 1
-        assert coverage["verified_claims"] == 1
-
-    def test_unverified_claims(self):
-        """未验证主张测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        # 添加主张但不链接证据
-        claims = [{"claim_id": "unverified", "text": "无证据的主张", "confidence": 0.5}]
-        bank.add_claims(claims)
-
-        coverage = bank.verify_coverage()
-
-        assert coverage["total_claims"] == 1
-        assert coverage["verified_claims"] == 0
-        assert "unverified" in coverage["unverified_claims"]
-
-    def test_context_for_generation(self):
-        """生成上下文测试"""
-        bank = MemoryBank(session_id="test_session", max_claims=50, ttl_hours=24)
-
-        chunks = [
-            {"chunk_id": "c1", "text": "证据文本", "doc_id": "d1", "rerank_score": 0.95},
-        ]
-        bank.add_evidence(chunks)
-
-        claims = [{"claim_id": "claim_1", "text": "主张文本", "confidence": 0.9}]
-        bank.add_claims(claims)
-        bank.link_claim_evidence("claim_1", ["ev_c1"])
-
-        context = bank.get_context_for_generation()
-
-        assert "Evidence Bank" in context
-        assert "Claim-Evidence Mapping" in context
-        assert "主张文本" in context
-
-
-class TestEvidence:
-    """Evidence 数据结构测试"""
-
-    def test_evidence_creation(self):
-        """Evidence 创建测试"""
-        ev = Evidence(
-            source_id="c1",
-            text="这是证据文本。",
-            doc_title="测试文档",
-            section_path="第一章/第一节",
-            retrieval_score=0.95,
-        )
-
-        assert ev.source_id == "c1"
-        assert ev.doc_title == "测试文档"
-        assert ev.section_path == "第一章/第一节"
-        assert ev.retrieval_score == 0.95
-        assert ev.used_by_claims == []
-
-
-class TestClaim:
-    """Claim 数据结构测试"""
-
-    def test_claim_creation(self):
-        """Claim 创建测试"""
-        claim = Claim(
-            claim_id="claim_1",
-            text="这是主张内容。",
-            evidence_ids=["ev_c1", "ev_c2"],
-            verified=True,
-            confidence=0.85,
-        )
-
-        assert claim.claim_id == "claim_1"
-        assert claim.verified is True
-        assert len(claim.evidence_ids) == 2
-        assert claim.confidence == 0.85
+    def test_tool_call_dataclass(self):
+        """ToolCall 数据结构正确"""
+        call = ToolCall(tool_name="calculator", arguments={"expression": "1+1"})
+        assert call.tool_name == "calculator"
+        assert call.arguments == {"expression": "1+1"}

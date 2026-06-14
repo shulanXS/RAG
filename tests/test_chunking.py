@@ -68,18 +68,15 @@ class TestHierarchicalChunker:
 
     def test_heading_extraction(self):
         """标题层级识别测试"""
-        chunker = HierarchicalChunker(chunk_size=200, min_chunk_size=50, heading_levels=[1, 2])
+        chunker = HierarchicalChunker(chunk_size=200, min_chunk_size=20, heading_levels=[1, 2])
 
-        content = """# 第一章
-这是第一章的内容。
-
-## 第一节
-这是第一节的详细内容。
-
-# 第二章
-这是第二章的内容。
-"""
-        text_units = content.split("\n\n")
+        # text_units 是已按 \\n\\n 切分的段; 标题必须在段内
+        # 段落要够长 (>20 tokens) 才会被产出, 否则会合并到前一个或被丢弃
+        text_units = [
+            "# 第一章\n这是第一章的内容。本章将详细介绍 RAG 系统的第一个核心组件即文档解析模块的工作原理、关键算法选择以及在生产环境中常见的优化技巧和性能瓶颈分析。",
+            "## 第一节\n这是第一节的详细内容。本节会深入讨论 RAG 系统的第二个核心组件即混合检索模块的 BM25 算法与向量检索算法的融合策略与权重调优。",
+            "# 第二章\n这是第二章的内容。本章聚焦 RAG 系统的第三个核心组件即 LLM 生成模块的 prompt 工程、结构化输出约束、引用标注机制和置信度评估方法。",
+        ]
         chunks = chunker.split(text_units, "test_hier", {"headings": []})
 
         # 应该有至少 2 个 chunks

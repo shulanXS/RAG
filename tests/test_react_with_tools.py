@@ -13,6 +13,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+# langgraph 是可选依赖 (CI 环境会装, 离线开发环境可缺)
+langgraph = pytest.importorskip("langgraph")
+
 from backend.agentic.react_agent import ReActAgent
 from backend.agentic.tool_registry import ToolRegistry
 from backend.agentic.tools.calculator import CalculatorTool

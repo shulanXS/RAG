@@ -170,7 +170,7 @@ class CitationVerifier:
                 verified.append(self._unsupported_citation(text, reason))
 
         score = supported_count / len(claims) if claims else 0.0
-        unsupported = [c.text for c in verified if not c.is_grounded]
+        unsupported = [c.unsupported_claims[0] for c in verified if c.unsupported_claims]
 
         return CitationVerificationResult(
             verified_citations=verified,

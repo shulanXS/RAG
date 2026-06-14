@@ -141,7 +141,6 @@ RAG/
 ├── scripts/                # ingest.py / eval.py / demo.py
 ├── tests/                  # pytest (unit + integration)
 ├── docker/                 # Prometheus + Grafana 配置
-├── k6/                     # 压测脚本
 ├── docker-compose.yml
 ├── ARCHITECTURE.md         # 深度技术决策 + Why Not 段
 ├── BENCHMARK.md            # 性能/成本/消融数据
@@ -155,7 +154,6 @@ make dev                    # 本地开发（不依赖 Docker）
 make test                   # 单元测试
 make test-integration       # 集成测试
 make cov                    # 覆盖率报告
-make bench                  # k6 负载测试
 make eval                   # 跑 RAGAS 评估
 make clean                  # 清理
 ```

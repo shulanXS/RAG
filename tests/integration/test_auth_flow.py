@@ -17,6 +17,10 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
+
+# fastapi / TestClient 是集成测试可选依赖 (CI 环境会装, 离线开发可缺)
+fastapi_testclient = pytest.importorskip("fastapi.testclient")
+
 from fastapi.testclient import TestClient
 
 

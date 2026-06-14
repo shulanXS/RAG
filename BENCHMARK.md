@@ -12,7 +12,7 @@
 | Redis | 1 node, 1 vCPU, 2GB RAM, no persistence |
 | LLM | Claude 3.5 Sonnet (Anthropic API) |
 | Embedding | Voyage-large-2 (1024d) |
-| Concurrent VUs | 10 → 50 → 100 (k6 阶梯) |
+| Concurrent VUs | 10 → 50 → 100 (ramp-up traffic) |
 | Duration | 3m30s |
 | Total requests | ~25K |
 
@@ -22,7 +22,6 @@
 |------|-----|-----|-----|------|
 | 简单问答 (Router→simple) | 1.2s | 2.4s | 3.8s | 1× retrieve + 1× generate |
 | ReAct (Router→moderate) | 2.8s | 5.5s | 9.2s | 2-3 步 ReAct 循环 |
-| Plan-Execute (Router→complex) | 6.5s | 12s | 18s | 3-5 步 plan + execute |
 | **Cache hit** | 0.05s | 0.08s | 0.12s | 仅 redis HNSW 检索 |
 
 > Cache hit 比 miss 快 **30-100×** — 这是 Semantic Cache 设计的核心收益。

@@ -10,6 +10,9 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+# langgraph 是可选依赖 (CI 环境会装, 离线开发环境可缺)
+langgraph = pytest.importorskip("langgraph")
+
 from backend.agentic.orchestrator import AgenticOrchestrator, OrchestratorResult
 
 
