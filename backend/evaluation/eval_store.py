@@ -323,6 +323,31 @@ class EvalStore:
                 )
                 return [dict(r) for r in cur.fetchall()]
 
+    def get_samples_since(self, since_iso: str, limit: int = 5000) -> list[dict]:
+        """
+        P1-6: 按时间窗口查询样本 (online evaluator 仪表板用)。
+
+        Args:
+            since_iso: ISO 时间字符串（>=）
+            limit: 最大返回行数
+
+        Returns:
+            list of sample dicts（按 timestamp ASC）
+        """
+        with self._lock:
+            with sqlite3.connect(self._db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cur = conn.execute(
+                    """
+                    SELECT * FROM eval_samples
+                    WHERE timestamp >= ?
+                    ORDER BY timestamp ASC
+                    LIMIT ?
+                    """,
+                    (since_iso, limit),
+                )
+                return [dict(r) for r in cur.fetchall()]
+
 
 # 模块级单例
 _instance: EvalStore | None = None

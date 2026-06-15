@@ -2,13 +2,15 @@
 test_orchestrator_integration.py — 端到端编排器集成测试
 ================================================================================
 覆盖:
-- 完整 RAG 流程：rewrite → route → retrieve → generate → reflect
+- 完整 RAG 流程：rewrite → route → retrieve → generate
 - 各复杂度路径（SIMPLE / MODERATE / COMPLEX / BEYOND_KB）
 - 缓存命中路径
 - 错误降级路径
 
 所有外部依赖（Qdrant / LLM / Redis）使用 mock，
-保留真实的内部协作逻辑（fuse, prompt builder, citation verifier）。
+保留真实的内部协作逻辑（fuse, prompt builder）。
+
+历史: Phase 1.2 移除 CitationVerifier、Phase 1.4 移除 BM25 权重 — 测试相应简化。
 """
 
 from __future__ import annotations
@@ -35,14 +37,13 @@ def _make_orchestrator(
     cfg = MagicMock()
     cfg.hybrid_search.bm25_weight = 0.5
     cfg.hybrid_search.dense_weight = 0.5
-    cfg.llm.generator.model = "claude-3-7-sonnet-20250620"
+    cfg.llm.generator.model = "deepseek-chat"
 
     # Mock hybrid search
     hybrid_search = MagicMock()
     retrieval_ctx = MagicMock()
     retrieval_ctx.total_latency_ms = 50.0
     retrieval_ctx.stage_breakdown = {
-        "bm25": "10ms (20%)",
         "dense": "15ms (30%)",
         "fusion": "2ms (4%)",
         "rerank": "23ms (46%)",
@@ -60,7 +61,7 @@ def _make_orchestrator(
 
     # Mock LLM
     llm_client = MagicMock()
-    llm_client.generator_model = "claude-3-7-sonnet-20250620"
+    llm_client.generator_model = "deepseek-chat"
     llm_client.generator_client = MagicMock()
     llm_client.generate_async = AsyncMock(return_value=answer)
     llm_client.router_client = MagicMock()
@@ -78,18 +79,7 @@ def _make_orchestrator(
     rewritten.rewritten = "test query"
     rewriter.rewrite = MagicMock(return_value=rewritten)
 
-    # Mock citation verifier
-    citation_verifier = MagicMock()
-    verify_result = MagicMock()
-    verify_result.overall_groundedness_score = 0.9
-    verify_result.num_supported = 3
-    verify_result.num_total = 3
-    verify_result.unsupported_claims = []
-    citation_verifier.verify = AsyncMock(return_value=verify_result)
-    citation_verifier.to_citations = MagicMock(return_value=[])
-
-    with patch("backend.retrieval.query_rewriter.QueryRewriter", return_value=rewriter), \
-         patch("backend.generation.citation_verifier.CitationVerifier", return_value=citation_verifier):
+    with patch("backend.retrieval.query_rewriter.QueryRewriter", return_value=rewriter):
         orch = AgenticOrchestrator(
             hybrid_search_engine=hybrid_search,
             router=router,

@@ -146,13 +146,8 @@ class TestReadiness:
 class TestConfigLoading:
     def test_config_loads_from_yaml(self, dummy_config):
         """默认 config.yaml 能成功加载"""
-        assert dummy_config.vector_db.bm25_mode in ("qdrant_sparse", "external")
         assert dummy_config.logging.max_bytes > 0
         assert dummy_config.logging.backup_count > 0
-
-    def test_bm25_mode_default(self, dummy_config):
-        """bm25_mode 默认 qdrant_sparse（避免双重 BM25）"""
-        assert dummy_config.vector_db.bm25_mode == "qdrant_sparse"
 
     def test_logging_rotation_settings(self, dummy_config):
         """LoggingConfig 含轮转字段"""

@@ -1,20 +1,16 @@
 """
-rate_limiter.py — Redis 令牌桶限流
+rate_limiter.py — Redis 滑动窗口限流（per-tenant）
 ================================================================================
-技术决策记录:
-- 基于 Redis 的令牌桶算法，支持 per-tenant 限流
-- 支持 tier 分组：free/pro/enterprise
-- 滑动窗口计数，避免 burst 问题
-- 限流在 API 网关层或 middleware 层处理，不在业务逻辑层
+P1-2 简化:
+- 移除 3-tier 抽象（free/pro/enterprise）：无前端传 X-Rate-Limit-Tier header
+- 固定 requests_per_minute=60（从原 pro 档）
+- 移除 check_rate_limit 装饰器（无消费方，只用 RateLimitMiddleware）
+- 保留 RateLimitExceeded 异常 + RateLimitMiddleware
 """
-
 from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass
-from functools import wraps
-from typing import Literal
 
 logger = logging.getLogger(__name__)
 
@@ -28,44 +24,28 @@ except ImportError:
     logger.warning("redis 未安装，限流不可用。请运行: pip install redis")
 
 
-@dataclass
-class RateLimitTier:
-    """限流 Tier 配置"""
-    name: str
-    requests_per_minute: int
-    burst_size: int
-
-
-DEFAULT_TIERS: dict[str, RateLimitTier] = {
-    "free": RateLimitTier(name="free", requests_per_minute=10, burst_size=5),
-    "pro": RateLimitTier(name="pro", requests_per_minute=60, burst_size=20),
-    "enterprise": RateLimitTier(name="enterprise", requests_per_minute=300, burst_size=100),
-}
+DEFAULT_REQUESTS_PER_MINUTE = 60
 
 
 class RateLimiter:
     """
-    Redis 滑动窗口限流器
+    Redis 滑动窗口限流器（per-tenant）
 
-    技术要点:
-    - 使用 Redis ZSET 实现滑动窗口计数器
-    - 每个 tenant_id 有独立的限流 key
-    - tier 决定请求速率上限
-    - P1.2: 切换到 redis.asyncio.Redis，避免在 FastAPI 异步请求里阻塞 event loop
+    P1-2: 固定 requests_per_minute=60，移除 tier 抽象。
     """
 
     def __init__(
         self,
         host: str = "localhost",
         port: int = 6379,
-        tiers: dict[str, RateLimitTier] | None = None,
+        requests_per_minute: int = DEFAULT_REQUESTS_PER_MINUTE,
     ):
         if not REDIS_AVAILABLE:
             raise ImportError("需要安装 redis: pip install redis")
 
         import redis.asyncio as aioredis
         self._client = aioredis.Redis(host=host, port=port, decode_responses=False)
-        self._tiers = tiers or DEFAULT_TIERS
+        self._requests_per_minute = requests_per_minute
 
     def _get_key(self, tenant_id: str) -> str:
         return f"ratelimit:{tenant_id}"
@@ -73,22 +53,16 @@ class RateLimiter:
     async def check_rate_limit(
         self,
         tenant_id: str,
-        tier: str = "free",
     ) -> tuple[bool, int, int]:
         """
         检查限流状态
 
         Args:
             tenant_id: 租户 ID
-            tier: 限流 tier
 
         Returns:
             (allowed, remaining, reset_in_seconds)
-            allowed: 是否允许请求
-            remaining: 窗口内剩余请求数
-            reset_in_seconds: 窗口重置时间
         """
-        tier_config = self._tiers.get(tier, self._tiers["free"])
         key = self._get_key(tenant_id)
         now = time.time()
         window_start = now - 60  # 60秒滑动窗口
@@ -107,19 +81,18 @@ class RateLimiter:
         # 设置过期时间
         pipe.expire(key, 120)
 
-        # P1.2: redis.asyncio 模式下 pipeline() 返回的对象可 await execute()
         results = await pipe.execute()
         current_count = results[1]  # zcard result
 
-        remaining = max(0, tier_config.requests_per_minute - current_count - 1)
-        allowed = current_count < tier_config.requests_per_minute
+        remaining = max(0, self._requests_per_minute - current_count - 1)
+        allowed = current_count < self._requests_per_minute
 
         # 如果不允许，不要将当前请求计入
         if not allowed:
             await self._client.zrem(key, f"{now}")
 
         logger.debug(
-            f"RateLimit: tenant={tenant_id} tier={tier} "
+            f"RateLimit: tenant={tenant_id} "
             f"allowed={allowed} remaining={remaining}"
         )
 
@@ -130,7 +103,6 @@ class RateLimiter:
         key = self._get_key(tenant_id)
         now = time.time()
         window_start = now - 60
-        # P1.2: async API
         return await self._client.zcount(key, window_start, now)
 
 
@@ -145,27 +117,6 @@ def get_rate_limiter(host: str = "localhost", port: int = 6379) -> RateLimiter:
     return _rate_limiter
 
 
-def check_rate_limit(tenant_id: str, tier: str = "free"):
-    """
-    限流检查装饰器
-
-    用法:
-        @check_rate_limit("tenant_123", "pro")
-        async def my_handler():
-            ...
-    """
-    def decorator(func):
-        @wraps(func)
-        async def wrapper(*args, **kwargs):
-            limiter = get_rate_limiter()
-            allowed, remaining, _ = await limiter.check_rate_limit(tenant_id, tier)
-            if not allowed:
-                raise RateLimitExceeded(f"Rate limit exceeded for tenant {tenant_id}")
-            return await func(*args, **kwargs)
-        return wrapper
-    return decorator
-
-
 class RateLimitExceeded(Exception):
     """限流超出异常"""
     pass
@@ -177,6 +128,8 @@ class RateLimitMiddleware:
 
     从请求头中提取 tenant_id，默认 fallback 到 IP。
     将限流结果以响应头返回: X-RateLimit-Remaining, X-RateLimit-Reset
+
+    P1-2: 移除 _extract_tier() — 无前端传 X-Rate-Limit-Tier header。
     """
 
     def __init__(self, app, limiter: RateLimiter | None = None):
@@ -190,10 +143,9 @@ class RateLimitMiddleware:
 
         limiter = self._limiter or get_rate_limiter()
         tenant_id = self._extract_tenant_id(scope)
-        tier = self._extract_tier(scope)
 
         try:
-            allowed, remaining, reset_in = await limiter.check_rate_limit(tenant_id, tier)
+            allowed, remaining, reset_in = await limiter.check_rate_limit(tenant_id)
         except Exception:
             allowed = True
             remaining = -1
@@ -236,10 +188,6 @@ class RateLimitMiddleware:
     def _extract_tenant_id(self, scope) -> str:
         """
         从 JWT 提取 tenant_id（user sub）。
-
-        P1-4: 原实现手写 base64 解 JWT payload，**不验证签名** — tenant_id 可被伪造。
-        改用 `backend.security.auth.decode_token`，统一用项目内的验签逻辑。
-        JWT 验签是 CPU bound（< 1ms），在 async middleware 中调用 sync 函数可接受。
         """
         headers = dict(scope.get("headers", []))
         auth = headers.get(b"authorization", b"").decode()
@@ -254,10 +202,3 @@ class RateLimitMiddleware:
         if client:
             return f"ip:{client[0]}"
         return "unknown"
-
-    def _extract_tier(self, scope) -> str:
-        headers = dict(scope.get("headers", []))
-        tier_header = headers.get(b"x-rate-limit-tier", b"").decode()
-        if tier_header in ("free", "pro", "enterprise"):
-            return tier_header
-        return "free"

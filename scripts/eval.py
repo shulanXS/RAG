@@ -32,7 +32,6 @@ from rich import print as rprint
 from backend.config import get_config, ConfigLoader
 from backend.evaluation.test_dataset import get_test_dataset, get_test_dataset_by_category
 from backend.evaluation.ragas_metrics import RAGASEvaluator
-from backend.evaluation.deepeval_tests import RAGTestSuite
 from backend.agentic import AgenticOrchestrator
 from backend.ingestion.embedder import Embedder
 from backend.retrieval.hybrid_search import HybridSearchEngine
@@ -113,22 +112,12 @@ async def run_evaluation(
         },
     )
 
-    suite = RAGTestSuite(
-        thresholds={
-            "faithfulness": config.evaluation.thresholds.faithfulness,
-            "answer_relevancy": config.evaluation.thresholds.answer_relevancy,
-            "context_precision": config.evaluation.thresholds.context_precision,
-            "context_recall": config.evaluation.thresholds.context_recall,
-            "hallucination": 0.05,
-        }
-    )
-
     # -------------------------------------------------------------------------
-    # 批量评估：每条用例跑真实 RAG pipeline
+    # 批量评估：每条用例跑真实 RAG pipeline，RAGAS 评估
     # -------------------------------------------------------------------------
     console.print(f"\n[bold cyan]运行评估（{len(test_cases)} 条用例）...[/bold cyan]")
 
-    results = []
+    rag_cases: list[dict] = []
     for i, case in enumerate(test_cases, 1):
         question = case["question"]
         ground_truth = case.get("ground_truth", "")
@@ -137,60 +126,68 @@ async def run_evaluation(
         if verbose:
             console.print(f"  [{i}/{len(test_cases)}] 评估中: {question[:40]}...")
 
-        # 执行真实 RAG pipeline
         try:
             rag_result = await orchestrator.run(
                 query=question,
                 conversation_history=None,
                 semantic_cache_fn=None,  # 评估时跳过缓存
             )
-
-            # 用真实结果评估
-            eval_result = suite.run_all(
-                question=question,
-                answer=rag_result.answer,
-                contexts=[c["text"] for c in rag_result.citations] if rag_result.citations else [],
-                ground_truth=ground_truth,
-                category=case_category,
+            contexts = (
+                [c["text"] for c in rag_result.citations]
+                if rag_result.citations else []
             )
-
-            # 附加 RAG 运行时信息
-            eval_result["rag_latency_ms"] = rag_result.latency_ms
-            eval_result["rag_complexity"] = rag_result.complexity.value
-            eval_result["rag_confidence"] = rag_result.confidence
-            eval_result["rag_cache_hit"] = rag_result.cache_hit
-
+            rag_cases.append({
+                "question": question,
+                "answer": rag_result.answer,
+                "contexts": contexts,
+                "ground_truth": ground_truth,
+                "category": case_category,
+                "rag_latency_ms": rag_result.latency_ms,
+                "rag_complexity": rag_result.complexity.value,
+                "rag_confidence": rag_result.confidence,
+                "rag_cache_hit": rag_result.cache_hit,
+            })
         except Exception as e:
             logger.warning(f"RAG pipeline 执行失败 [{question[:40]}...]: {e}")
-            eval_result = suite._dummy_result(question, "", case_category)
-            eval_result["rag_error"] = str(e)
+            rag_cases.append({
+                "question": question,
+                "answer": "",
+                "contexts": [],
+                "ground_truth": ground_truth,
+                "category": case_category,
+                "rag_error": str(e),
+            })
 
-        results.append(eval_result)
+    # RAGAS 批量评估
+    if verbose:
+        console.print("  [dim]调用 RAGAS 评估...[/dim]")
+    report = await evaluator.evaluate_batch([
+        {
+            "question": c["question"],
+            "answer": c["answer"],
+            "contexts": c["contexts"],
+            "ground_truth": c.get("ground_truth") or None,
+        }
+        for c in rag_cases
+    ])
 
-        if verbose:
-            status = "[green]PASS[/green]" if eval_result["all_passed"] else "[red]FAIL[/red]"
-            score = eval_result.get("average_score", 0)
-            console.print(f"       {status} score={score:.2f}")
-
-    # -------------------------------------------------------------------------
-    # 生成 CI 报告
-    # -------------------------------------------------------------------------
-    ci_report = suite.run_ci(
-        test_cases=[{
-            "question": tc["question"],
-            "answer": next((r["answer"] for r in results if r["question"] == tc["question"]), ""),
-            "contexts": [tc.get("ground_truth", "")],
-            "ground_truth": tc.get("ground_truth", ""),
-            "category": tc["category"],
-        } for tc in test_cases],
-        regression_threshold=config.evaluation.ci.regression_threshold,
+    # 附加 RAG 运行时统计 (与 DeepEval 时代字段名一致，便于 print_report)
+    if rag_cases:
+        report["avg_latency_ms"] = (
+            sum(c.get("rag_latency_ms", 0) for c in rag_cases) / len(rag_cases)
+        )
+        report["cache_hit_rate"] = sum(
+            1 for c in rag_cases if c.get("rag_cache_hit")
+        ) / len(rag_cases)
+    report["should_fail_ci"] = (
+        report["pass_rate"] < 0.8
+        or any(
+            report.get("average_scores", {}).get(m, 1.0) <
+            evaluator._thresholds.get(m, 0.5)
+            for m in evaluator._thresholds
+        )
     )
-
-    # 补充 RAG 运行时统计
-    ci_report["avg_latency_ms"] = sum(r.get("rag_latency_ms", 0) for r in results) / len(results) if results else 0
-    ci_report["cache_hit_rate"] = sum(1 for r in results if r.get("rag_cache_hit")) / len(results) if results else 0
-
-    return ci_report
+    return report
 
 
 def print_report(report: dict, verbose: bool = False) -> None:
@@ -263,6 +260,7 @@ def main():
     parser.add_argument("--verbose", action="store_true", help="详细输出")
     parser.add_argument("--output", type=str, help="保存报告到 JSON 文件")
     parser.add_argument("--config", type=str, default="config.yaml", help="配置文件")
+    parser.add_argument("--run-id", type=str, default=None, help="指定 run_id（默认自动生成）")
 
     args = parser.parse_args()
 
@@ -272,6 +270,7 @@ def main():
     console.print("[bold green]Enterprise RAG — 评估工具[/bold green]")
 
     try:
+        started_at = datetime.utcnow()
         report = asyncio.run(run_evaluation(
             category=args.category,
             verbose=args.verbose,
@@ -286,6 +285,34 @@ def main():
             with open(output_path, "w", encoding="utf-8") as f:
                 json.dump(report, f, ensure_ascii=False, indent=2)
             console.print(f"\n[green]报告已保存: {args.output}[/green]")
+
+        # P0-3 fix: 写 eval_runs 表，让 diff gate 能拿到本次 run
+        try:
+            from backend.evaluation.eval_store import get_eval_store
+            from backend.generation.prompts import get_prompts_with_hash
+
+            _, prompt_hash = get_prompts_with_hash()
+            run_id = args.run_id or f"cli_{started_at.strftime('%Y%m%d_%H%M%S')}"
+            avg_scores = report.get("average_scores", {}) or {}
+            store = get_eval_store()
+            store.save_run(
+                run_id=run_id,
+                started_at=started_at.isoformat(),
+                ended_at=datetime.utcnow().isoformat(),
+                total_cases=report.get("total", 0),
+                passed_cases=report.get("passed", 0),
+                avg_faithfulness=avg_scores.get("faithfulness", 0.0),
+                avg_answer_relevancy=avg_scores.get("answer_relevancy", 0.0),
+                avg_context_precision=avg_scores.get("context_precision", 0.0),
+                avg_context_recall=avg_scores.get("context_recall", 0.0),
+                avg_answer_correctness=avg_scores.get("answer_correctness", 0.0),
+                weakest_metric=report.get("weakest_metric", ""),
+                metadata={"source": "cli", "category": args.category or "all"},
+                prompt_hash=prompt_hash,
+            )
+            console.print(f"[dim]已写入 eval_runs: {run_id}[/dim]")
+        except Exception as e:
+            logger.warning(f"写 eval_runs 失败（diff gate 将跳过）: {e}")
 
         # CI 状态
         if report["should_fail_ci"]:
@@ -302,7 +329,6 @@ def main():
 
             cfg = _gc()
             _, prompt_hash = get_prompts_with_hash()
-            # 取最近一次 run (已写库的)
             store = get_eval_store()
             latest = store.get_latest_run()
             if latest and latest.get("prompt_hash"):

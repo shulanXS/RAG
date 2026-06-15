@@ -90,6 +90,10 @@ async def run_index_pipeline(
             generator_model=config.llm.generator.model,
             router_provider=config.llm.router.provider,
             router_model=config.llm.router.model,
+            generator_api_key=config.llm.deepseek.api_key or None,
+            generator_base_url=config.llm.deepseek.base_url,
+            router_api_key=config.llm.deepseek.api_key or None,
+            router_base_url=config.llm.deepseek.base_url,
         )
 
         embedder = Embedder(
@@ -105,7 +109,6 @@ async def run_index_pipeline(
                 "chunk_size": config.chunking.chunk_size,
                 "chunk_overlap": config.chunking.chunk_overlap,
                 "min_chunk_size": config.chunking.min_chunk_size,
-                "heading_levels": config.chunking.heading_levels,
             },
         )
 
@@ -210,46 +213,7 @@ async def run_index_pipeline(
 
 
 # -----------------------------------------------------------------------------
-# 向后兼容 shim：旧代码用 `index_file_task` / `get_document_status` / `list_indexed_documents`
-# 现已迁移到 DocumentRegistry，下面三个函数保留为薄包装以最小化调用方改动
+# 旧的 `index_file_task` / `get_document_status` / `list_indexed_documents` /
+# `reset_index_state` 入口已在 Phase1-1.10 删除（调用方已全部迁移到
+# `run_index_pipeline` + `DocumentRegistry`）。
 # -----------------------------------------------------------------------------
-
-
-async def index_file_task(
-    file_path: Path | str,
-    file_id: str,
-    tenant_id: str = "default",
-    strategy: str = "recursive",
-) -> dict:
-    """P1-A1: 现为 run_index_pipeline 的别名（保留旧入口名）。"""
-    return await run_index_pipeline(
-        file_path=file_path,
-        file_id=file_id,
-        tenant_id=tenant_id,
-        strategy=strategy,
-    )
-
-
-def get_document_status(file_id: str) -> dict | None:
-    """P1-A1: 旧 API — 现通过 DocumentRegistry 读。"""
-    from backend.ingestion.document_registry import get_document_registry
-    rec = get_document_registry().get(file_id)
-    if rec is None:
-        return None
-    return rec.to_payload()
-
-
-def list_indexed_documents() -> list[dict]:
-    """P1-A1: 旧 API — 现通过 DocumentRegistry 读 (默认租户)。"""
-    from backend.ingestion.document_registry import get_document_registry
-    from backend.security.tenant import DEFAULT_TENANT_ID
-    return [
-        rec.to_payload()
-        for rec in get_document_registry().list_by_tenant(DEFAULT_TENANT_ID)
-    ]
-
-
-def reset_index_state() -> None:
-    """P1-A1: 测试钩子 — 现改为重置 DocumentRegistry 单例 (测试用)。"""
-    from backend.ingestion.document_registry import reset_document_registry_for_test
-    reset_document_registry_for_test()

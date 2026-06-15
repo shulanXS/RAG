@@ -4,7 +4,6 @@ tracing.py — OpenTelemetry tracing for RAG system
 技术决策记录:
 - 每个 RAG 阶段作为独立 span：query_rewrite / routing / retrieval / rerank / generation
 - span 记录：duration、attributes（query_complexity, num_chunks, cache_hit 等）
-- 支持 W3C TraceContext 传播（HTTP header 注入/提取）
 - 使用 OTLP exporter（支持 Jaeger/Zipkin/Console）
 - 采样策略: AlwaysOn（生产环境零遗漏）+ Parent-based（保留 trace 树结构）
 
@@ -19,7 +18,7 @@ from __future__ import annotations
 import logging
 from contextlib import contextmanager
 from functools import lru_cache
-from typing import Any, Generator, Literal
+from typing import Generator
 
 from opentelemetry import trace
 from opentelemetry.sdk.trace import TracerProvider
@@ -34,9 +33,7 @@ from opentelemetry.trace import set_tracer_provider
 
 logger = logging.getLogger(__name__)
 
-# =============================================================================
-# 1. Span Names Constants
-# =============================================================================
+# Span Names Constants
 
 SPAN_NAME_QUERY_REWRITE = "rag.query_rewrite"
 SPAN_NAME_ROUTING = "rag.routing"
@@ -48,16 +45,12 @@ SPAN_NAME_EMBEDDING = "rag.embedding"
 SPAN_NAME_CACHE_LOOKUP = "rag.cache_lookup"
 SPAN_NAME_CACHE_STORE = "rag.cache_store"
 
-# =============================================================================
-# 2. Tracer Names
-# =============================================================================
+# Tracer Names
 
 TRACER_NAME = "enterprise_rag"
 
 
-# =============================================================================
-# 3. TracingManager Singleton
-# =============================================================================
+# TracingManager Singleton
 
 
 @lru_cache(maxsize=1)
@@ -71,10 +64,8 @@ def TracingManager() -> "TracingManagerImpl":
         tm = TracingManager()
         tm.setup_tracing(service_name="rag-api", otlp_endpoint="http://jaeger:4317")
 
-        # 使用 context manager 创建 span
         with tm.create_span("rag.retrieval") as span:
             span.set_attribute("num_chunks", 5)
-            # ... 业务逻辑 ...
     """
     return TracingManagerImpl()
 
@@ -91,7 +82,6 @@ class TracingManagerImpl:
     技术要点:
     - TracerProvider: 全局追踪提供者，配置采样策略和 exporter
     - SpanProcessor: BatchSpanProcessor 用于生产（异步批处理）
-    - Propagator: W3C TraceContext 用于跨服务传播
     """
 
     def __init__(self):
@@ -195,12 +185,6 @@ class TracingManagerImpl:
 
         Yields:
             Span: 当前 span 对象
-
-        用法示例:
-            with tm.create_span("rag.retrieval") as span:
-                span.set_attribute("num_chunks", 5)
-                results = await hybrid_search.search(query)
-                span.set_attribute("num_results", len(results))
         """
         tracer = self.get_tracer()
         with tracer.start_as_current_span(span_name, kind=kind) as span:
@@ -211,69 +195,6 @@ class TracingManagerImpl:
                 span.record_exception(e)
                 raise
 
-    def create_span_decorator(
-        self,
-        span_name: str | None = None,
-        kind: trace.SpanKind = trace.SpanKind.INTERNAL,
-    ):
-        """
-        span 装饰器（用于函数级别的自动追踪）
-
-        Args:
-            span_name: 可选，span 名称（默认使用函数名）
-            kind: span 类型
-
-        用法示例:
-            @tracing_manager.create_span_decorator("rag.embedding")
-            def embed_text(text: str) -> list[float]:
-                # ... 函数逻辑 ...
-                pass
-        """
-        def decorator(func):
-            _span_name = span_name or f"{func.__module__}.{func.__name__}"
-
-            def sync_wrapper(*args, **kwargs):
-                with self.create_span(_span_name, kind=kind) as span:
-                    span.set_attribute("function", func.__name__)
-                    return func(*args, **kwargs)
-
-            async def async_wrapper(*args, **kwargs):
-                with self.create_span(_span_name, kind=kind) as span:
-                    span.set_attribute("function", func.__name__)
-                    return await func(*args, **kwargs)
-
-            import asyncio
-            if asyncio.iscoroutinefunction(func):
-                return async_wrapper
-            return sync_wrapper
-
-        return decorator
-
-    def inject_context(self, carrier: dict[str, str]) -> dict[str, str]:
-        """
-        将当前 trace context 注入到 carrier（用于 HTTP header 传播）
-
-        Args:
-            carrier: 目标容器（如 request.headers）
-
-        Returns:
-            包含 trace context 的 carrier
-        """
-        self._propagator.inject(carrier)
-        return carrier
-
-    def extract_context(self, carrier: dict[str, str]) -> trace.Context:
-        """
-        从 carrier 提取 trace context（用于接收外部请求）
-
-        Args:
-            carrier: 源容器（如 response.headers）
-
-        Returns:
-            OpenTelemetry Context
-        """
-        return self._propagator.extract(carrier)
-
     def get_current_span(self) -> Span:
         """
         获取当前活跃的 span
@@ -282,39 +203,6 @@ class TracingManagerImpl:
             当前 span（如果没有则返回 noop span）
         """
         return trace.get_current_span()
-
-    def add_span_attributes(self, attributes: dict[str, Any]) -> None:
-        """
-        向当前 span 添加 attributes
-
-        Args:
-            attributes: attribute 字典
-        """
-        span = self.get_current_span()
-        for key, value in attributes.items():
-            span.set_attribute(key, value)
-
-    def set_span_status(self, status: StatusCode, description: str = "") -> None:
-        """
-        设置当前 span 的状态
-
-        Args:
-            status: 状态码（OK/ERROR）
-            description: 状态描述
-        """
-        span = self.get_current_span()
-        span.set_status(Status(status, description))
-
-    def record_exception(self, exception: Exception) -> None:
-        """
-        记录异常到当前 span
-
-        Args:
-            exception: 异常对象
-        """
-        span = self.get_current_span()
-        span.record_exception(exception)
-        span.set_status(Status(StatusCode.ERROR, str(exception)))
 
     def shutdown(self, timeout: float = 5.0) -> None:
         """
@@ -326,50 +214,3 @@ class TracingManagerImpl:
         if self._provider:
             self._provider.shutdown(timeout=timeout)
             logger.info("Tracing provider 已关闭")
-
-
-# =============================================================================
-# 4. Convenience Functions
-# =============================================================================
-
-
-@lru_cache(maxsize=1)
-def get_tracer() -> trace.Tracer:
-    """
-    获取全局 tracer 实例
-
-    Returns:
-        OpenTelemetry Tracer
-    """
-    return TracingManager().get_tracer()
-
-
-@contextmanager
-def create_span(
-    span_name: str,
-    kind: trace.SpanKind = trace.SpanKind.INTERNAL,
-) -> Generator[Span, None, None]:
-    """
-    快捷函数：创建 span
-
-    用法示例:
-        from backend.observability.tracing import create_span
-
-        with create_span("rag.retrieval") as span:
-            span.set_attribute("num_chunks", 5)
-    """
-    tm = TracingManager()
-    if not tm._initialized:
-        tm.setup_tracing()
-    with tm.create_span(span_name, kind) as span:
-        yield span
-
-
-def inject_trace_context(carrier: dict[str, str]) -> dict[str, str]:
-    """快捷函数：注入 trace context 到 HTTP header"""
-    return TracingManager().inject_context(carrier)
-
-
-def extract_trace_context(carrier: dict[str, str]) -> trace.Context:
-    """快捷函数：从 HTTP header 提取 trace context"""
-    return TracingManager().extract_context(carrier)

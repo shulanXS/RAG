@@ -126,7 +126,8 @@ class TestQuerySignals:
         assert s.is_multi_hop is False
         assert s.query_length == 0
         assert s.has_quote is False
-        assert s.extra == {}
+        # Phase 1.12: `extra` 字段已删除（无外部消费方）
+        assert not hasattr(s, "extra") or "extra" not in s.to_dict()
 
     def test_to_dict_round_trip(self):
         s = QuerySignals(

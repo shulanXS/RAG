@@ -2,19 +2,16 @@
 fusion.py — 多路检索结果融合
 ================================================================================
 技术决策记录:
-|- RRF (Reciprocal Rank Fusion) 是 2026 年工业界的事实标准。
+- RRF (Reciprocal Rank Fusion) 是 2026 年工业界的事实标准。
   核心优势: 无需 score 归一化，对不同量纲（BM25 vs cosine similarity）天然鲁棒。
-|- 为什么 k=60: 这是学术和工业界共同验证的最优值。
+- 为什么 k=60: 这是学术和工业界共同验证的最优值。
   k 值越大，各路算法的权重越均衡；k 值越小，排名靠前的结果权重越高。
   k=60 在「头部结果权重」和「各路均衡」之间取得最佳平衡。
 
 业务难点:
-|- 排名冲突处理: 当两路算法给出完全不同的排名时，RRF 通过排名倒数平滑处理。
-|- 相关性信号冗余: 两路算法可能都检索到同一结果，RRF 天然处理这种情况
+- 排名冲突处理: 当两路算法给出完全不同的排名时，RRF 通过排名倒数平滑处理。
+- 相关性信号冗余: 两路算法可能都检索到同一结果，RRF 天然处理这种情况
   （同一文档在两路中的排名叠加）。
-
-P1-B30: WeightedFusion 与 FusionStrategy ABC 已删除（HybridSearchEngine
-默认走 RRF，weighted 永远无 caller；YAGNI）。
 """
 
 from __future__ import annotations
@@ -48,98 +45,6 @@ class FusionResult:
     metadata: dict = field(default_factory=dict)
 
 
-class RRFFusion:
-    """
-    Reciprocal Rank Fusion (RRF) — 2026 年工业界默认方案
-
-    算法原理:
-    score_RRF(d) = Σ 1/(k + rank_i(d))
-
-    其中:
-    - d: 目标文档
-    - k: 融合参数（默认 60）
-    - rank_i(d): 文档 d 在第 i 路检索中的排名
-
-    技术决策:
-    - k=60 是经过大量实验验证的最优值（Van Gysel et al., 2011 及大量工业实践）
-    - k 越小，头部结果权重越高；k 越大，各路越均衡
-    - 当 rank_i(d) 相同时（即同一结果在不同路的排名相同），
-      该结果的 RRF 得分最高（这是我们想要的）
-
-    P1-B30: 去掉 ABC 继承 — 唯一实现，无需抽象层。
-    """
-
-    def __init__(self, k: int = 60):
-        self._k = k
-
-    def fuse(
-        self,
-        result_sets: dict[str, list],
-    ) -> list[FusionResult]:
-        """
-        执行 RRF 融合。
-
-        Args:
-            result_sets: 形如 {"bm25": [BM25Result, ...], "dense": [VectorResult, ...]}
-                        各路结果列表必须已按各自得分降序排列
-
-        Returns:
-            按 RRF 得分降序排列的融合结果
-        """
-        # 计算每个 chunk 在各路的排名
-        doc_scores: dict[str, dict] = {}
-
-        for source_name, results in result_sets.items():
-            for rank, result in enumerate(results, 1):
-                chunk_id = result.chunk_id
-                if chunk_id not in doc_scores:
-                    doc_scores[chunk_id] = {
-                        "doc_id": result.doc_id,
-                        "text": getattr(result, "text", ""),
-                        "section_path": getattr(result, "section_path", ""),
-                        "metadata": getattr(result, "metadata", {}),
-                        "rrf_contribution": 0.0,
-                        "sources": [],
-                        "individual_scores": {},
-                    }
-
-                # RRF 贡献 = 1 / (k + rank)
-                rrf_contrib = 1.0 / (self._k + rank)
-                doc_scores[chunk_id]["rrf_contribution"] += rrf_contrib
-                doc_scores[chunk_id]["sources"].append(source_name)
-                doc_scores[chunk_id]["individual_scores"][source_name] = getattr(
-                    result, "score", 1.0 / (self._k + rank)
-                )
-
-        # 按 RRF 得分降序排序
-        ranked = sorted(
-            doc_scores.items(),
-            key=lambda x: x[1]["rrf_contribution"],
-            reverse=True,
-        )
-
-        fusion_results: list[FusionResult] = []
-        for rank, (chunk_id, data) in enumerate(ranked, 1):
-            fusion_results.append(FusionResult(
-                chunk_id=chunk_id,
-                doc_id=data["doc_id"],
-                fused_score=data["rrf_contribution"],
-                rank=rank,
-                text=data["text"],
-                section_path=data["section_path"],
-                sources=data["sources"],
-                individual_scores=data["individual_scores"],
-                metadata=data["metadata"],
-            ))
-
-        logger.debug(f"RRF 融合完成: {len(result_sets)} 路检索 → {len(fusion_results)} 个唯一文档")
-        return fusion_results
-
-
-# =============================================================================
-# P2-B5: DynamicRRFFusion — 按 query complexity 动态调整 k
-# =============================================================================
-
 # 默认的 complexity → k 映射
 # - simple:   k=30 (小 k → 看重头部; simple 查询通常 BM25 命中率高)
 # - moderate: k=60 (默认)
@@ -155,14 +60,14 @@ DEFAULT_K_BY_COMPLEXITY: dict[str, int] = {
 
 class DynamicRRFFusion:
     """
-    P2-B5: 按 query complexity 动态选 k 的 RRF 融合器。
+    按 query complexity 动态选 k 的 RRF 融合器。
 
     启发式:
     - 简单查询 (pronoun / 短词) → BM25 头部结果更相关 → 小 k 强调头部
     - 复杂查询 (multi-hop / analytical) → 需 dense 提权重 → 大 k 让 RRF 均衡融合
     - moderate / beyond_kb → 默认 k=60
 
-    与原 RRFFusion 接口一致 (fuse 签名相同), 可直接替换。
+    算法: score_RRF(d) = Σ 1/(k + rank_i(d))
 
     Args:
         k_default: 无 complexity 信号时的 fallback k (默认 60)
@@ -202,5 +107,57 @@ class DynamicRRFFusion:
             按 RRF 得分降序的 FusionResult 列表
         """
         k = self.k_for_complexity(complexity)
-        inner = RRFFusion(k=k)
-        return inner.fuse(result_sets)
+        return self._rrf_fuse(result_sets, k)
+
+    @staticmethod
+    def _rrf_fuse(result_sets: dict[str, list], k: int) -> list[FusionResult]:
+        """
+        RRF 核心算法（内联，避免 RRFFusion 中间类）
+
+        score_RRF(d) = Σ 1/(k + rank_i(d))
+        """
+        doc_scores: dict[str, dict] = {}
+
+        for source_name, results in result_sets.items():
+            for rank, result in enumerate(results, 1):
+                chunk_id = result.chunk_id
+                if chunk_id not in doc_scores:
+                    doc_scores[chunk_id] = {
+                        "doc_id": result.doc_id,
+                        "text": getattr(result, "text", ""),
+                        "section_path": getattr(result, "section_path", ""),
+                        "metadata": getattr(result, "metadata", {}),
+                        "rrf_contribution": 0.0,
+                        "sources": [],
+                        "individual_scores": {},
+                    }
+
+                rrf_contrib = 1.0 / (k + rank)
+                doc_scores[chunk_id]["rrf_contribution"] += rrf_contrib
+                doc_scores[chunk_id]["sources"].append(source_name)
+                doc_scores[chunk_id]["individual_scores"][source_name] = getattr(
+                    result, "score", 1.0 / (k + rank)
+                )
+
+        ranked = sorted(
+            doc_scores.items(),
+            key=lambda x: x[1]["rrf_contribution"],
+            reverse=True,
+        )
+
+        fusion_results: list[FusionResult] = []
+        for rank, (chunk_id, data) in enumerate(ranked, 1):
+            fusion_results.append(FusionResult(
+                chunk_id=chunk_id,
+                doc_id=data["doc_id"],
+                fused_score=data["rrf_contribution"],
+                rank=rank,
+                text=data["text"],
+                section_path=data["section_path"],
+                sources=data["sources"],
+                individual_scores=data["individual_scores"],
+                metadata=data["metadata"],
+            ))
+
+        logger.debug(f"RRF 融合完成: {len(result_sets)} 路检索 → {len(fusion_results)} 个唯一文档")
+        return fusion_results

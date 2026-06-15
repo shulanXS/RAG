@@ -61,7 +61,7 @@ def _get_db_path() -> Path:
 
 
 def _init_db() -> None:
-    """确保 users 表存在"""
+    """确保 users 表存在（模块级 lazy init，调用方通过 _DB_READY 标志避免重复）"""
     db_path = _get_db_path()
     with sqlite3.connect(db_path) as conn:
         conn.execute("""
@@ -75,8 +75,20 @@ def _init_db() -> None:
         """)
 
 
-def _get_user_by_username(username: str) -> dict | None:
+_DB_READY: bool = False
+
+
+def _ensure_db_ready() -> None:
+    """Phase1-1.15: 模块级 lazy init — 第一次 DB 调用时建表，之后跳过 CREATE TABLE IF NOT EXISTS。"""
+    global _DB_READY
+    if _DB_READY:
+        return
     _init_db()
+    _DB_READY = True
+
+
+def _get_user_by_username(username: str) -> dict | None:
+    _ensure_db_ready()
     db_path = _get_db_path()
     with sqlite3.connect(db_path) as conn:
         conn.row_factory = sqlite3.Row
@@ -92,7 +104,7 @@ def _get_user_by_username(username: str) -> dict | None:
 
 def _create_user(username: str, password: str) -> int:
     """创建用户，返回 user_id"""
-    _init_db()
+    _ensure_db_ready()
     pw_hash = pwd_context.hash(password + _PEPPER)
     now = datetime.now(timezone.utc).isoformat()
     db_path = _get_db_path()

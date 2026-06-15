@@ -210,85 +210,10 @@
 
 ---
 
-## Out of Scope
+## 移除与精简记录
 
-明确**不做**的（避免 scope creep）：
+P0 阶段砍掉的模块：Plan-and-Execute Agent / HyDE / ColBERT / Parent Document / A/B Testing / Shadow Testing / StructuredOutputGenerator / OnlineEvaluator / Eval Dashboard / Voyage+BGE Embedding / Anthropic+Google LLM Backend 等。
 
-- K8s manifests / Helm chart / Terraform
-- OIDC / SAML / 企业 SSO
-- SOC2 / ISO27001 合规
-- 多区域容灾 / DR
-- PII 脱敏 (Presidio)
-- A/B testing 平台（仅 shadow testing）
-- 复杂计费 / 用量配额
-- 移动端 App
-- 多语言 i18n
-
-这些**要写进 README**，面试官会加分——知道自己不知道什么。
+详细说明见 git log 与各模块 PR 描述；本节不再维护"已删"列表（删除完成态已固化在代码中）。
 
 ---
-
-## Why Not（为什么不做 — P0 阶段砍掉的模块）
-
-> 这是 P0 阶段最关键的改动：**与其堆 features，不如删掉那些"看起来在做实际是 stub"或"收益不抵成本"的代码**。
-> 下面每个模块都曾是项目的一部分；每一项都给出**明确的删除理由 + 何时该考虑重新引入**。
-
-### ❌ 1. Plan-and-Execute Agent (`plan_execute.py`, 334 行)
-- **删除原因**：
-  1. 99% 真实查询被 Query Router 分到 SIMPLE，剩下 1% ReAct 足够 — 真实生产中 Plan-and-Execute 几乎没被使用过。
-  2. `route_step` 永远 return `"execute_step"`，靠 `max_steps=8` 强制退出，**不会真的"动态重规划"**。
-  3. 多 1 次 LLM call 生成 plan (200-500ms 延迟)，NDCG 收益 < 2%。
-- **何时该重新引入**：
-  - 当产品支持"对比 X/Y/Z 三个供应商的交付能力"这种**真正需要多步 cross-document 综合**的查询，且单次 ReAct 不能收敛时。
-  - 引入时必须实现 dynamic plan revision（当前 bug）。
-
-### ❌ 2. HyDE (`hyde.py`, 305 行)
-- **删除原因**：
-  1. 仅 COMPLEX 路径用，但 Router 把 99% query 分到 SIMPLE — HyDE 命中数 < 1%。
-  2. 每次假设生成 3 个 50-100 token 的 hypothetical answer (200-500ms LLM 调用)。
-  3. 实测 NDCG@10 提升 < 3%，但**对精确 token 查询（合同号、SKU）引入幻觉干扰**。
-- **何时该重新引入**：
-  - 当 KB 主要是"短文本 + 大量同义词"的场景（如电商搜索）。
-  - 引入时要 gate 在"query 是 abstract semantic"分类后，而不是 COMPLEX 路由。
-
-### ❌ 3. ColBERT Late Interaction Retriever (`colbert_retriever.py`, 343 行)
-- **删除原因**：
-  1. 未接入主流程 — `retrieval/__init__.py` 没 export，hybrid_search 没用。
-  2. 部署成本高：sentence-transformers ColBERT 变体在长文档上 MaxSim 慢，**生产需 GPU (A10G+)**。
-  3. NDCG 收益对比 Cross-Encoder rerank（已经做了）边际 < 2%。
-- **何时该重新引入**：
-  - 当 QPS 高到 Cross-Encoder rerank 成为瓶颈（> 1K QPS），可考虑 ColBERT serving + token-level 缓存。
-  - 当前 QPS < 100，Cross-Encoder rerank 完全够用。
-
-### ❌ 4. Parent Document Retrieval (`parent_retriever.py`, 337 行)
-- **删除原因**：
-  1. Indexer 没有产出 parent chunks — `parent_retriever.retrieve()` 会拿空 list。
-  2. 引入完整功能需同时改 chunker (加 parent_id) + indexer (建 parent collection) + hybrid_search (融合策略)，超出 P0 预算。
-- **何时该重新引入**：
-  - 当用户反馈"答案有但 context 不够"时。
-  - 引入时建议用 Qdrant 1.10+ 的 named vectors 做 multi-granularity embedding。
-
-### ❌ 5. A/B Testing 平台 (`ab_testing.py`, 457 行)
-- **删除原因**：
-  1. 没接入主流程 — orchestrator 没读 `ABTestManager.assign_variant()`。
-  2. FAANG 真实生产用 EP (Experimentation Platform) / FB Experiment，**不放在 RAG repo 内**。
-  3. 作品集 demo 阶段用 `online_evaluator.py` 做后验分析已经够。
-- **何时该重新引入**：
-  - 当产品上线 > 6 个月、需要做 feature rollout 时，集成公司内部的 EP 平台。
-
-### ❌ 6. Shadow Testing 框架 (`shadow_testing.py`, 367 行)
-- **删除原因**：同 A/B Testing — 真实生产用 Feature Flag Service (LaunchDarkly / Statsig)，不在 RAG repo 内。
-
-### ❌ 7. StructuredOutputGenerator (`structured_output.py`, 211 行)
-- **删除原因**：
-  1. LLMClient 已原生支持 JSON Schema 透传（Anthropic `tool_use` / OpenAI `response_format`）。
-  2. 单独类徒增抽象 — orchestrator 可以直接调 `llm_client.generate_structured_async(prompt, schema)`。
-- **何时该重新引入**：
-  - 当需要 PydanticAI / Instructor 风格的强类型 structured output 时，直接引入 `instructor` 库而不是自造轮子。
-
-### 📊 量化影响
-- **代码量**：~16,200 行 → ~14,500 行 (-10% 显式删) + 移除 2,354 行死代码（-14%）
-- **真实 stub 数量**：5 → 0
-- **"被面试官追问会崩"的点**：5 → 0
-- **CI 跑通率**：100%（无 plan_execute / colbert / hyde 等 import 失败）
-

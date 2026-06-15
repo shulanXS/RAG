@@ -111,7 +111,6 @@ async def index_documents(
             "chunk_size": config.chunking.chunk_size,
             "chunk_overlap": config.chunking.chunk_overlap,
             "min_chunk_size": config.chunking.min_chunk_size,
-            "heading_levels": config.chunking.heading_levels,
         },
     )
 

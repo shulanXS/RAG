@@ -1,6 +1,7 @@
 """
 test_query_rewriter.py — P3.1 补充测试
 ================================================================================
+P0-6: QueryIntent / QueryType 已从 query_rewriter 移除。
 """
 
 from __future__ import annotations
@@ -9,11 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from backend.retrieval.query_rewriter import (
-    QueryIntent,
-    QueryRewriter,
-    QueryType,
-)
+from backend.retrieval.query_rewriter import QueryRewriter
 
 
 def test_needs_rewriting_short_query():

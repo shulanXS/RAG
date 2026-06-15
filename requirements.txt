@@ -4,75 +4,58 @@
 # Python >= 3.11
 #
 # 技术决策说明:
-# - 不锁死 LLM 版本: openai/anthropic/google-genai 使用 >= 1.0 兼容版本，
-#   因为这些 SDK 的 breaking change 频率较高，锁定版本会导致兼容性问题。
+# - 不锁死 LLM 版本: openai SDK 兼容 OpenAI / DeepSeek（DeepSeek 走 OpenAI 协议），
+#   openai>=1.12.0 提供 ChatCompletion + Embeddings + Stream 全套 API。
 # - Qdrant-client: 选 Qdrant 而非 Chroma，因其 HNSW 优化、mmap 支持
 #   和 sparse vector 原生混合搜索能力远强于 Chroma。
-# - rank-bm25: 纯 Python 实现，足够轻量；生产级 BM25 可升级到
-#   Qdrant native sparse vector 或 ParadeDB，无需引入 Elasticsearch。
+# - langgraph 保留（Phase1-1.1 删了 tool_node 后，状态机本身仍是 ReAct 的核心）
 # =============================================================================
 
 # --------------------------------------------------------------------------
 # Document Processing / Parsing
 # --------------------------------------------------------------------------
 pypdf>=4.0.0
-pymupdf>=1.24.0
 python-docx>=1.1.0
-markdownify>=0.12.0
 html2text>=2020.1.16
 unstructured[pptx,pdf,docx,html]>=0.14.0
 
 # --------------------------------------------------------------------------
 # Embedding & Reranking
 # --------------------------------------------------------------------------
-voyageai>=0.2.0
+# OpenAI Embedding（DeepSeek backend 也走 OpenAI 兼容协议，fallback 到 OpenAI Embedding）
 openai>=1.12.0
-sentence-transformers>=2.5.0
+# Cohere + BGE 双 reranker provider（用户选择 keep_both）
 cohere>=5.5.0
-
-# --------------------------------------------------------------------------
-# LLM Clients
-# --------------------------------------------------------------------------
-anthropic>=0.25.0
-google-genai>=0.8.0
 
 # --------------------------------------------------------------------------
 # Vector Database & Search
 # --------------------------------------------------------------------------
 qdrant-client>=1.9.0
-rank-bm25>=0.2.0
 
 # --------------------------------------------------------------------------
-# Agentic Orchestration (LangGraph / LangChain)
+# Agentic Orchestration (LangGraph 状态机)
 # --------------------------------------------------------------------------
+# Phase1-1.1 删了 tool_node 后，langgraph 仍作为 ReAct 多步检索的状态机框架
 langgraph>=0.2.0
-langchain-core>=0.3.0
-langchain-anthropic>=0.2.0
-langchain-openai>=0.2.0
-langchain-community>=0.3.0
 
 # --------------------------------------------------------------------------
 # Semantic Cache
 # --------------------------------------------------------------------------
 redis>=5.0.0
 redisvl>=0.3.0
-valkey>=1.0.0
 
 # --------------------------------------------------------------------------
-# Evaluation
+# Evaluation (RAGAS only — Online Evaluator / DeepEval 已删除)
 # --------------------------------------------------------------------------
 ragas>=0.4.0
-deepeval>=0.22.0
 datasets>=2.14.0
 numpy>=1.26.0
-scipy>=1.12.0
 
 # --------------------------------------------------------------------------
 # Config & Utilities
 # --------------------------------------------------------------------------
 pyyaml>=6.0.0
 pydantic>=2.5.0
-pydantic-settings>=2.1.0
 python-dotenv>=1.0.0
 tiktoken>=0.7.0
 
@@ -103,7 +86,6 @@ httpx>=0.27.0
 pytest>=8.0.0
 pytest-asyncio>=0.23.0
 pytest-cov>=4.1.0
-httpx>=0.27.0
 
 # --------------------------------------------------------------------------
 # Web API (FastAPI)
@@ -113,16 +95,8 @@ uvicorn[standard]>=0.30.0
 python-multipart>=0.0.9
 
 # --------------------------------------------------------------------------
-# Async Task Queue (P1-A2: 替换 FastAPI BackgroundTasks)
+# Async Task Queue
 # --------------------------------------------------------------------------
 # Arq 轻量 async task queue，任务持久化到 Redis Stream。
 # 替代之前的 BackgroundTasks（绑定 worker 进程，重启即丢）。
 arq>=0.26.0
-
-# --------------------------------------------------------------------------
-# MCP Server (P2 阶段 - 2026 事实标准)
-# --------------------------------------------------------------------------
-# Anthropic 在 2024-11 推出 MCP (Model Context Protocol)，2025-12 捐给 Linux Foundation。
-# 暴露 retrieve / search / cite 三个 tool，让 Claude Desktop / Cursor / Cline 等
-# MCP-aware 客户端可以直接调用 RAG 系统。
-mcp>=1.0.0

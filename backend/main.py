@@ -32,17 +32,32 @@ from backend.api import (
 )
 from backend.config import get_config
 from backend.middleware.rate_limiter import RateLimitMiddleware, get_rate_limiter
+from backend.middleware.request_context import RequestContextFilter
+from backend.middleware.request_context_middleware import RequestContextMiddleware
 
 logger = logging.getLogger(__name__)
 
 
 def _setup_logging() -> None:
-    """配置日志（轮转文件 + stdout）"""
+    """配置日志（轮转文件 + stdout）
+
+    P2-8: formatter 加 request_id / tenant_id / session_id 字段；
+    RequestContextFilter 注入 ContextVar 值到每条 log record。
+    """
     cfg = get_config()
     log_level = getattr(logging, cfg.logging.level.upper(), logging.INFO)
-    formatter = logging.Formatter(cfg.logging.format)
+
+    # P2-8: 扩展 format 含 request_id / tenant_id (默认 "-" 表示无上下文)
+    log_format = (
+        "%(asctime)s | %(levelname)s | %(name)s "
+        "| rid=%(request_id)s tenant=%(tenant_id)s | %(message)s"
+    )
+    formatter = logging.Formatter(log_format)
 
     handlers: list[logging.Handler] = [logging.StreamHandler(sys.stdout)]
+    # P2-8: filter 应用到每个 handler
+    for h in handlers:
+        h.addFilter(RequestContextFilter())
 
     log_path = Path(cfg.logging.file)
     try:
@@ -54,6 +69,7 @@ def _setup_logging() -> None:
             encoding="utf-8",
         )
         rotating.setFormatter(formatter)
+        rotating.addFilter(RequestContextFilter())
         handlers.append(rotating)
     except Exception as e:
         # 目录不可写时（如容器只读 fs）只回退到 stdout
@@ -113,6 +129,9 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+# P2-8: 请求上下文中间件 (最外层，确保所有 handler / 子任务都能继承)
+app.add_middleware(RequestContextMiddleware)
 
 # CORS 中间件（开发环境允许前端访问）
 app.add_middleware(

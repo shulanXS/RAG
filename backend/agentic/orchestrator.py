@@ -23,10 +23,8 @@ from typing import Any, Literal, TYPE_CHECKING, AsyncGenerator
 
 from backend.agentic.query_router import QueryComplexity, QueryRouter
 from backend.agentic.react_agent import ReActAgent
-from backend.agentic.self_reflection import do_reflection
 from backend.generation.llm_client import LLMClient
 from backend.generation.prompt_builder import PromptBuilder
-from backend.generation.citation_verifier import CitationVerifier
 from backend.observability.metrics import create_metrics_collector
 
 logger = logging.getLogger(__name__)
@@ -49,7 +47,7 @@ class OrchestratorResult:
     - routing_confidence: 路由分类置信度
     - latency_ms: 总执行时间
     - trace: 各阶段执行信息
-    - gaps: 信息缺口描述
+    - cache_hit: 是否走语义缓存命中
     """
     answer: str
     citations: list[dict] = field(default_factory=list)
@@ -58,10 +56,7 @@ class OrchestratorResult:
     routing_confidence: float = 0.0
     latency_ms: float = 0.0
     trace: dict = field(default_factory=dict)
-    gaps: list[str] = field(default_factory=list)
-    was_rewritten: bool = False
     cache_hit: bool = False
-    citation_verification: dict | None = None
 
 
 # =============================================================================
@@ -104,9 +99,6 @@ class AgenticOrchestrator:
         self._chat_store = chat_store
         # P1.2: 接受 cache callable（read 模式无参 / write 模式有 payload）
         self._semantic_cache_fn = semantic_cache_fn
-        self._citation_verifier = CitationVerifier(
-            llm_client=llm_client.generator_client if llm_client else None
-        )
 
         self._react_agent: ReActAgent | None = None
 
@@ -120,11 +112,9 @@ class AgenticOrchestrator:
 
     def _get_react_agent(self) -> ReActAgent:
         if self._react_agent is None:
-            from backend.agentic.tool_registry import get_tool_registry
             self._react_agent = ReActAgent(
                 llm_client=self._llm.router_client if self._llm else None,
                 retrieval_fn=self._run_retrieval,
-                tool_registry=get_tool_registry(),
             )
         return self._react_agent
 
@@ -146,7 +136,6 @@ class AgenticOrchestrator:
         start = time.perf_counter()
         trace: dict = {}
         cache_hit = False
-        was_rewritten = False
         mc = self._metrics
         tm = self._tracing
 
@@ -186,16 +175,14 @@ class AgenticOrchestrator:
         from backend.retrieval.query_rewriter import QueryRewriter
         rewriter = QueryRewriter(llm_client=self._llm.generator_client if self._llm else None)
         rewritten = await rewriter.rewrite_async(query, conversation_history)
-        was_rewritten = rewritten.was_rewritten
         display_query = rewritten.rewritten
 
         with tm.create_span("rag.query_rewrite") as span:
-            span.set_attribute("was_rewritten", was_rewritten)
             span.set_attribute("original_query_length", len(query))
             span.set_attribute("rewritten_query_length", len(display_query))
 
         trace["query_rewrite"] = {
-            "was_rewritten": was_rewritten,
+            "was_rewritten": rewritten.was_rewritten,
             "confidence": rewritten.confidence,
             "original": query,
             "rewritten": display_query,
@@ -268,9 +255,7 @@ class AgenticOrchestrator:
                     "stages": retrieval_context.stage_breakdown,
                     "fusion_k_used": retrieval_context.fusion_k_used,
                 }
-                answer, citations, citation_verification = await self._generate_answer(
-                    display_query, chunks, verify_citation=False
-                )
+                answer, citations = await self._generate_answer(display_query, chunks)
             else:
                 answer = "检索引擎未配置"
                 citations = []
@@ -297,31 +282,6 @@ class AgenticOrchestrator:
             trace["retrieval"] = {"strategy": "skip", "reason": "beyond_kb"}
             answer, citations = await self._direct_generate(display_query)
             confidence = 0.9
-
-        # P0-3: Self-Reflection 仅在 MODERATE/COMPLEX 路径触发。
-        # SIMPLE 路径（67% 流量）跳过，节省 200-500ms LLM 调用。
-        gaps: list[str] = []
-        if (
-            complexity in (QueryComplexity.MODERATE, QueryComplexity.COMPLEX)
-            and retrieved_chunks
-            and answer
-            and self._llm
-            and self._llm.generator_client
-        ):
-            with tm.create_span("rag.self_reflection") as span:
-                score, gaps, revised, needs_correction = await do_reflection(
-                    self._llm.generator_client, query, answer, retrieved_chunks
-                )
-                if needs_correction and score < 0.5:
-                    answer = revised
-                confidence = score
-                span.set_attribute("score", score)
-                span.set_attribute("needs_correction", needs_correction)
-            trace["reflection"] = {
-                "score": score,
-                "needs_correction": needs_correction,
-                "gaps": gaps,
-            }
 
         # ---- confidence mapping ----
         conf_level = self._map_confidence(confidence)
@@ -353,8 +313,6 @@ class AgenticOrchestrator:
             span.set_attribute("llm_model", self._llm.generator_model if self._llm else "unknown")
             span.set_attribute("answer_length", len(answer))
 
-        # P1-B10+B22: 删除 _collect_spans 与 trace_store ring buffer 写入
-        # (OTel 端已有完整 trace，Jaeger UI 提供 trace 查询；不再维护自定义 ring buffer)
         return OrchestratorResult(
             answer=answer,
             citations=citations,
@@ -363,10 +321,7 @@ class AgenticOrchestrator:
             routing_confidence=routing.confidence,
             latency_ms=latency,
             trace=trace,
-            was_rewritten=was_rewritten,
             cache_hit=cache_hit,
-            gaps=gaps,
-            citation_verification=locals().get("citation_verification"),
         )
 
     # 精简的 JSON Schema — 与 LLMClient.generate_async(structured_schema=...) 配合
@@ -389,7 +344,6 @@ class AgenticOrchestrator:
                 "type": "string",
                 "enum": ["high", "medium", "low", "insufficient"],
             },
-            "gaps": {"type": "array", "items": {"type": "string"}},
         },
         "required": ["answer", "citations", "confidence"],
     }
@@ -398,17 +352,15 @@ class AgenticOrchestrator:
         self,
         query: str,
         chunks: list[dict],
-        verify_citation: bool = True,
-    ) -> tuple[str, list[dict], dict | None]:
+    ) -> tuple[str, list[dict]]:
         """
         基于检索结果生成答案。
 
-        P0-3: verify_citation 默认为 True，但 SIMPLE 路径调用时传 False，
-        节省 200-500ms citation verifier LLM 调用。
-        MODERATE / COMPLEX 路径默认 True。
+        P1-Phase1.2: citation verifier 已删除 — 答案-引用对齐验证无人消费（前端不展示），
+        移除后每条 MODERATE/COMPLEX query 节省 200-500ms LLM 调用 + 一次额外 token 成本。
         """
         if self._llm is None:
-            return "LLM 不可用", [], None
+            return "LLM 不可用", []
 
         llm_start = time.perf_counter()
         context = self._prompt_builder.build_context(chunks)
@@ -427,25 +379,8 @@ class AgenticOrchestrator:
             llm_latency,
         )
 
-        # P0-3: 答实对齐验证 — 仅在 verify_citation=True 时调用（MODERATE/COMPLEX）
-        citation_verification = None
-        if verify_citation and chunks and self._llm:
-            try:
-                verify_result = await self._citation_verifier.verify(query, response, chunks)
-                citations = self._citation_verifier.to_citations(verify_result)
-                citation_verification = {
-                    "groundedness_score": verify_result.overall_groundedness_score,
-                    "num_supported": verify_result.num_supported,
-                    "num_total": verify_result.num_total,
-                    "unsupported_claims": verify_result.unsupported_claims,
-                }
-            except Exception as e:
-                logger.warning(f"Citation verification failed in _generate_answer: {e}")
-                citations = self._extract_citations(chunks)
-        else:
-            citations = self._extract_citations(chunks)
-
-        return response, citations, citation_verification
+        citations = self._extract_citations(chunks)
+        return response, citations
 
     async def _direct_generate(self, query: str) -> tuple[str, list[dict]]:
         """直接生成（无需检索）
@@ -482,73 +417,6 @@ class AgenticOrchestrator:
         elif confidence >= 0.3:
             return "low"
         return "insufficient"
-
-    @staticmethod
-    def _collect_spans(trace: dict) -> list[dict]:
-        """
-        把 orchestrator 的 trace dict 转换成 trace_viewer 期望的 spans 列表。
-        每个 span: {name, duration_ms, attrs}
-        """
-        spans = []
-        if "query_rewrite" in trace:
-            qr = trace["query_rewrite"]
-            spans.append({
-                "name": "rag.query_rewrite",
-                "duration_ms": 0.0,  # 不计；偏 detail 时用 OTEL
-                "attrs": {
-                    "was_rewritten": qr.get("was_rewritten", False),
-                    "confidence": qr.get("confidence", 0.0),
-                },
-            })
-        if "routing" in trace:
-            r = trace["routing"]
-            spans.append({
-                "name": "rag.routing",
-                "duration_ms": 0.0,
-                "attrs": {
-                    "complexity": r.get("complexity"),
-                    "confidence": r.get("confidence"),
-                    "approach": r.get("approach"),
-                },
-            })
-        if "retrieval" in trace:
-            ret = trace["retrieval"]
-            spans.append({
-                "name": "rag.retrieval",
-                "duration_ms": ret.get("latency_ms", 0.0),
-                "attrs": {
-                    "strategy": ret.get("strategy"),
-                    "num_chunks": ret.get("num_chunks", 0),
-                },
-            })
-        if "agent" in trace:
-            a = trace["agent"]
-            spans.append({
-                "name": "rag.agentic",
-                "duration_ms": 0.0,
-                "attrs": {
-                    "type": a.get("type"),
-                    "num_iterations": a.get("num_iterations", a.get("num_steps", 0)),
-                    "confidence": a.get("confidence", 0.0),
-                },
-            })
-        if "reflection" in trace:
-            rf = trace["reflection"]
-            spans.append({
-                "name": "rag.self_reflection",
-                "duration_ms": 0.0,
-                "attrs": {
-                    "score": rf.get("score", 0.0),
-                    "needs_correction": rf.get("needs_correction", False),
-                },
-            })
-        if trace.get("cache_hit"):
-            spans.append({
-                "name": "rag.cache_lookup",
-                "duration_ms": 0.0,
-                "attrs": {"cache_hit": True},
-            })
-        return spans
 
     async def run_stream(
         self,

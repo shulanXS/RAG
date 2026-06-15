@@ -20,6 +20,7 @@ query_router.py — 查询复杂度路由器
 
 from __future__ import annotations
 
+import json
 import logging
 from dataclasses import dataclass
 from enum import Enum
@@ -118,51 +119,40 @@ class QueryRouter:
         self._llm = llm_client
         self._threshold = complexity_threshold
 
+    # P2-2: 集中式 approach 映射表 — 3 路径共用，避免 3 套重复逻辑
+    _APPROACH_MAP: dict = {
+        QueryComplexity.SIMPLE: "直接混合检索（BM25 + Dense + RRF + Reranker）",
+        QueryComplexity.MODERATE: "ReAct 推理循环（边推理边检索）",
+        QueryComplexity.COMPLEX: "Plan-and-Execute（先规划再逐步执行）",
+        QueryComplexity.BEYOND_KB: "直接 LLM 生成（无需检索）",
+    }
+
     def route(self, query: str, history: list[dict] | None = None) -> RoutingDecision:
         """
         对查询进行复杂度分类
-
-        Args:
-            query: 用户查询
-            history: 对话历史
-
-        Returns:
-            RoutingDecision: 包含复杂度分类和置信度 + QuerySignals
         """
         # P2-B6: 无论 LLM 是否可用, 都先跑一遍规则 analyzer
-        # (无 LLM 时用 signals.complexity_hint() 兜底)
         from backend.agentic.query_signals import QueryAnalyzer
         signals = QueryAnalyzer().analyze(query)
 
         if self._llm is None:
-            # 无 LLM 时, 用 signals 给的 hint 兜底 (避免无脑 MODERATE)
+            # 无 LLM 时用 signals.complexity_hint() 兜底
             hint = signals.complexity_hint()
             try:
                 complexity = QueryComplexity(hint)
             except ValueError:
                 complexity = QueryComplexity.MODERATE
-            return RoutingDecision(
+            return self._fallback_decision(
                 complexity=complexity,
                 confidence=0.5,
                 reasoning=f"No LLM client; signals-based hint: {hint}",
-                recommended_approach=(
-                    "直接混合检索" if complexity == QueryComplexity.SIMPLE
-                    else "ReAct Agent" if complexity == QueryComplexity.MODERATE
-                    else "Plan-and-Execute"
-                ),
-                original_query=query,
+                query=query,
                 signals=signals,
             )
 
-        history_context = ""
-        if history:
-            history_context = "\n\n对话历史:\n" + "\n".join(
-                f"用户: {h['content']}" if h.get("role") == "user" else f"助手: {h['content']}"
-                for h in history[-2:]
-            )
+        history_context = self._build_history_context(history)
 
         # P2-B6: 把 signals 拼进 LLM prompt, 让 LLM 决策时能参考规则信号
-        # (pronoun / multi-hop / length 等结构化 hint 比纯文本稳)
         signals_context = (
             f"\n\n规则信号 (供参考):\n"
             f"- 包含代词: {signals.has_pronoun}\n"
@@ -186,7 +176,6 @@ class QueryRouter:
 """
 
         try:
-            import json
             response = self._llm.generate(
                 prompt,
                 max_tokens=256,
@@ -198,44 +187,62 @@ class QueryRouter:
             confidence = float(result.get("confidence", 0.5))
             reasoning = result.get("reasoning", "")
 
-            # 映射到枚举
             try:
                 complexity = QueryComplexity(complexity_str)
             except ValueError:
                 complexity = QueryComplexity.MODERATE
 
             # 降级路径: 置信度低于阈值时升级复杂度
-            if confidence < self._threshold and complexity == QueryComplexity.SIMPLE:
-                complexity = QueryComplexity.MODERATE
-                reasoning += " (置信度过低，升级到 MODERATE)"
-            elif confidence < self._threshold and complexity == QueryComplexity.MODERATE:
-                complexity = QueryComplexity.COMPLEX
-                reasoning += " (置信度过低，升级到 COMPLEX)"
-
-            approach_map = {
-                QueryComplexity.SIMPLE: "直接混合检索（BM25 + Dense + RRF + Reranker）",
-                QueryComplexity.MODERATE: "ReAct 推理循环（边推理边检索）",
-                QueryComplexity.COMPLEX: "Plan-and-Execute（先规划再逐步执行）",
-                QueryComplexity.BEYOND_KB: "直接 LLM 生成（无需检索）",
-            }
+            if confidence < self._threshold:
+                if complexity == QueryComplexity.SIMPLE:
+                    complexity = QueryComplexity.MODERATE
+                    reasoning += " (置信度过低，升级到 MODERATE)"
+                elif complexity == QueryComplexity.MODERATE:
+                    complexity = QueryComplexity.COMPLEX
+                    reasoning += " (置信度过低，升级到 COMPLEX)"
 
             return RoutingDecision(
                 complexity=complexity,
                 confidence=confidence,
                 reasoning=reasoning,
-                recommended_approach=approach_map[complexity],
+                recommended_approach=self._APPROACH_MAP[complexity],
                 original_query=query,
                 signals=signals,
             )
 
         except Exception as e:
             logger.warning(f"路由失败: {e}，默认 MODERATE")
-            # P2-B6: 即使 LLM 异常也保留 signals (debug 价值)
-            return RoutingDecision(
+            return self._fallback_decision(
                 complexity=QueryComplexity.MODERATE,
                 confidence=0.0,
                 reasoning=f"路由异常: {e}",
-                recommended_approach="ReAct Agent",
-                original_query=query,
+                query=query,
                 signals=signals,
             )
+
+    def _fallback_decision(
+        self,
+        complexity: QueryComplexity,
+        confidence: float,
+        reasoning: str,
+        query: str,
+        signals,
+    ) -> RoutingDecision:
+        """P2-2: 统一兜底路径 (no-LLM / exception 共用)"""
+        return RoutingDecision(
+            complexity=complexity,
+            confidence=confidence,
+            reasoning=reasoning,
+            recommended_approach=self._APPROACH_MAP.get(complexity, "ReAct Agent"),
+            original_query=query,
+            signals=signals,
+        )
+
+    @staticmethod
+    def _build_history_context(history: list[dict] | None) -> str:
+        if not history:
+            return ""
+        return "\n\n对话历史:\n" + "\n".join(
+            f"用户: {h['content']}" if h.get("role") == "user" else f"助手: {h['content']}"
+            for h in history[-2:]
+        )

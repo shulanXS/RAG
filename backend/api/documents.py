@@ -66,7 +66,11 @@ class DocumentUploadResponse(BaseModel):
     indexing: str = "queued"  # queued | processing | indexed | failed | deduplicated
 
 
-ALLOWED_EXTENSIONS = {".pdf", ".txt", ".md", ".docx", ".csv", ".json", ".html", ".xml"}
+# 文件扩展名白名单统一从 ingestion.document_parser 的 registry 派生
+# （单一来源，添加新格式时只改一处）
+from backend.ingestion.document_parser import _EXTENSION_PARSERS
+
+ALLOWED_EXTENSIONS = frozenset(_EXTENSION_PARSERS.keys())
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
 
 
@@ -78,7 +82,7 @@ def _validate_file(file: UploadFile) -> None:
     if ext not in ALLOWED_EXTENSIONS:
         raise HTTPException(
             status_code=400,
-            detail=f"不支持的文件类型: {ext}。支持的类型: {', '.join(ALLOWED_EXTENSIONS)}",
+            detail=f"不支持的文件类型: {ext}。支持的类型: {', '.join(sorted(ALLOWED_EXTENSIONS))}",
         )
 
 

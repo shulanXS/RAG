@@ -51,13 +51,10 @@ class QuerySignals:
     is_multi_hop: bool = False
     query_length: int = 0
     has_quote: bool = False
-    # 未来扩展点 (P3+: 命名实体识别, 关键词权重, 时间词等)
-    extra: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """OTel attribute / JSON 序列化友好版本"""
-        d = asdict(self)
-        return d
+        return asdict(self)
 
     def complexity_hint(self) -> str:
         """

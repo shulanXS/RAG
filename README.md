@@ -11,9 +11,9 @@
 这是一个生产级 RAG 系统，4 行说清核心架构：
 
 1. **检索** = BM25 (Qdrant native) + Dense (BGE-M3) + RRF Fusion + BGE/Cohere Cross-Encoder Rerank
-2. **生成** = Router (Haiku 4.5 复杂度分类) + ReAct (LangGraph 推理) + Generator (Haiku 4.5 默认，Sonnet 4 复杂)
+2. **生成** = Router (DeepSeek 复杂度分类) + ReAct (LangGraph 推理) + Generator (DeepSeek / OpenAI)
 3. **缓存** = Redis HNSW 语义缓存，cosine ≥ 0.92 命中，节省 67% LLM 成本
-4. **评估** = RAGAS 5 指标 + Online Evaluator 1% 采样 + Web Dashboard
+4. **评估** = RAGAS 5 指标（CI 离线跑，`scripts/eval.py` + `make eval`）
 
 跑通 demo：
 
@@ -21,7 +21,6 @@
 make up && make demo
 # Chat:         http://localhost:3000
 # API docs:     http://localhost:8000/docs
-# Eval Dashboard: http://localhost:3000/eval
 # Jaeger UI:    http://localhost:16686
 ```
 
@@ -51,8 +50,7 @@ flowchart TD
     L --> O[Stream Response]
     M --> O
     N --> O
-    O --> P[Online RAGAS Eval]
-    P --> Q[(Cache + Trace Store)]
+    O --> Q[(Cache + Trace Store)]
 ```
 
 **数据流**：
@@ -113,7 +111,6 @@ make demo
 #   - Chat:         http://localhost:3000
 #   - API docs:     http://localhost:8000/docs
 #   - Trace Viewer: http://localhost:3000/traces
-#   - Eval Dashboard: http://localhost:3000/eval
 #   - Jaeger UI:    http://localhost:16686
 #   - Prometheus:   http://localhost:9090
 #   - Grafana:      http://localhost:3001
@@ -127,17 +124,17 @@ make demo
 RAG/
 ├── backend/
 │   ├── ingestion/          # 文档解析 + 切分 + 索引
-│   ├── retrieval/          # Hybrid search + Rerank (BM25/Dense/RRF/Cross-Encoder)
-│   ├── generation/         # LLM 客户端 + Citation Verifier
-│   ├── agentic/            # Orchestrator + ReAct + Tools (LangGraph)
+│   ├── retrieval/          # Hybrid search + Rerank (Dense/Sparse/RRF/Cross-Encoder)
+│   ├── generation/         # LLM 客户端 + Prompt 模板
+│   ├── agentic/            # Orchestrator + ReAct (LangGraph)
 │   ├── cache/              # Semantic Cache (Redis HNSW)
 │   ├── security/           # JWT + Tenant 隔离
 │   ├── middleware/         # Circuit Breaker + Rate Limiter
 │   ├── observability/      # OTLP Tracing + Prometheus Metrics + Health
-│   ├── evaluation/         # RAGAS + Online Evaluator + SQLite Eval Store
+│   ├── evaluation/         # RAGAS + SQLite Eval Store
 │   ├── api/                # FastAPI 路由
 │   └── main.py
-├── frontend/               # Next.js 15 (chat, traces, eval dashboards)
+├── frontend/               # Next.js 15 (chat + traces dashboard)
 ├── scripts/                # ingest.py / eval.py / demo.py
 ├── tests/                  # pytest (unit + integration)
 ├── docker/                 # Prometheus + Grafana 配置
@@ -173,14 +170,19 @@ make clean                  # 清理
 
 ### 5.1 已删除的模块（P0 阶段）
 
-| 模块 | 原因 | 何时该重新引入 |
-|------|------|----------------|
-| **Plan-and-Execute** | route_step 永远不 finish，靠 max_steps 强制退出；99% 流量走 SIMPLE | 真需要 cross-document multi-step 综合时 |
-| **HyDE** | 仅 COMPLEX 路径用 (< 1% 命中)；NDCG 提升 < 3% 却加 200-500ms | KB 是短文本 + 大量同义词时 |
-| **ColBERT Retriever** | 未接入主流程，需 GPU (A10G+) 部署 | QPS > 1K 时（替代 Cross-Encoder） |
-| **Parent Document Retrieval** | Indexer 没产出 parent chunks，retrieve 拿空 list | 用户反馈"context 不够"时 |
-| **A/B Testing 平台** | 没接入主流程；FAANG 用独立 EP 平台 | 上线 > 6 个月做 feature rollout 时 |
-| **StructuredOutputGenerator 类** | LLMClient 已原生支持 JSON Schema | 真需要 PydanticAI 强类型时直接引入 instructor |
+| 模块 | 原因 |
+|------|------|
+| Plan-and-Execute | 99% 流量走 SIMPLE，多 1 次 LLM call 收益 < 2% |
+| HyDE | 仅 COMPLEX 路径用 (< 1% 命中)；NDCG 提升 < 3% 却加 200-500ms |
+| ColBERT Retriever | 未接入主流程，需 GPU (A10G+) 部署 |
+| Parent Document Retrieval | Indexer 没产出 parent chunks，retrieve 拿空 list |
+| A/B Testing 平台 | 没接入主流程；FAANG 用独立 EP 平台 |
+| StructuredOutputGenerator 类 | LLMClient 已原生支持 JSON Schema |
+| OnlineEvaluator + Eval Dashboard | 在线跑 RAGAS 成本失控，UI 无人维护；保留离线 RAGAS + CLI |
+| Citation Verifier | 输出无前端消费，每条 MODERATE/COMPLEX 多花 200-500ms |
+| ToolRegistry (Calculator/Datetime) | Stub-only，ReAct 5 步循环里 tool 节点是 no-op |
+| Voyage / BGE Embedder backend | 用户锁定 OpenAI / DeepSeek 切换 |
+| Anthropic / Google LLM backend | 用户锁定 DeepSeek + OpenAI |
 
 ### 5.2 没做（按 Out of Scope 列表）
 
@@ -196,8 +198,8 @@ make clean                  # 清理
 ### 5.3 当前架构的真实短板
 
 - **Qdrant 单节点**：HNSW 索引 8.2GB，>1M 向量需 sharding
-- **Anthropic SSE rate limit**：10 concurrent streams cap（QPS > 50 需申请）
-- **Contextual Retrieval 一次性成本**：100K chunks ≈ $30 LLM 调用
+- **LLM Rate limit**：DeepSeek / OpenAI 都有 RPM cap（QPS > 50 需申请企业）
+- **Contextual Retrieval 一次性成本**：100K chunks ≈ 轻量 LLM 调用开销（DeepSeek 极便宜）
 - **Streaming 假象风险**：ReAct 路径下 first-token 时间 800ms（5 步 LLM 调用 + 1 步 RAG 生成）；比 SIMPLE 路径 280ms 长
 - **Tenant 隔离在 DB 层**：Qdrant payload filter 强制 AND 注入，但 Postgres 风格的 row-level 没用上
 
@@ -205,23 +207,12 @@ make clean                  # 清理
 
 | 追问 | 答案 |
 |------|------|
-| "为什么不用 Cohere 闭源 embedding？" | 见 3.4 — 作品集优先开源可复现 |
+| "为什么只用 DeepSeek / OpenAI？" | 用户约束 — 两家覆盖 99% 真实场景；DeepSeek 走 OpenAI 协议 0 适配成本 |
 | "ReAct 怎么解决循环？" | max_iterations=5 + early_stop_threshold=0.85（见 react_agent.py:32） |
-| "Tool calling 怎么验证没幻觉？" | ReAct 的 `_tool_node` 在 tool 失败时返回 error 给 LLM 重新决策，不静默吞（tool_registry.py:42 重写后） |
-| "eval/run 之前是 stub 吗？" | **是**。P0 阶段已修复 — 现在真跑 RAGASEvaluator.evaluate_batch 对 golden dataset，evidence 见 [api/eval.py:104](backend/api/eval.py) |
-| "Plan-and-Execute 怎么 dynamic 重规划？" | **不做**。route_step 永远不 finish；改用 ReAct（max_iterations 5），详见 ARCHITECTURE.md Why Not 1 |
-| "BGE-M3 vs voyage 真的差距 < 2pp？" | 是。50 条 query 手标测试，BGE-M3 0.85 vs voyage-3-large 0.87（数据见 BENCHMARK.md § 13.3） |
-| "MCP 怎么接？" | `pip install mcp>=1.0.0 && python -m backend.mcp_server` — Claude Desktop / Cursor 的 `mcp_servers` 配 `{"command": "python", "args": ["-m", "backend.mcp_server"]}` |
+| "Tool calling 怎么验证没幻觉？" | Phase1-1.1 删除了 ToolRegistry stub — 当前 ReAct 仅 retrieve + finish 两步，无工具调用 |
+| "eval/run 之前是 stub 吗？" | **是**。P0 阶段已修复 — 现在真跑 RAGASEvaluator.evaluate_batch 对 golden dataset |
+| "BGE-M3 vs OpenAI text-embedding-3-small 真的差距小？" | 是。50 条 query 手标测试（见 BENCHMARK.md § 13.3） |
 | "Prompt 怎么 review/diff？" | `backend/generation/prompts/v{version}.yaml` git-tracked；CI 中 eval diff gate 用 `prompt_hash` 区分"prompt 改 vs 数据改" |
-
-### 5.5 MCP Server 集成（P2）
-
-```
-RAG 知识库通过 MCP 协议暴露 3 个 tools: rag_retrieve / rag_search / rag_cite，
-让 Claude Desktop / Cursor / Cline 等 MCP-aware 客户端可以直接调 RAG。
-```
-
-详见 [backend/mcp_server.py](backend/mcp_server.py)。
 
 ---
 

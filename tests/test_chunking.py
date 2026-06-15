@@ -1,6 +1,7 @@
 """
 test_chunking.py — 分块策略单元测试
 ================================================================================
+P1-3: HierarchicalChunker / SemanticChunker 已删除（仅保留 RecursiveChunker）。
 """
 
 import pytest
@@ -8,7 +9,6 @@ from backend.ingestion.chunker import (
     Chunk,
     ChunkResult,
     RecursiveChunker,
-    HierarchicalChunker,
     count_tokens,
 )
 
@@ -61,30 +61,6 @@ class TestRecursiveChunker:
             assert c.doc_id == "doc_123"
             assert c.section_path == "第一章/第一节"
             assert c.chunk_index >= 0
-
-
-class TestHierarchicalChunker:
-    """层级分块策略测试"""
-
-    def test_heading_extraction(self):
-        """标题层级识别测试"""
-        chunker = HierarchicalChunker(chunk_size=200, min_chunk_size=20, heading_levels=[1, 2])
-
-        # text_units 是已按 \\n\\n 切分的段; 标题必须在段内
-        # 段落要够长 (>20 tokens) 才会被产出, 否则会合并到前一个或被丢弃
-        text_units = [
-            "# 第一章\n这是第一章的内容。本章将详细介绍 RAG 系统的第一个核心组件即文档解析模块的工作原理、关键算法选择以及在生产环境中常见的优化技巧和性能瓶颈分析。",
-            "## 第一节\n这是第一节的详细内容。本节会深入讨论 RAG 系统的第二个核心组件即混合检索模块的 BM25 算法与向量检索算法的融合策略与权重调优。",
-            "# 第二章\n这是第二章的内容。本章聚焦 RAG 系统的第三个核心组件即 LLM 生成模块的 prompt 工程、结构化输出约束、引用标注机制和置信度评估方法。",
-        ]
-        chunks = chunker.split(text_units, "test_hier", {"headings": []})
-
-        # 应该有至少 2 个 chunks
-        assert len(chunks) >= 2
-
-        # 检查 section_path 是否被正确填充
-        paths = [c.section_path for c in chunks]
-        assert any("第一章" in p for p in paths)
 
 
 class TestTokenCounting:

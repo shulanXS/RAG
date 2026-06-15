@@ -267,81 +267,6 @@ class HealthChecker:
                 details={"redis": "unknown_error"},
             )
 
-    async def check_llm(self) -> HealthStatus:
-        """
-        检查 LLM API 健康状态
-
-        检查方式: 发送一个轻量请求（如 list models 或短文本完成）
-
-        超时处理: 5s 超时视为不可用
-
-        注意: LLM API 检查是可选的，配置了 llm_api_base 才执行
-        """
-        if not self._llm_api_base:
-            return HealthStatus(
-                status=HealthState.DEGRADED,
-                latency_ms=0.0,
-                error="LLM API base not configured",
-                details={"llm": "not_configured"},
-            )
-
-        start = time.perf_counter()
-
-        try:
-            async with httpx.AsyncClient(timeout=self._check_timeout) as client:
-                # 尝试获取 models 列表（标准 OpenAI-compatible API）
-                response = await client.get(
-                    f"{self._llm_api_base}/v1/models",
-                    headers={"Authorization": "Bearer dummy"},
-                )
-
-                latency_ms = (time.perf_counter() - start) * 1000
-
-                if response.status_code in (200, 401, 403):
-                    # 401/403 表示 API 可达但认证失败，这也是"健康"的（API 活着）
-                    return HealthStatus(
-                        status=HealthState.HEALTHY,
-                        latency_ms=latency_ms,
-                        details={"llm": "connected"},
-                    )
-                else:
-                    return HealthStatus(
-                        status=HealthState.DEGRADED,
-                        latency_ms=latency_ms,
-                        error=f"LLM API returned status {response.status_code}",
-                        details={"llm": "error"},
-                    )
-
-        except httpx.TimeoutException:
-            latency_ms = (time.perf_counter() - start) * 1000
-            logger.warning(f"LLM API 健康检查超时: {self._llm_api_base}")
-            return HealthStatus(
-                status=HealthState.UNHEALTHY,
-                latency_ms=latency_ms,
-                error="Timeout connecting to LLM API",
-                details={"llm": "timeout"},
-            )
-
-        except httpx.ConnectError as e:
-            latency_ms = (time.perf_counter() - start) * 1000
-            logger.warning(f"LLM API 连接失败: {e}")
-            return HealthStatus(
-                status=HealthState.UNHEALTHY,
-                latency_ms=latency_ms,
-                error=f"Cannot connect to LLM API: {str(e)[:100]}",
-                details={"llm": "connection_error"},
-            )
-
-        except Exception as e:
-            latency_ms = (time.perf_counter() - start) * 1000
-            logger.error(f"LLM API 健康检查异常: {e}")
-            return HealthStatus(
-                status=HealthState.DEGRADED,
-                latency_ms=latency_ms,
-                error=str(e)[:200],
-                details={"llm": "unknown_error"},
-            )
-
     # -------------------------------------------------------------------------
     # Aggregate Health Checks
     # -------------------------------------------------------------------------
@@ -365,7 +290,7 @@ class HealthChecker:
         """
         Readiness 检查（Kubernetes readiness probe）
 
-        检查所有依赖：Qdrant、Redis、LLM API
+        检查核心依赖：Qdrant、Redis
 
         技术决策:
         - 使用 asyncio.gather 并发执行所有检查
@@ -378,13 +303,11 @@ class HealthChecker:
         results = await asyncio.gather(
             self.check_qdrant(),
             self.check_redis(),
-            self.check_llm(),
             return_exceptions=True,
         )
 
         qdrant_status = results[0] if not isinstance(results[0], Exception) else None
         redis_status = results[1] if not isinstance(results[1], Exception) else None
-        llm_status = results[2] if not isinstance(results[2], Exception) else None
 
         # 解析异常
         if isinstance(results[0], Exception):
@@ -401,18 +324,11 @@ class HealthChecker:
                 error=str(results[1])[:200],
                 details={"redis": "exception"},
             )
-        if isinstance(results[2], Exception):
-            llm_status = HealthStatus(
-                status=HealthState.UNHEALTHY,
-                latency_ms=0.0,
-                error=str(results[2])[:200],
-                details={"llm": "exception"},
-            )
 
         total_latency_ms = (time.perf_counter() - start) * 1000
 
         # 聚合状态判断
-        overall_status = self._aggregate_status(qdrant_status, redis_status, llm_status)
+        overall_status = self._aggregate_status(qdrant_status, redis_status)
 
         return HealthStatus(
             status=overall_status,
@@ -421,7 +337,6 @@ class HealthChecker:
                 "dependencies": {
                     "qdrant": qdrant_status.to_dict() if qdrant_status else None,
                     "redis": redis_status.to_dict() if redis_status else None,
-                    "llm": llm_status.to_dict() if llm_status else None,
                 }
             },
         )
@@ -430,7 +345,6 @@ class HealthChecker:
         self,
         qdrant: HealthStatus | None,
         redis: HealthStatus | None,
-        llm: HealthStatus | None,
     ) -> HealthState:
         """
         聚合多个依赖的健康状态
@@ -438,10 +352,6 @@ class HealthChecker:
         规则:
         - Qdrant 是核心依赖：必须 healthy 或 degraded
         - Redis 可选：可用性降级不影响整体健康
-        - LLM 可选：API 不可用时可降级服务
-
-        Returns:
-            HealthState: 聚合后的整体状态
         """
         if qdrant and qdrant.status == HealthState.UNHEALTHY:
             return HealthState.UNHEALTHY
@@ -449,7 +359,7 @@ class HealthChecker:
         # 检查是否有任何 healthy 依赖
         all_degraded = all(
             s and s.status in (HealthState.DEGRADED, HealthState.UNHEALTHY)
-            for s in [qdrant, redis, llm]
+            for s in [qdrant, redis]
         )
         if all_degraded:
             return HealthState.UNHEALTHY
@@ -457,7 +367,7 @@ class HealthChecker:
         # 有 degraded 状态
         has_degraded = any(
             s and s.status == HealthState.DEGRADED
-            for s in [qdrant, redis, llm]
+            for s in [qdrant, redis]
         )
         if has_degraded:
             return HealthState.DEGRADED
@@ -522,37 +432,5 @@ def reset_health_checker() -> None:
 
 
 # =============================================================================
-# 5. FastAPI Dependency (for dependency injection)
+# 5. FastAPI 端点统一在 backend/api/health.py，模块层不再提供便捷函数
 # =============================================================================
-
-
-async def get_liveness() -> dict[str, Any]:
-    """
-    FastAPI liveness endpoint handler
-
-    用法:
-        from fastapi import FastAPI
-        from backend.observability.health import get_liveness
-
-        app = FastAPI()
-        app.add_api_route("/health", get_liveness, methods=["GET"])
-    """
-    checker = HealthChecker()
-    result = await checker.get_liveness()
-    return result.to_dict()
-
-
-async def get_readiness() -> dict[str, Any]:
-    """
-    FastAPI readiness endpoint handler
-
-    用法:
-        from fastapi import FastAPI
-        from backend.observability.health import get_readiness
-
-        app = FastAPI()
-        app.add_api_route("/ready", get_readiness, methods=["GET"])
-    """
-    checker = HealthChecker()
-    result = await checker.get_readiness()
-    return result.to_dict()

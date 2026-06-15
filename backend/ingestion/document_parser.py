@@ -78,226 +78,152 @@ class DocumentParser(Protocol):
 
 
 # =============================================================================
-# 3. 具体解析器实现
+# 3. 解析器实现 (P2-3: 合并 4 个 class 为 registry + 顶层委托)
 # =============================================================================
 
 
-class PDFParser:
+def _read_text_fallback_enc(fp: Path) -> str:
+    """优先 UTF-8 读文本，失败回退 GBK"""
+    try:
+        return fp.read_text(encoding="utf-8")
+    except UnicodeDecodeError:
+        logger.warning(f"使用 GBK 编码读取 [{fp}]")
+        return fp.read_text(encoding="gbk")
+
+
+def _parse_pdf(fp: Path, doc_id: str) -> ParsedDocument | None:
     """
-    PDF 解析器 — 使用 unstructured 库
-
-    技术决策:
-    - primary: unstructured（综合最强，自动检测表格/图片）
-    - fallback: pypdf（更轻量，适合纯文字 PDF）
-    - 表格处理: unstructured 的 table_as_cells 可以把表格转为 Markdown 格式，
-      保证 chunker 能按行/列语义切分。
+    PDF 解析 — primary: unstructured，fallback: pypdf
     """
-
-    def supports(self, file_path: Path) -> bool:
-        suffix = file_path.suffix.lower()
-        return suffix in {".pdf"}
-
-    def parse(self, file_path: Path) -> ParsedDocument | None:
-        doc_id = _gen_doc_id(file_path)
-        try:
-            # 优先使用 unstructured
-            return self._parse_with_unstructured(file_path, doc_id)
-        except Exception as e:
-            logger.warning(f"unstructured 解析 PDF 失败 [{file_path}]，fallback 到 pypdf: {e}")
-            try:
-                return self._parse_with_pypdf(file_path, doc_id)
-            except Exception as e2:
-                logger.error(f"pypdf 解析也失败 [{file_path}]: {e2}")
-                return None
-
-    def _parse_with_unstructured(self, fp: Path, doc_id: str) -> ParsedDocument:
+    try:
         from unstructured.partition.pdf import partition_pdf
 
-        # unstructured 的 partition_pdf 自动处理：
-        # - 文字提取（pypdf/mupdf backend）
-        # - 表格结构识别（table_as_cells=True 转 Markdown）
-        # - 图片描述（captioning 可选，但对 RAG 意义不大）
         elements = partition_pdf(
             filename=str(fp),
-            strategy="hi_res",  # 优先高精度（含表格检测）
+            strategy="hi_res",
             infer_table_structure=True,
-            languages=["eng", "chi"],  # 支持中英文
+            languages=["eng", "chi"],
         )
-
         text_units = [str(el) for el in elements if el.text.strip()]
         content = "\n\n".join(text_units)
-        title = _extract_title_from_content(content) or fp.stem
-
-        metadata = {
-            "parser": "unstructured",
-            "num_elements": len(elements),
-            "file_size_bytes": fp.stat().st_size,
-        }
         return ParsedDocument(
             doc_id=doc_id,
             source_path=str(fp),
-            title=title,
-            content=content,
-            text_units=text_units,
-            metadata=metadata,
-        )
-
-    def _parse_with_pypdf(self, fp: Path, doc_id: str) -> ParsedDocument | None:
-        import pypdf
-
-        reader = pypdf.PdfReader(str(fp))
-        pages: list[str] = []
-        for page in reader.pages:
-            text = page.extract_text()
-            if text:
-                pages.append(text.strip())
-
-        content = "\n\n".join(pages)
-        title = _extract_title_from_content(content) or fp.stem
-        text_units = [p for p in pages if p.strip()]
-
-        return ParsedDocument(
-            doc_id=doc_id,
-            source_path=str(fp),
-            title=title,
-            content=content,
-            text_units=text_units,
-            metadata={"parser": "pypdf", "num_pages": len(reader.pages)},
-        )
-
-
-class DOCXParser:
-    """
-    DOCX 解析器
-
-    技术决策:
-    - 为什么不用 python-docx 的段落 API ?
-      → python-docx 的 paragraph.text 按行读取，会丢失标题层级信息。
-        使用 python-docx 的 XML 底层接口可以保留 Heading 样式。
-      - 更优方案: unstructured 对 docx 支持已经很好，直接用它。
-    """
-
-    def supports(self, file_path: Path) -> bool:
-        suffix = file_path.suffix.lower()
-        return suffix in {".docx", ".doc"}
-
-    def parse(self, file_path: Path) -> ParsedDocument | None:
-        doc_id = _gen_doc_id(file_path)
-        try:
-            from unstructured.partition.docx import partition_docx
-
-            elements = partition_docx(filename=str(file_path))
-            text_units = [str(el) for el in elements if el.text.strip()]
-            content = "\n\n".join(text_units)
-            title = _extract_title_from_content(content) or file_path.stem
-
-            return ParsedDocument(
-                doc_id=doc_id,
-                source_path=str(file_path),
-                title=title,
-                content=content,
-                text_units=text_units,
-                metadata={"parser": "unstructured", "num_elements": len(elements)},
-            )
-        except Exception as e:
-            logger.error(f"DOCX 解析失败 [{file_path}]: {e}")
-            return None
-
-
-class MarkdownParser:
-    """
-    Markdown 解析器
-
-    技术要点:
-    - Markdown 解析的核心挑战是提取标题层级关系（# ## ###）
-    - 使用正则提取标题行，构建 section_path，供 hierarchical chunker 使用
-    - 保留完整 Markdown 格式（代码块、列表等），因为 embedding 模型
-      可以理解 Markdown 语法。
-    """
-
-    def supports(self, file_path: Path) -> bool:
-        suffix = file_path.suffix.lower()
-        return suffix in {".md", ".markdown", ".mdown"}
-
-    def parse(self, file_path: Path) -> ParsedDocument | None:
-        try:
-            content = file_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            content = file_path.read_text(encoding="gbk")
-            logger.warning(f"使用 GBK 编码读取 [{file_path}]")
-
-        doc_id = _gen_doc_id(file_path)
-        title = _extract_title_from_content(content) or file_path.stem
-
-        # 按空行拆分段落（保留 Markdown 格式）
-        text_units = [p.strip() for p in content.split("\n\n") if p.strip()]
-
-        # 提取标题层级路径
-        heading_lines = [
-            line.strip() for line in content.split("\n")
-            if line.strip().startswith("#")
-        ]
-        headings = _extract_headings(content)
-
-        return ParsedDocument(
-            doc_id=doc_id,
-            source_path=str(file_path),
-            title=title,
+            title=_extract_title_from_content(content) or fp.stem,
             content=content,
             text_units=text_units,
             metadata={
-                "parser": "markdown",
-                "headings": headings,
-                "heading_lines": heading_lines,
+                "parser": "unstructured",
+                "num_elements": len(elements),
+                "file_size_bytes": fp.stat().st_size,
             },
         )
-
-
-class HTMLParser:
-    """
-    HTML 解析器
-
-    技术要点:
-    - 使用 html2text 将 HTML 转为 Markdown（保留基础格式）
-    - 去除脚本和样式（html2text 自动处理）
-    - 标题从 <h1>-<h6> 标签提取
-    """
-
-    def supports(self, file_path: Path) -> bool:
-        suffix = file_path.suffix.lower()
-        return suffix in {".html", ".htm"}
-
-    def parse(self, file_path: Path) -> ParsedDocument | None:
+    except Exception as e:
+        logger.warning(f"unstructured 解析 PDF 失败 [{fp}]，fallback 到 pypdf: {e}")
         try:
-            import html2text
-        except ImportError:
-            logger.error("需要安装 html2text: pip install html2text")
+            import pypdf
+
+            reader = pypdf.PdfReader(str(fp))
+            pages = [p.extract_text().strip() for p in reader.pages if p.extract_text()]
+            content = "\n\n".join(pages)
+            return ParsedDocument(
+                doc_id=doc_id,
+                source_path=str(fp),
+                title=_extract_title_from_content(content) or fp.stem,
+                content=content,
+                text_units=[p for p in pages if p.strip()],
+                metadata={"parser": "pypdf", "num_pages": len(reader.pages)},
+            )
+        except Exception as e2:
+            logger.error(f"pypdf 解析也失败 [{fp}]: {e2}")
             return None
 
-        try:
-            html_content = file_path.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            html_content = file_path.read_text(encoding="gbk")
 
-        h = html2text.HTML2Text()
-        h.ignore_links = False
-        h.ignore_images = True
-        content = h.handle(html_content)
-        content = content.strip()
+def _parse_docx(fp: Path, doc_id: str) -> ParsedDocument | None:
+    """DOCX 解析 — 用 unstructured.partition.docx 保留 Heading 样式"""
+    try:
+        from unstructured.partition.docx import partition_docx
 
-        doc_id = _gen_doc_id(file_path)
-        title = _extract_title_from_content(content) or file_path.stem
-
-        text_units = [p.strip() for p in content.split("\n\n") if p.strip()]
-
+        elements = partition_docx(filename=str(fp))
+        text_units = [str(el) for el in elements if el.text.strip()]
+        content = "\n\n".join(text_units)
         return ParsedDocument(
             doc_id=doc_id,
-            source_path=str(file_path),
-            title=title,
+            source_path=str(fp),
+            title=_extract_title_from_content(content) or fp.stem,
             content=content,
             text_units=text_units,
-            metadata={"parser": "html2text"},
+            metadata={"parser": "unstructured", "num_elements": len(elements)},
         )
+    except Exception as e:
+        logger.error(f"DOCX 解析失败 [{fp}]: {e}")
+        return None
+
+
+def _parse_markdown(fp: Path, doc_id: str) -> ParsedDocument | None:
+    """Markdown 解析 — 纯文本 + 提取 heading 层级"""
+    content = _read_text_fallback_enc(fp)
+    text_units = [p.strip() for p in content.split("\n\n") if p.strip()]
+    heading_lines = [
+        line.strip() for line in content.split("\n")
+        if line.strip().startswith("#")
+    ]
+    return ParsedDocument(
+        doc_id=doc_id,
+        source_path=str(fp),
+        title=_extract_title_from_content(content) or fp.stem,
+        content=content,
+        text_units=text_units,
+        metadata={
+            "parser": "markdown",
+            "headings": _extract_headings(content),
+            "heading_lines": heading_lines,
+        },
+    )
+
+
+def _parse_html(fp: Path, doc_id: str) -> ParsedDocument | None:
+    """HTML 解析 — html2text 转 Markdown"""
+    try:
+        import html2text
+    except ImportError:
+        logger.error("需要安装 html2text: pip install html2text")
+        return None
+
+    html_content = _read_text_fallback_enc(fp)
+    h = html2text.HTML2Text()
+    h.ignore_links = False
+    h.ignore_images = True
+    content = h.handle(html_content).strip()
+
+    text_units = [p.strip() for p in content.split("\n\n") if p.strip()]
+    return ParsedDocument(
+        doc_id=doc_id,
+        source_path=str(fp),
+        title=_extract_title_from_content(content) or fp.stem,
+        content=content,
+        text_units=text_units,
+        metadata={"parser": "html2text"},
+    )
+
+
+# 顶层委托：扩展名 → 解析器函数 的注册表
+# P2-3: 4 个 class 合并为 1 个注册表，新增格式只需 add 一条
+_EXTENSION_PARSERS: dict[str, "callable"] = {
+    ".pdf": _parse_pdf,
+    ".docx": _parse_docx,
+    ".doc": _parse_docx,
+    ".md": _parse_markdown,
+    ".markdown": _parse_markdown,
+    ".mdown": _parse_markdown,
+    ".html": _parse_html,
+    ".htm": _parse_html,
+}
+
+
+# Phase1-1.11: 4 个薄 class 包装（PDFParser / DOCXParser / MarkdownParser / HTMLParser）
+# 与 register_parser() 公开 API 已被 registry + DocumentParserFactory.parse_file 取代，
+# 0 外部调用方，删除以减少表面积。
 
 
 # =============================================================================
@@ -315,32 +241,24 @@ class DocumentParserFactory:
     - 解析器优先级: unstructured (综合最强) > 专用库 (轻量 fallback)
     """
 
-    _parsers: list[DocumentParser] = [
-        MarkdownParser(),
-        HTMLParser(),
-        DOCXParser(),
-        PDFParser(),
-    ]
-
     @classmethod
     def parse_file(cls, file_path: Path) -> ParsedDocument | None:
         """
         使用合适解析器解析单个文件。
 
-        技术要点:
-        - 按优先级遍历解析器列表，第一个支持的即为处理解析器。
-        - 这意味着如果同时支持 MarkdownParser 和通用 parser，
-          更专门的 parser 应该放在前面。
+        P2-3: 顶层委托 — 通过 _EXTENSION_PARSERS registry 查表，
+        替代原 4-class 遍历。
         """
-        for parser in cls._parsers:
-            if parser.supports(file_path):
-                result = parser.parse(file_path)
-                if result is not None:
-                    logger.info(f"成功解析: {file_path.name} (parser={result.metadata.get('parser')})")
-                    return result
-                # 如果 parser 支持但返回 None，继续尝试下一个
-        logger.warning(f"没有支持的解析器: {file_path}")
-        return None
+        ext = file_path.suffix.lower()
+        parser_fn = _EXTENSION_PARSERS.get(ext)
+        if parser_fn is None:
+            logger.warning(f"没有支持的解析器: {file_path}")
+            return None
+
+        result = parser_fn(file_path, _gen_doc_id(file_path))
+        if result is not None:
+            logger.info(f"成功解析: {file_path.name} (parser={result.metadata.get('parser')})")
+        return result
 
     @classmethod
     def parse_directory(
@@ -358,10 +276,10 @@ class DocumentParserFactory:
         Returns:
             成功解析的文档列表
         """
-        SUPPORTED_EXTS = {".pdf", ".docx", ".doc", ".md", ".markdown", ".mdown", ".html", ".htm"}
-
+        # P2-3: 顶层委托 — 用 registry keys 作为 SUPPORTED_EXTS，
+        # 新扩展名只需 register_parser() 一行
         pattern = "**/*" if recursive else "*"
-        files = [f for f in directory.glob(pattern) if f.suffix.lower() in SUPPORTED_EXTS]
+        files = [f for f in directory.glob(pattern) if f.suffix.lower() in _EXTENSION_PARSERS]
 
         results: list[ParsedDocument] = []
         dedup = get_global_deduplicator()

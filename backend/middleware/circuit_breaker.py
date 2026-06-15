@@ -49,6 +49,7 @@ class CircuitBreakerStats:
     failed_calls: int = 0
     state: CircuitState = CircuitState.CLOSED
     last_failure_time: float = 0.0
+    last_state_change: float = 0.0
     consecutive_failures: int = 0
     consecutive_successes: int = 0
 

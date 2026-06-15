@@ -45,7 +45,6 @@ class ReActState(TypedDict, total=False):
     - confidence: 当前置信度
     - error: 错误信息
     - trace: 推理轨迹（用于展示和 debug）
-    - tool_observations: 工具执行结果列表 (P1-B8: 修复 LLM 看不到工具结果)
     """
     query: str
     rewritten_query: str
@@ -59,7 +58,6 @@ class ReActState(TypedDict, total=False):
     confidence: float
     error: str | None
     trace: list[dict]
-    tool_observations: list[str]
 
 
 # =============================================================================
@@ -241,7 +239,6 @@ class ReActAgent:
         retrieval_fn=None,
         max_iterations: int = 5,
         early_stop_threshold: float = 0.85,
-        tool_registry=None,
     ):
         """
         Args:
@@ -249,13 +246,11 @@ class ReActAgent:
             retrieval_fn: 检索函数，签名为 async def(query) -> list[chunks]
             max_iterations: 最大迭代次数
             early_stop_threshold: 置信度阈值，达到此值则提前退出
-            tool_registry: ToolRegistry 实例 (P2.4: 真接入多工具)
         """
         self._llm = llm_client
         self._retrieve_fn = retrieval_fn
         self._max_iters = max_iterations
         self._early_stop = early_stop_threshold
-        self._tool_registry = tool_registry
 
         self._current_chunks: list[dict] = []
         self._trace: list[dict] = []
@@ -282,7 +277,6 @@ class ReActAgent:
         # 添加节点
         graph.add_node("think", self._think_node)
         graph.add_node("retrieve", self._retrieve_node)
-        graph.add_node("tool", self._tool_node)
         graph.add_node("finish", self._finish_node)
         graph.add_node("max_iter", self._max_iter_node)
 
@@ -290,7 +284,7 @@ class ReActAgent:
         graph.set_entry_point("think")
 
         # 条件边: think → ?
-        def route_action(state: ReActState) -> Literal["retrieve", "tool", "finish", "max_iter"]:
+        def route_action(state: ReActState) -> Literal["retrieve", "finish", "max_iter"]:
             action = state.get("action", "think")
             iters = state.get("iterations", 0)
 
@@ -298,8 +292,6 @@ class ReActAgent:
                 return "finish"
             elif action == "retrieve" and iters < self._max_iters:
                 return "retrieve"
-            elif action == "tool_call" and iters < self._max_iters:
-                return "tool"
             elif iters >= self._max_iters:
                 return "max_iter"
             else:
@@ -310,7 +302,6 @@ class ReActAgent:
             route_action,
             {
                 "retrieve": "retrieve",
-                "tool": "tool",
                 "finish": "finish",
                 "max_iter": "max_iter",
                 "think": "think",  # 如果 action=think，继续 think
@@ -319,7 +310,6 @@ class ReActAgent:
 
         # 固定边
         graph.add_edge("retrieve", "think")
-        graph.add_edge("tool", "think")
         graph.add_edge("max_iter", "finish")
         graph.add_edge("finish", END)
 
@@ -356,7 +346,6 @@ class ReActAgent:
             "confidence": 0.0,
             "error": None,
             "trace": [],
-            "tool_observations": [],
         }
 
         try:
@@ -404,7 +393,6 @@ class ReActAgent:
             "confidence": 0.0,
             "error": None,
             "trace": [],
-            "tool_observations": [],
         }
 
         # 用 LangGraph 的 astream() 捕获节点级事件；
@@ -475,27 +463,9 @@ class ReActAgent:
 
         iters = state.get("iterations", 0)
         context = self._format_context(state.get("retrieved_chunks", []))
-        # P1-B8: 注入工具执行结果，让 LLM 在 think 时能看到之前 tool_call 的输出
-        observations = state.get("tool_observations", []) or []
-        obs_text = (
-            "\n".join(f"[obs{i+1}] {o}" for i, o in enumerate(observations))
-            if observations
-            else "(暂无工具结果)"
-        )
 
-        # P2.4: 动态注入 ToolRegistry 的 schema
-        if self._tool_registry is not None:
-            try:
-                import json
-                tool_schemas = json.dumps(
-                    self._tool_registry.get_tool_schemas(),
-                    ensure_ascii=False,
-                    indent=2,
-                )
-            except Exception:
-                tool_schemas = "(tool schemas unavailable)"
-        else:
-            tool_schemas = "- retrieve(query): 检索知识库"
+        # P0-3: ToolRegistry 工具已删除（calculator/datetime）。ReAct 仅用 retrieve + finish。
+        tool_schemas = "- retrieve(query): 检索知识库"
 
         user_prompt = REACT_USER_PROMPT.format(
             query=state.get("rewritten_query", state.get("query", "")),
@@ -503,7 +473,7 @@ class ReActAgent:
             max_iterations=self._max_iters,
             confidence=state.get("confidence", 0.0),
             context=context or "(暂无上下文，请检索)",
-            observations=obs_text,
+            observations="(暂无工具结果)",
         )
 
         prompt = f"{REACT_SYSTEM_PROMPT.format(max_iterations=self._max_iters, early_stop_threshold=self._early_stop, tool_schemas=tool_schemas)}\n\n{user_prompt}"
@@ -572,54 +542,29 @@ class ReActAgent:
 
     async def _tool_node(self, state: ReActState) -> dict:
         """
-        P2.4: 工具执行节点 - 调用 calculator / datetime 等。
-        P1-B8: 修复 — 工具结果写入 `tool_observations` (state 一等字段)，
-        让后续 think 节点和 finish 节点真正能看到结果。
-        旧实现写 memory_bank_summary，但 _format_context 不读它。
+        P0-3: Tool 节点降级为 no-op。
+
+        原行为：调用 calculator / datetime 等工具。
+        现行为：保留 LangGraph 节点（不影响 routing），但实际不执行任何 tool
+                —— ReAct LLM 即使决定 action=tool_call 也会被 no-op 兜底。
+                待未来真工具接入时，恢复 `execute_by_name` 调用。
         """
-        if self._tool_registry is None:
-            return {"reasoning": state.get("reasoning", "") + "\n[no tool registry]"}
-        tool_name = state.get("tool_name", "")
-        tool_args = state.get("tool_args", {})
-        if not tool_name:
-            return {"reasoning": state.get("reasoning", "") + "\n[tool_name missing]"}
-        try:
-            result = await self._tool_registry.execute_by_name(tool_name, tool_args)
-            obs = result.result if result.success else f"ERROR: {result.error}"
-            obs_text = (
-                f"Tool {tool_name} → {obs}" if not isinstance(obs, str)
-                else f"Tool {tool_name} → {obs[:500]}"
-            )
-            # P1-B8: 写入 tool_observations，think/finish 节点会读它
-            prev = state.get("tool_observations", []) or []
-            return {
-                "tool_observations": [*prev, obs_text],
-                "reasoning": state.get("reasoning", "") + f"\n[tool: {tool_name}]",
-            }
-        except Exception as e:
-            logger.warning(f"工具执行异常: {tool_name}: {e}")
-            return {"reasoning": state.get("reasoning", "") + f"\n[tool error: {e}]"}
+        logger.debug("ReAct tool node reached but no tools registered (P0-3).")
+        return {}
 
     async def _finish_node(self, state: ReActState) -> dict:
-        """生成节点: 基于收集的上下文生成最终答案。
-        P1-B8: 注入 tool_observations，让 final answer 能引用工具结果。
-        """
+        """生成节点: 基于收集的上下文生成最终答案。"""
         context = self._format_context(state.get("retrieved_chunks", []))
-        observations = state.get("tool_observations", []) or []
-        obs_text = "\n".join(f"- {o}" for o in observations) if observations else "(无)"
         query = state.get("rewritten_query", state.get("query", ""))
 
         if self._llm is None:
             answer = f"基于检索结果，无法给出精确答案。请提供更多信息。"
             return {"final_answer": answer}
 
-        prompt = f"""你是一个企业知识助手。请基于以下检索到的上下文信息和工具执行结果回答用户问题。
+        prompt = f"""你是一个企业知识助手。请基于以下检索到的上下文信息回答用户问题。
 
 检索到的上下文:
 {context}
-
-工具执行结果 (P1-B8: 此前的 tool_call 输出，例如 calculator / datetime):
-{obs_text}
 
 用户问题: {query}
 

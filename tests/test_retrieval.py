@@ -1,29 +1,51 @@
 """
 test_retrieval.py — 检索链路测试
+================================================================================
+P0-7: BM25Retriever / BM25Result 已删除。RRF 测试中的 bm25_results 改用
+types.SimpleNamespace 作为属性访问的最小替身（fusion.fuse 用 result.chunk_id
+等属性访问；dict 会触发 AttributeError）。
 """
+from __future__ import annotations
+
+from types import SimpleNamespace
 
 import pytest
 from backend.retrieval.fusion import (
-    RRFFusion,
     DynamicRRFFusion,
     DEFAULT_K_BY_COMPLEXITY,
     FusionResult,
 )
-from backend.retrieval.bm25_retriever import BM25Result
 from backend.retrieval.vector_retriever import VectorSearchResult
 
 
+def _bm25_result(chunk_id, doc_id, score, rank, text="", metadata=None):
+    """BM25Result 字段的 SimpleNamespace 替身（P0-7: BM25Result 类已删除）"""
+    return SimpleNamespace(
+        chunk_id=chunk_id,
+        doc_id=doc_id,
+        score=score,
+        rank=rank,
+        text=text,
+        metadata=metadata or {},
+    )
+
+
+def _make_fuser(k=60):
+    """Phase1-1.6: RRFFusion 已合并到 DynamicRRFFusion 内联 RRF。"""
+    return DynamicRRFFusion(k_default=k)
+
+
 class TestRRFFusion:
-    """RRF 融合测试"""
+    """RRF 融合测试（Phase1-1.6 合并到 DynamicRRFFusion）"""
 
     def test_basic_fusion(self):
         """基础融合测试"""
-        fusion = RRFFusion(k=60)
+        fusion = _make_fuser()
 
         bm25_results = [
-            BM25Result(chunk_id="c1", doc_id="d1", score=5.0, rank=1, text="text1", metadata={}),
-            BM25Result(chunk_id="c2", doc_id="d1", score=3.0, rank=2, text="text2", metadata={}),
-            BM25Result(chunk_id="c3", doc_id="d2", score=4.0, rank=3, text="text3", metadata={}),
+            _bm25_result("c1", "d1", 5.0, 1, "text1"),
+            _bm25_result("c2", "d1", 3.0, 2, "text2"),
+            _bm25_result("c3", "d2", 4.0, 3, "text3"),
         ]
 
         dense_results = [
@@ -42,7 +64,7 @@ class TestRRFFusion:
 
     def test_single_source_fusion(self):
         """单路融合测试"""
-        fusion = RRFFusion(k=60)
+        fusion = _make_fuser()
 
         results = [
             VectorSearchResult(chunk_id="c1", doc_id="d1", score=0.95, rank=1, text="text1", section_path="", metadata={}),
@@ -55,7 +77,7 @@ class TestRRFFusion:
 
     def test_rrf_scoring(self):
         """RRF 得分计算测试"""
-        fusion = RRFFusion(k=60)
+        fusion = _make_fuser()
 
         # 两路都排第一的文档应该得分最高
         top_results = [
@@ -73,29 +95,8 @@ class TestRRFFusion:
         assert fused[0].fused_score > fused[-1].fused_score
 
 
-class TestBM25Result:
-    """BM25 结果数据结构测试"""
-
-    def test_bm25_result_creation(self):
-        """BM25 结果创建测试"""
-        result = BM25Result(
-            chunk_id="test_chunk",
-            doc_id="test_doc",
-            score=5.5,
-            rank=1,
-            text="This is test content.",
-            metadata={"section": "intro"},
-        )
-
-        assert result.chunk_id == "test_chunk"
-        assert result.doc_id == "test_doc"
-        assert result.score == 5.5
-        assert result.rank == 1
-        assert result.metadata["section"] == "intro"
-
-
 # ===========================================================================
-# P2-B5: DynamicRRFFusion
+# DynamicRRFFusion
 # ===========================================================================
 
 class TestDynamicRRFFusion:
@@ -136,9 +137,9 @@ class TestDynamicRRFFusion:
         assert d.k_for_complexity("complex") == 100
 
     def test_fuse_uses_dynamic_k(self):
-        """fuse 行为应与 RRFFusion 一致, 但 k 由 complexity 决定"""
+        """fuse 行为应与 RRF 一致, 但 k 由 complexity 决定"""
         d = DynamicRRFFusion()
-        bm25 = [BM25Result(chunk_id="c1", doc_id="d1", score=1.0, rank=1, text="x", metadata={})]
+        bm25 = [_bm25_result("c1", "d1", 1.0, 1, "x")]
         dense = [VectorSearchResult(chunk_id="c2", doc_id="d1", score=0.9, rank=1, text="y", section_path="", metadata={})]
         results = d.fuse({"bm25": bm25, "dense": dense}, complexity="simple")
         # 简单查询用 k=30, RRF 公式 1/(k+rank)
@@ -151,9 +152,9 @@ class TestDynamicRRFFusion:
         assert abs(scores["c2"] - 1/31) < 1e-6
 
     def test_fuse_without_complexity_falls_back_to_k60(self):
-        """fuse 不传 complexity → k=60 (同 RRFFusion 默认)"""
+        """fuse 不传 complexity → k=60"""
         d = DynamicRRFFusion()
-        bm25 = [BM25Result(chunk_id="c1", doc_id="d1", score=1.0, rank=1, text="x", metadata={})]
+        bm25 = [_bm25_result("c1", "d1", 1.0, 1, "x")]
         dense = [VectorSearchResult(chunk_id="c2", doc_id="d1", score=0.9, rank=1, text="y", section_path="", metadata={})]
         results = d.fuse({"bm25": bm25, "dense": dense})
         # k=60, 1/(60+1) = 1/61

@@ -257,7 +257,6 @@ class TestHybridSearchErrorFallback:
             embedder=embedder,
             vector_retriever=vector_retriever,
             reranker=reranker,
-            bm25_mode="qdrant_sparse",
         )
 
         tenant = TenantContext(tenant_id="t1")
@@ -294,7 +293,6 @@ class TestHybridSearchErrorFallback:
             embedder=embedder,
             vector_retriever=vector_retriever,
             reranker=reranker,
-            bm25_mode="qdrant_sparse",
         )
 
         tenant = TenantContext(tenant_id="t1")

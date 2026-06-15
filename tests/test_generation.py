@@ -1,27 +1,21 @@
 """
 test_generation.py — Generation 层核心测试
 ================================================================================
-覆盖现存的 3 个组件:
-1. PromptBuilder — 真实 yaml 加载 + prompt 组装 (system/context/structured)
-2. CitationVerifier — answer 声明 grounding 验证（含降级路径）
-3. retry.with_retry — 指数退避 + 可重试/不可重试分类
+覆盖现存的 2 个组件:
+1. PromptBuilder — 真实 yaml 加载 + prompt 组装 (system/context)
+2. retry.with_retry — 指数退避 + 可重试/不可重试分类
 
-历史: P0 阶段删除 grounded_generator / citation_generator 后,
-此文件曾引用 2 个不存在的模块导致 pytest 100% 失败, 现重写为真测试。
+历史: P0 阶段删除 grounded_generator / citation_generator,
+Phase 1.2 进一步删除 CitationVerifier（无前端消费）— 此文件相应清理。
 """
 
 from __future__ import annotations
 
-import asyncio
 import json
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.generation.citation_verifier import (
-    CitationVerificationResult,
-    CitationVerifier,
-)
 from backend.generation.prompt_builder import PromptBuilder
 from backend.generation.retry import (
     NON_RETRYABLE_EXCEPTIONS,
@@ -113,135 +107,12 @@ class TestPromptBuilder:
         # 不含引用要求时应更短 (至少短 50 字符)
         assert len(prompt_no_cite) < len(prompt_full) - 50
 
-    def test_build_structured_prompt_includes_schema(self):
-        """structured prompt 应包含 schema 的字段描述"""
+    def test_structured_prompt_methods_removed(self):
+        """Phase 1.3: build_structured_prompt / _format_schema / _schema_to_text 已删除（无调用方）"""
         builder = PromptBuilder()
-        schema = {
-            "type": "object",
-            "properties": {
-                "answer": {"type": "string", "description": "the answer"},
-                "score": {"type": "number"},
-            },
-        }
-        prompt = builder.build_structured_prompt("查询", "上下文", schema)
-
-        assert "answer" in prompt
-        assert "score" in prompt
-        assert "JSON" in prompt
-
-    def test_format_schema_enum(self):
-        """enum schema 被格式化为 '枚举(...)' 文本"""
-        builder = PromptBuilder()
-        text = builder._format_schema({
-            "type": "string",
-            "enum": ["high", "medium", "low"],
-        })
-        assert "枚举" in text or "high" in text
-
-
-# =============================================================================
-# 2. CitationVerifier
-# =============================================================================
-
-
-class TestCitationVerifier:
-    """CitationVerifier 答实对齐验证测试"""
-
-    def test_no_llm_returns_fallback(self):
-        """无 LLM 时降级为简单 extraction, score=0"""
-        verifier = CitationVerifier(llm_client=None)
-        chunks = [{"doc_id": "d1", "chunk_id": "c1", "text": "content", "rerank_score": 0.9}]
-        result = asyncio.run(verifier.verify("q", "answer", chunks))
-
-        assert isinstance(result, CitationVerificationResult)
-        assert result.overall_groundedness_score == 0.0
-        assert result.num_total == len(chunks)
-        assert result.num_supported == 0
-        # fallback 中所有 citation 都是 is_grounded=False
-        for c in result.verified_citations:
-            assert c.is_grounded is False
-            assert "fallback" in c.reason
-
-    def test_empty_answer_returns_fallback(self):
-        """空 answer 时降级"""
-        verifier = CitationVerifier(llm_client=None)
-        result = asyncio.run(verifier.verify("q", "", [{"doc_id": "d", "text": "t"}]))
-        assert result.overall_groundedness_score == 0.0
-
-    def test_empty_chunks_returns_empty_result(self):
-        """无 chunks 时降级 (num_total=0)"""
-        verifier = CitationVerifier(llm_client=None)
-        result = asyncio.run(verifier.verify("q", "answer", []))
-        assert result.num_total == 0
-        assert result.overall_groundedness_score == 0.0
-
-    def test_llm_fully_grounded(self):
-        """LLM 返回所有 claims supported → score=1.0"""
-        mock_llm = AsyncMock()
-        mock_llm.generate_async.return_value = json.dumps({
-            "claims": [
-                {"text": "claim 1", "supported": True, "supporting_chunk_index": 1, "reason": "ok"},
-                {"text": "claim 2", "supported": True, "supporting_chunk_index": 2, "reason": "ok"},
-            ]
-        })
-
-        verifier = CitationVerifier(llm_client=mock_llm)
-        chunks = [
-            {"doc_id": "d1", "chunk_id": "c1", "text": "text 1", "rerank_score": 0.9},
-            {"doc_id": "d2", "chunk_id": "c2", "text": "text 2", "rerank_score": 0.8},
-        ]
-        result = asyncio.run(verifier.verify("q", "answer with claim 1 and 2", chunks))
-
-        assert result.overall_groundedness_score == 1.0
-        assert result.num_supported == 2
-        assert result.num_total == 2
-        assert len(result.unsupported_claims) == 0
-
-    def test_llm_partially_grounded(self):
-        """部分 claims supported → score < 1.0"""
-        mock_llm = AsyncMock()
-        mock_llm.generate_async.return_value = json.dumps({
-            "claims": [
-                {"text": "claim 1", "supported": True, "supporting_chunk_index": 1, "reason": "ok"},
-                {"text": "claim 2 (unsupported)", "supported": False, "supporting_chunk_index": None, "reason": "hallucination"},
-            ]
-        })
-
-        verifier = CitationVerifier(llm_client=mock_llm)
-        chunks = [{"doc_id": "d1", "text": "t1"}]
-        result = asyncio.run(verifier.verify("q", "answer", chunks))
-
-        assert result.overall_groundedness_score == 0.5
-        assert result.num_supported == 1
-        assert result.num_total == 2
-        assert "claim 2 (unsupported)" in result.unsupported_claims
-
-    def test_llm_invalid_json_returns_fallback(self):
-        """LLM 返回非 JSON 时降级 (不崩)"""
-        mock_llm = AsyncMock()
-        mock_llm.generate_async.return_value = "This is not JSON {oops"
-
-        verifier = CitationVerifier(llm_client=mock_llm)
-        result = asyncio.run(verifier.verify(
-            "q", "answer", [{"doc_id": "d", "text": "t"}]
-        ))
-
-        assert result.overall_groundedness_score == 0.0
-        assert "fallback" in result.verified_citations[0].reason
-
-    def test_to_citations_api_format(self):
-        """to_citations 转换为 API JSON 格式 (含 is_grounded / supported_claims)"""
-        verifier = CitationVerifier(llm_client=None)
-        result = asyncio.run(verifier.verify("q", "a", [{"doc_id": "d1", "text": "t1"}]))
-        citations = verifier.to_citations(result)
-
-        assert isinstance(citations, list)
-        assert len(citations) == 1
-        c = citations[0]
-        assert "doc_id" in c
-        assert "is_grounded" in c
-        assert "supported_claims" in c
-        assert "reason" in c
+        assert not hasattr(builder, "build_structured_prompt")
+        assert not hasattr(builder, "_format_schema")
+        assert not hasattr(builder, "_schema_to_text")
 
 
 # =============================================================================

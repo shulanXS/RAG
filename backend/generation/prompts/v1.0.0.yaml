@@ -4,7 +4,6 @@
 # 每个 prompt 段对应 PromptBuilder 的一个方法：
 #   - system:           build_prompt() 的 system 段
 #   - requirements:     build_prompt() 的"回答要求"段
-#   - structured:       build_structured_prompt() 的整段
 #
 # P2 阶段：CI 跑 RAGAS 评估时，prompt_hash 与 commit hash 一起存到 eval_runs 表，
 # 可以做"prompt 改了之后 NDCG 是涨还是跌"的纵向 diff。
@@ -41,18 +40,3 @@ requirements:
        - medium: 上下文部分支持，可能有遗漏
        - low: 上下文支持不足，需要更多信息
        - insufficient: 上下文完全不包含答案所需信息
-
-structured_template: |
-  你是一个企业知识助手。请基于以下检索到的上下文信息回答用户问题。
-
-  [检索到的上下文]
-  {context}
-
-  [用户问题]
-  {query}
-
-  [回答要求]
-  请以 JSON 格式输出，字段定义如下:
-  {schema}
-
-  JSON 输出（不要包含任何非 JSON 内容）:

@@ -72,60 +72,6 @@ class VectorRetriever:
         self._vector_size = vector_size
         self._distance = distance
 
-    def search(
-        self,
-        query_vector: list[float],
-        top_k: int = 50,
-        query_filter: dict | None = None,
-        score_threshold: float | None = None,
-    ) -> list[VectorSearchResult]:
-        """
-        执行向量相似度检索。
-
-        Args:
-            query_vector: 查询的 embedding 向量
-            top_k: 返回 top-k 结果
-            query_filter: Qdrant filter 表达式（ACL 过滤等）
-            score_threshold: 最小相似度阈值
-
-        Returns:
-            按余弦相似度降序排列的检索结果
-        """
-        # 构建 Qdrant filter
-        qdrant_filter = None
-        if query_filter:
-            qdrant_filter = self._build_filter(query_filter)
-
-        results = self._client.search(
-            collection_name=self._collection_name,
-            query_vector=query_vector,
-            limit=top_k,
-            query_filter=qdrant_filter,
-            score_threshold=score_threshold,
-            with_payload=True,
-            with_vectors=False,  # 不返回原始向量，节省带宽
-            params=models.SearchParams(hnsw_ef=128),
-        )
-
-        vector_results = []
-        for rank, hit in enumerate(results, 1):
-            payload = hit.payload or {}
-            vector_results.append(VectorSearchResult(
-                chunk_id=payload.get("chunk_id", ""),
-                doc_id=payload.get("doc_id", ""),
-                score=float(hit.score),
-                rank=rank,
-                text=payload.get("text", ""),
-                section_path=payload.get("section_path", ""),
-                metadata={
-                    "chunk_index": payload.get("chunk_index", 0),
-                    "token_count": payload.get("token_count", 0),
-                    "section_path": payload.get("section_path", ""),
-                },
-            ))
-
-        return vector_results
-
     def hybrid_search(
         self,
         query_vector: list[float],
@@ -176,9 +122,9 @@ class VectorRetriever:
             )
             hits = results.points
         except (TypeError, AttributeError):
-            # 极老版本 Qdrant 兼容：使用 search + Python 层 RRF
+            # 极老版本 Qdrant 兼容：使用 dense-only（query_points 失败时退回 search）
             logger.warning("Qdrant 版本不支持 RRF Query API，使用 dense-only 降级")
-            return self.search(query_vector, top_k, query_filter)
+            return self._dense_only_fallback(query_vector, top_k, query_filter)
 
         # 解析融合结果
         fused_results = []
@@ -197,6 +143,45 @@ class VectorRetriever:
                 },
             ))
         return fused_results
+
+    def _dense_only_fallback(
+        self,
+        query_vector: list[float],
+        top_k: int,
+        query_filter: dict | None,
+    ) -> list[VectorSearchResult]:
+        """dense-only 降级路径，inline 实现以避免外部调用。"""
+        from qdrant_client.http import models
+
+        qdrant_filter = None
+        if query_filter:
+            qdrant_filter = self._build_filter(query_filter)
+
+        results = self._client.search(
+            collection_name=self._collection_name,
+            query_vector=query_vector,
+            limit=top_k,
+            query_filter=qdrant_filter,
+            with_payload=True,
+            with_vectors=False,
+            params=models.SearchParams(hnsw_ef=128),
+        )
+        out: list[VectorSearchResult] = []
+        for rank, hit in enumerate(results, 1):
+            payload = hit.payload or {}
+            out.append(VectorSearchResult(
+                chunk_id=payload.get("chunk_id", ""),
+                doc_id=payload.get("doc_id", ""),
+                score=float(hit.score),
+                rank=rank,
+                text=payload.get("text", ""),
+                section_path=payload.get("section_path", ""),
+                metadata={
+                    "chunk_index": payload.get("chunk_index", 0),
+                    "token_count": payload.get("token_count", 0),
+                },
+            ))
+        return out
 
     def scroll_all(self, limit: int = 1000) -> list[dict]:
         """

@@ -261,11 +261,26 @@ class RAGASEvaluator:
             )
             weakest_score = sum(weakest_scores) / len(weakest_scores) if weakest_scores else 0.0
 
+        # Per-metric averages — P1-4 替代 RAGTestSuite.run_ci 输出形状
+        # 与原 DeepEval 时代 `average_scores` 字段名一致。
+        per_metric_avg = {
+            metric: (sum(v) / len(v) if v else 0.0)
+            for metric, v in all_metrics.items()
+        }
+
+        # 回归检测：与阈值比较（与原 RAGTestSuite.run_ci 一致语义）
+        regression_detected = any(
+            score < self._thresholds.get(metric, 0.5)
+            for metric, score in per_metric_avg.items()
+        )
+
         return {
             "total": total,
             "passed": passed,
             "pass_rate": passed / total if total > 0 else 0,
             "average_score": sum(avg_scores) / len(avg_scores) if avg_scores else 0,
+            "average_scores": per_metric_avg,
+            "regression_detected": regression_detected,
             "weakest_metric": weakest_name,
             "weakest_score": weakest_score,
             "per_case": [

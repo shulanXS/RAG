@@ -48,6 +48,10 @@ def get_llm_client() -> "LLMClient":
         generator_model=cfg.llm.generator.model,
         router_provider=cfg.llm.router.provider,
         router_model=cfg.llm.router.model,
+        generator_api_key=cfg.llm.deepseek.api_key or None,
+        generator_base_url=cfg.llm.deepseek.base_url,
+        router_api_key=cfg.llm.deepseek.api_key or None,
+        router_base_url=cfg.llm.deepseek.base_url,
     )
 
 

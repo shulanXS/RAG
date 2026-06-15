@@ -4,7 +4,7 @@ from backend.ingestion.document_parser import (
     SimHashDeduplicator, get_global_deduplicator,
 )
 from backend.ingestion.chunker import (
-    ChunkResult, HierarchicalChunker, RecursiveChunker, SemanticChunker, get_chunker,
+    ChunkResult, RecursiveChunker, get_chunker,
 )
 from backend.ingestion.embedder import Embedder
 from backend.ingestion.indexer import QdrantIndexer

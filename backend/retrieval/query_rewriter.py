@@ -1,9 +1,9 @@
 """
-query_rewriter.py — 多轮对话查询改写器 + 意图分类
+query_rewriter.py — 多轮对话查询改写器
 ================================================================================
 技术决策记录:
 - 为什么需要 Query Rewriting: 在多轮对话场景中，用户的追问往往是省略句
- （「那第二点呢？」），缺少主语和上下文，纯向量检索会失败。
+  （「那第二点呢？」），缺少主语和上下文，纯向量检索会失败。
 - 实现方式: LLM 重写为完整独立问题。这是最有效但成本最高的方式。
 - 备选方案:
   (1) 历史窗口拼接: 将对话历史直接拼接到当前查询前。
@@ -18,10 +18,8 @@ query_rewriter.py — 多轮对话查询改写器 + 意图分类
 - 简单查询的处理: 对于单轮对话，直接跳过重写以节省成本。
   解决方案: 检测查询是否包含代词（我/你/它/这/那），有则重写。
 
-增强 (Phase 1):
-- IntentClassification: 新增查询意图分类 (factual/comparative/analytical/summarization)
-- ClarificationDetection: 识别模糊查询，主动要求用户澄清
-- QueryType: 返回查询类型，指导后续检索策略选择
+P0-6: 移除 QueryIntent / QueryType / `query_type` 字段 — 下游零消费（QueryRouter
+只分 SIMPLE/MODERATE/COMPLEX/BEYOND_KB 复杂度，不读 intent）。
 """
 
 from __future__ import annotations
@@ -31,52 +29,9 @@ import json
 import logging
 import re
 from collections import OrderedDict
-from dataclasses import dataclass, field
-from enum import Enum
-from typing import Literal
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
-
-
-class QueryIntent(Enum):
-    """
-    查询意图分类 — 用于决定扩展策略和检索策略
-
-    - factual: 事实型查询，需要精确匹配
-    - comparative: 比较型查询，需要多角度对比
-    - analytical: 分析型查询，需要多来源综合
-    - definitional: 定义型查询，需要权威定义
-    - procedural: 流程型查询，需要步骤性文档
-    - summarization: 摘要型查询，需要全面覆盖
-    - conversational: 对话型查询，不需要检索
-    """
-    FACTUAL = "factual"
-    COMPARATIVE = "comparative"
-    ANALYTICAL = "analytical"
-    DEFINITIONAL = "definitional"
-    PROCEDURAL = "procedural"
-    SUMMARIZATION = "summarization"
-    CONVERSATIONAL = "conversational"
-
-
-@dataclass
-class QueryType:
-    """
-    查询类型信息
-
-    字段说明:
-    - intent: 查询意图
-    - is_beyond_kb: 是否超出知识库范围
-    - needs_clarification: 是否需要用户澄清
-    - clarification_questions: 如果需要澄清，列出具体问题
-    - estimated_complexity: 预估复杂度 (1-5)
-    """
-    intent: QueryIntent
-    is_beyond_kb: bool = False
-    needs_clarification: bool = False
-    clarification_questions: list[str] = field(default_factory=list)
-    estimated_complexity: int = 1
-    intent_confidence: float = 0.5
 
 
 @dataclass
@@ -89,13 +44,11 @@ class RewrittenQuery:
     - was_rewritten: 是否进行了改写（原查询即完整则返回原查询）
     - confidence: 重写置信度（0-1）
     - original: 原始查询
-    - query_type: 查询类型信息（P1-B2: QueryClassifier 已删除，保留字段留待 P2 重做）
     """
     rewritten: str
     was_rewritten: bool
     confidence: float
     original: str
-    query_type: QueryType | None = None
 
 
 class QueryRewriter:
@@ -113,9 +66,6 @@ class QueryRewriter:
       缓解: 先检测代词，有代词才重写。
     - 重写错误: LLM 可能误解原意，生成完全不同的问题。
       缓解: 添加 self-check，置信度 < 0.7 时回退到原查询。
-
-    P1-B2: QueryClassifier 已删除（死代码，意图分类由 LLM 改写 prompt 完成）。
-    P1-B3: 反射式 `__init_subclass__` 已删除（无子类，YAGNI）。
     """
 
     def __init__(
@@ -197,7 +147,6 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=1.0,
                 original=query,
-                query_type=None,
             )
 
         if self._llm is None:
@@ -206,10 +155,9 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.5,
                 original=query,
-                query_type=None,
             )
 
-        return self._llm_rewrite(query, conversation_history or [], None)
+        return self._llm_rewrite(query, conversation_history or [])
 
     def _needs_rewriting(self, query: str) -> bool:
         """
@@ -241,9 +189,8 @@ class QueryRewriter:
         self,
         query: str,
         history: list[dict],
-        query_type: QueryType | None = None,
     ) -> RewrittenQuery:
-        """使用 LLM 重写查询（query_type 保留参数以兼容外部调用，实际不再使用）"""
+        """使用 LLM 重写查询"""
         import json
 
         history_context = ""
@@ -290,7 +237,6 @@ class QueryRewriter:
                 was_rewritten=was_rewritten,
                 confidence=confidence,
                 original=query,
-                query_type=None,
             )
 
         except Exception as e:
@@ -300,7 +246,6 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.0,
                 original=query,
-                query_type=None,
             )
 
     async def rewrite_async(
@@ -321,7 +266,6 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=1.0,
                 original=query,
-                query_type=None,
             )
             self._cache_put(cache_key, result)
             return result
@@ -332,12 +276,11 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.5,
                 original=query,
-                query_type=None,
             )
             self._cache_put(cache_key, result)
             return result
 
-        result = await self._llm_rewrite_async(query, conversation_history or [], None)
+        result = await self._llm_rewrite_async(query, conversation_history or [])
         self._cache_put(cache_key, result)
         return result
 
@@ -345,9 +288,8 @@ class QueryRewriter:
         self,
         query: str,
         history: list[dict],
-        query_type: QueryType | None = None,
     ) -> RewrittenQuery:
-        """异步 LLM 重写（query_type 保留参数以兼容外部调用，实际不再使用）"""
+        """异步 LLM 重写"""
         import json
 
         history_context = ""
@@ -389,7 +331,6 @@ class QueryRewriter:
                 was_rewritten=was_rewritten,
                 confidence=confidence,
                 original=query,
-                query_type=None,
             )
 
         except Exception as e:
@@ -399,5 +340,4 @@ class QueryRewriter:
                 was_rewritten=False,
                 confidence=0.0,
                 original=query,
-                query_type=None,
             )
