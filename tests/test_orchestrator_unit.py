@@ -13,7 +13,7 @@ import pytest
 # langgraph 是可选依赖 (CI 环境会装, 离线开发环境可缺)
 langgraph = pytest.importorskip("langgraph")
 
-from backend.agentic.orchestrator import AgenticOrchestrator, OrchestratorResult
+from backend.domain.agent.orchestrator import AgenticOrchestrator, OrchestratorResult
 
 
 @pytest.fixture
@@ -89,7 +89,7 @@ async def test_orchestrator_handles_missing_hybrid_search():
 @pytest.mark.asyncio
 async def test_orchestrator_router_classification_called(mock_orchestrator: AgenticOrchestrator):
     """Router 应对 query 进行分类"""
-    with patch("backend.agentic.orchestrator.QueryRouter") as MockRouter:
+    with patch("backend.domain.agent.orchestrator.QueryRouter") as MockRouter:
         mock_router_instance = MagicMock()
         mock_router_instance.route = AsyncMock(return_value=MagicMock(
             complexity="simple",

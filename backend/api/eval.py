@@ -14,7 +14,7 @@ from datetime import datetime
 
 from fastapi import APIRouter, BackgroundTasks, Depends
 
-from backend.evaluation.eval_store import get_eval_store
+from backend.domain.evaluation.eval_store import get_eval_store
 from backend.security.auth import require_current_user
 
 logger = logging.getLogger(__name__)
@@ -39,8 +39,8 @@ async def trigger_run(
         try:
             from backend.api.deps import get_orchestrator
             from backend.config import get_config
-            from backend.evaluation.ragas_metrics import RAGASEvaluator
-            from backend.evaluation.test_dataset import get_test_dataset_by_category
+            from backend.domain.evaluation.ragas_metrics import RAGASEvaluator
+            from backend.domain.evaluation.test_dataset import get_test_dataset_by_category
 
             test_cases = get_test_dataset_by_category(category)
             cfg = get_config()

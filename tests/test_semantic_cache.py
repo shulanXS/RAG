@@ -15,7 +15,7 @@ redisvl = pytest.importorskip("redisvl")
 
 @pytest.mark.asyncio
 async def test_semantic_cache_get_miss():
-    from backend.cache.semantic_cache import RedisSemanticCache
+    from backend.domain.cache.semantic_cache import RedisSemanticCache
 
     cache = RedisSemanticCache(
         host="localhost",
@@ -37,7 +37,7 @@ async def test_semantic_cache_get_miss():
 
 @pytest.mark.asyncio
 async def test_semantic_cache_get_hit():
-    from backend.cache.semantic_cache import RedisSemanticCache
+    from backend.domain.cache.semantic_cache import RedisSemanticCache
 
     cache = RedisSemanticCache(
         host="localhost",
@@ -65,7 +65,7 @@ async def test_semantic_cache_get_hit():
 @pytest.mark.asyncio
 async def test_semantic_cache_normalization():
     """query embedding 应在 KNN 搜索前归一化"""
-    from backend.cache.semantic_cache import RedisSemanticCache
+    from backend.domain.cache.semantic_cache import RedisSemanticCache
 
     cache = RedisSemanticCache(host="localhost", port=6379, embedding_dim=4)
     captured: dict = {}

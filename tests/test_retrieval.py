@@ -10,12 +10,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from backend.retrieval.fusion import (
+from backend.domain.retrieval.fusion import (
     DynamicRRFFusion,
     DEFAULT_K_BY_COMPLEXITY,
     FusionResult,
 )
-from backend.retrieval.vector_retriever import VectorSearchResult
+from backend.domain.retrieval.vector_retriever import VectorSearchResult
 
 
 def _bm25_result(chunk_id, doc_id, score, rank, text="", metadata=None):
@@ -163,7 +163,7 @@ class TestDynamicRRFFusion:
 
     def test_default_k_mapping_has_all_complexities(self):
         """sanity: 默认 mapping 覆盖所有 QueryComplexity 值"""
-        from backend.agentic.query_router import QueryComplexity
+        from backend.domain.agent.query_router import QueryComplexity
         for level in QueryComplexity:
             assert level.value in DEFAULT_K_BY_COMPLEXITY, (
                 f"missing k for {level.value!r}"

@@ -34,7 +34,7 @@ async def test_anthropic_generate_stream_yields_tokens():
     P2.1: AnthropicBackend.generate_stream_async 必须 token-level 流式
     (之前调基类一次性 yield 整个结果)
     """
-    from backend.generation.llm_client import AnthropicBackend
+    from backend.domain.generation.llm_client import AnthropicBackend
 
     backend = AnthropicBackend.__new__(AnthropicBackend)
     backend._model = "claude-3-7-sonnet-20250620"
@@ -81,8 +81,8 @@ async def test_orchestrator_run_stream_emits_generating_stage(dummy_config, mock
     验证 orchestrator.run_stream 在 LLM 流式阶段 yield 'generating' 事件
     且 token 累积正确
     """
-    from backend.agentic.orchestrator import AgenticOrchestrator
-    from backend.agentic.query_router import QueryComplexity, RoutingDecision
+    from backend.domain.agent.orchestrator import AgenticOrchestrator
+    from backend.domain.agent.query_router import QueryComplexity, RoutingDecision
 
     # Stub router 强制走 SIMPLE 路径
     router = MagicMock()

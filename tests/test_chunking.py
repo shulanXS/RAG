@@ -5,7 +5,7 @@ P1-3: HierarchicalChunker / SemanticChunker 已删除（仅保留 RecursiveChunk
 """
 
 import pytest
-from backend.ingestion.chunker import (
+from backend.domain.ingestion.chunker import (
     Chunk,
     ChunkResult,
     RecursiveChunker,

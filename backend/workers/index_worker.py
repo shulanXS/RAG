@@ -17,7 +17,7 @@ from typing import Any
 
 from arq.worker import Worker
 
-from backend.ingestion.pipeline import run_index_pipeline
+from backend.domain.ingestion.pipeline import run_index_pipeline
 
 logger = logging.getLogger(__name__)
 

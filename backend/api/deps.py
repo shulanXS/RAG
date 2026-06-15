@@ -18,19 +18,19 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from fastapi import Depends
 
-    from backend.ingestion.embedder import Embedder
-    from backend.retrieval.hybrid_search import HybridSearchEngine
-    from backend.agentic.orchestrator import AgenticOrchestrator
-    from backend.generation.llm_client import LLMClient
-    from backend.agentic.query_router import QueryRouter
-    from backend.session.chat_store import ChatStore
+    from backend.domain.ingestion.embedder import Embedder
+    from backend.domain.retrieval.hybrid_search import HybridSearchEngine
+    from backend.domain.agent.orchestrator import AgenticOrchestrator
+    from backend.domain.generation.llm_client import LLMClient
+    from backend.domain.agent.query_router import QueryRouter
+    from backend.domain.session.chat_store import ChatStore
 
 
 @lru_cache(maxsize=1)
 def get_embedder() -> "Embedder":
     """获取 Embedder 单例（每个进程一个实例）"""
     from backend.config import get_config
-    from backend.ingestion.embedder import Embedder
+    from backend.domain.ingestion.embedder import Embedder
 
     cfg = get_config()
     return Embedder(backend=cfg.embedding.backend)
@@ -40,7 +40,7 @@ def get_embedder() -> "Embedder":
 def get_llm_client() -> "LLMClient":
     """获取 LLMClient 单例（每个进程一个实例，含 Router + Generator 分离）"""
     from backend.config import get_config
-    from backend.generation.llm_client import LLMClient
+    from backend.domain.generation.llm_client import LLMClient
 
     cfg = get_config()
     return LLMClient(
@@ -59,8 +59,8 @@ def get_llm_client() -> "LLMClient":
 def get_hybrid_search() -> "HybridSearchEngine":
     """获取混合检索引擎单例"""
     from backend.config import get_config
-    from backend.ingestion.embedder import Embedder
-    from backend.retrieval.hybrid_search import HybridSearchEngine
+    from backend.domain.ingestion.embedder import Embedder
+    from backend.domain.retrieval.hybrid_search import HybridSearchEngine
 
     cfg = get_config()
     embedder: Embedder = get_embedder()
@@ -70,9 +70,9 @@ def get_hybrid_search() -> "HybridSearchEngine":
 @lru_cache(maxsize=1)
 def get_orchestrator() -> "AgenticOrchestrator":
     """获取编排器单例（自动注入所有依赖）"""
-    from backend.agentic.query_router import QueryRouter
-    from backend.agentic.orchestrator import AgenticOrchestrator
-    from backend.session.chat_store import ChatStore
+    from backend.domain.agent.query_router import QueryRouter
+    from backend.domain.agent.orchestrator import AgenticOrchestrator
+    from backend.domain.session.chat_store import ChatStore
 
     hs: "HybridSearchEngine" = get_hybrid_search()
     llm: "LLMClient" = get_llm_client()
@@ -112,7 +112,7 @@ def get_orchestrator() -> "AgenticOrchestrator":
 @lru_cache(maxsize=1)
 def get_chat_store() -> "ChatStore":
     """获取 Chat Store 单例"""
-    from backend.session.chat_store import ChatStore
+    from backend.domain.session.chat_store import ChatStore
 
     return ChatStore()
 
@@ -130,7 +130,7 @@ def get_semantic_cache():
         调用方在 cache_fn 内做 graceful degradation）。
     """
     from backend.config import get_config
-    from backend.cache.semantic_cache import RedisSemanticCache
+    from backend.domain.cache.semantic_cache import RedisSemanticCache
 
     try:
         cfg = get_config()
@@ -167,6 +167,6 @@ def get_tenant_from_token(token_payload: dict | None = None) -> "TenantContext":
     与 require_current_user 配合时需手动传 token_payload；
     也可以用 Depends(get_current_user) 让 None 自然传播。
     """
-    from backend.security.tenant import TenantContext
+    from backend.domain.tenant import TenantContext
 
     return TenantContext.from_token(token_payload)

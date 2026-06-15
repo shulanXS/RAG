@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 from unittest.mock import MagicMock
 
-from backend.agentic.query_router import (
+from backend.domain.agent.query_router import (
     QueryComplexity,
     QueryRouter,
     RoutingDecision,

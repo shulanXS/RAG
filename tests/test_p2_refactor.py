@@ -23,8 +23,8 @@ class TestOpenAICompatibleBackend:
 
     def test_class_aliases_removed(self):
         """P0-Phase1.17: OpenAIBackend / DeepSeekBackend 别名已删除，仅保留 OpenAICompatibleBackend"""
-        from backend.generation.llm_client import OpenAICompatibleBackend
-        import backend.generation.llm_client as llm_mod
+        from backend.domain.generation import llm_client as llm_mod
+        from backend.domain.generation.llm_client import OpenAICompatibleBackend
 
         assert OpenAICompatibleBackend is not None
         assert not hasattr(llm_mod, "OpenAIBackend")
@@ -32,13 +32,13 @@ class TestOpenAICompatibleBackend:
 
     def test_default_base_url_per_provider(self):
         """Phase 5.1: OpenAI 与 DeepSeek 共享 OpenAICompatibleBackend；base_url 由调用方传入"""
-        from backend.generation.llm_client import OpenAICompatibleBackend
+        from backend.domain.generation.llm_client import OpenAICompatibleBackend
         # Phase 5.1 删除: DEFAULT_BASE_URLS 字段；class 不再硬编码 provider→url 映射
         assert not hasattr(OpenAICompatibleBackend, "DEFAULT_BASE_URLS")
 
     def test_constructor_records_base_url(self):
         """构造时记录 base_url（替代 provider 字段）"""
-        from backend.generation.llm_client import OpenAICompatibleBackend
+        from backend.domain.generation.llm_client import OpenAICompatibleBackend
         # 不真正发请求（SDK 未配 api_key 会失败），用 __new__ 跳过 __init__
         inst = OpenAICompatibleBackend.__new__(OpenAICompatibleBackend)
         inst._base_url = "https://api.deepseek.com/v1"
@@ -50,10 +50,10 @@ class TestOpenAICompatibleBackend:
 
     def test_llm_client_factory_dispatches(self):
         """LLMClient._create_backend 把 deepseek/openai 都路由到 OpenAICompatibleBackend"""
-        from backend.generation.llm_client import LLMClient, OpenAICompatibleBackend
+        from backend.domain.generation.llm_client import LLMClient, OpenAICompatibleBackend
         from unittest.mock import patch
 
-        with patch("backend.generation.llm_client.OpenAICompatibleBackend") as MockBackend:
+        with patch("backend.domain.generation.llm_client.OpenAICompatibleBackend") as MockBackend:
             MockBackend.side_effect = lambda **kwargs: SimpleNamespace(
                 _base_url=kwargs.get("base_url"),
                 _model=kwargs.get("model"),
@@ -83,13 +83,13 @@ class TestQueryRouterRefactor:
 
     def test_approach_map_covers_all_complexities(self):
         """_APPROACH_MAP 必须覆盖 4 种复杂度"""
-        from backend.agentic.query_router import QueryRouter, QueryComplexity
+        from backend.domain.agent.query_router import QueryRouter, QueryComplexity
         for c in QueryComplexity:
             assert c in QueryRouter._APPROACH_MAP, f"Missing mapping for {c}"
 
     def test_no_llm_path_uses_fallback(self):
         """无 LLM 时走 _fallback_decision，返回正确的 recommended_approach"""
-        from backend.agentic.query_router import QueryRouter, QueryComplexity
+        from backend.domain.agent.query_router import QueryRouter, QueryComplexity
         router = QueryRouter(llm_client=None)
         d = router.route("简单问题")
         # SIMPLE 查询走 signals 兜底
@@ -98,7 +98,7 @@ class TestQueryRouterRefactor:
 
     def test_build_history_context_helper(self):
         """_build_history_context 辅助方法正确处理空/非空历史"""
-        from backend.agentic.query_router import QueryRouter
+        from backend.domain.agent.query_router import QueryRouter
         assert QueryRouter._build_history_context(None) == ""
         assert QueryRouter._build_history_context([]) == ""
         ctx = QueryRouter._build_history_context([
@@ -110,7 +110,7 @@ class TestQueryRouterRefactor:
 
     def test_fallback_decision_passes_through_complexity(self):
         """_fallback_decision 把传入的 complexity 写到 recommended_approach"""
-        from backend.agentic.query_router import QueryRouter, QueryComplexity
+        from backend.domain.agent.query_router import QueryRouter, QueryComplexity
         router = QueryRouter(llm_client=None)
         d = router._fallback_decision(
             complexity=QueryComplexity.BEYOND_KB,
@@ -133,18 +133,18 @@ class TestDocumentParserRegistry:
 
     def test_default_extensions_registered(self):
         """_EXTENSION_PARSERS 至少包含 8 个默认扩展名"""
-        from backend.ingestion.document_parser import _EXTENSION_PARSERS
+        from backend.domain.ingestion.document_parser import _EXTENSION_PARSERS
         expected = {".pdf", ".docx", ".doc", ".md", ".markdown", ".mdown", ".html", ".htm"}
         assert expected <= set(_EXTENSION_PARSERS.keys())
 
     def test_register_parser_removed(self):
         """Phase1-1.11: register_parser() 已删除 — 无外部调用方"""
-        from backend.ingestion import document_parser as dp
+        from backend.domain.ingestion import document_parser as dp
         assert not hasattr(dp, "register_parser"), "register_parser should be removed in Phase1-1.11"
 
     def test_backward_compat_class_aliases_removed(self):
         """Phase1-1.11: PDFParser / DOCXParser / MarkdownParser / HTMLParser 薄 class 已删除"""
-        from backend.ingestion import document_parser as dp
+        from backend.domain.ingestion import document_parser as dp
         for name in ("PDFParser", "DOCXParser", "MarkdownParser", "HTMLParser", "register_parser"):
             assert not hasattr(dp, name), f"{name} should be removed in Phase1-1.11"
 

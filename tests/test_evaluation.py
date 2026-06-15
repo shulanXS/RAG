@@ -4,7 +4,7 @@ test_evaluation.py — Evaluation 模块测试
 
 import json
 import pytest
-from backend.evaluation.ragas_metrics import (
+from backend.domain.evaluation.ragas_metrics import (
     RAGASEvaluator,
     EvaluationReport,
     RAGASResult,
@@ -19,7 +19,7 @@ class TestOnlineEvaluatorRemoved:
         import importlib
 
         with pytest.raises(ModuleNotFoundError):
-            importlib.import_module("backend.evaluation.online_evaluator")
+            importlib.import_module("backend.domain.evaluation.online_evaluator")
 
 
 # =============================================================================
@@ -55,7 +55,7 @@ class TestP01_AnswerCorrectnessIncluded:
         方法以在 metric_objs 构造阶段插入 capture 点，绕开真实 ragas 调用。
         """
         # 模拟 ragas 可用
-        monkeypatch.setattr("backend.evaluation.ragas_metrics.RAGAS_AVAILABLE", True)
+        monkeypatch.setattr("backend.domain.evaluation.ragas_metrics.RAGAS_AVAILABLE", True)
 
         # 在测试模块的 globals 里也注入假 ragas 模块对象（_evaluate_with_ragas 内部
         # 的 try/except import 捕获的是模块级 names；这里我们在 monkeypatch 整个
@@ -78,11 +78,11 @@ class TestP01_AnswerCorrectnessIncluded:
                 metric_objs.append(fake_answer_correctness)
                 metric_objs.append(fake_context_recall)
             captured_metric_names.extend(m.name for m in metric_objs)
-            from backend.evaluation.ragas_metrics import EvaluationReport
+            from backend.domain.evaluation.ragas_metrics import EvaluationReport
             return EvaluationReport(overall_pass=True, results=[])
 
         monkeypatch.setattr(
-            "backend.evaluation.ragas_metrics.RAGASEvaluator._evaluate_with_ragas",
+            "backend.domain.evaluation.ragas_metrics.RAGASEvaluator._evaluate_with_ragas",
             fake_evaluate_with_ragas,
         )
 
@@ -111,7 +111,7 @@ class TestP01_AnswerCorrectnessIncluded:
         """
         P1-3 修复: ragas 不可用时 evaluate() 应 raise RuntimeError（不再静默回退到不可信实现）。
         """
-        monkeypatch.setattr("backend.evaluation.ragas_metrics.RAGAS_AVAILABLE", False)
+        monkeypatch.setattr("backend.domain.evaluation.ragas_metrics.RAGAS_AVAILABLE", False)
 
         evaluator = RAGASEvaluator()
         import asyncio
@@ -226,7 +226,7 @@ class TestP02_PromptHash:
 
     def test_hash_changes_when_requirements_changed(self):
         """改 requirements 字段必须改 hash（原 bug: hash 不变）"""
-        from backend.generation.prompts import get_prompt_hash, load_prompts
+        from backend.domain.generation.prompts import get_prompt_hash, load_prompts
 
         prompts_a = load_prompts()
         prompts_b = json.loads(json.dumps(prompts_a))  # deep copy
@@ -251,7 +251,7 @@ class TestP02_PromptHash:
 
     def test_hash_is_deterministic(self):
         """相同 dict 多次计算 hash 必须一致（用 sort_keys 保证）"""
-        from backend.generation.prompts import get_prompt_hash, load_prompts
+        from backend.domain.generation.prompts import get_prompt_hash, load_prompts
 
         prompts = load_prompts()
         h1 = get_prompt_hash(prompts)
@@ -260,7 +260,7 @@ class TestP02_PromptHash:
 
     def test_hash_different_for_different_versions(self):
         """不同 version 字符串必须产生不同 hash"""
-        from backend.generation.prompts import get_prompt_hash
+        from backend.domain.generation.prompts import get_prompt_hash
         a = {"version": "v1.0.0", "system": "s"}
         b = {"version": "v1.0.1", "system": "s"}
         assert get_prompt_hash(a) != get_prompt_hash(b)
@@ -272,7 +272,7 @@ class TestP1_OrchestratorSimplePath:
     def test_generate_answer_signature(self):
         """_generate_answer 返回 (answer, citations) 二元组"""
         import inspect
-        from backend.agentic.orchestrator import AgenticOrchestrator
+        from backend.domain.agent.orchestrator import AgenticOrchestrator
 
         sig = inspect.signature(AgenticOrchestrator._generate_answer)
         # 验证 verify_citation 参数已移除

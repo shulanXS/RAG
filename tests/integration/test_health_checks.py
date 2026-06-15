@@ -58,7 +58,7 @@ def mock_external_services():
 def client(mock_external_services, dummy_config):
     """FastAPI 测试客户端"""
     # 重要: 必须在导入 main 之前 patch 外部依赖，否则 lifespan 会尝试初始化
-    from backend.main import app
+    from backend.app import app
 
     with TestClient(app) as c:
         yield c
@@ -189,7 +189,7 @@ class TestDependencyInjection:
 class TestRoutes:
     def test_routes_registered(self, client):
         """所有路由都注册到 FastAPI app"""
-        from backend.main import app
+        from backend.app import app
 
         paths = [route.path for route in app.routes]
         # 健康检查

@@ -9,20 +9,21 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from backend.retrieval.reranker import (
+from backend.domain.retrieval.reranker import (
     BGEReranker,
     CohereReranker,
     RerankResult,
-    _RerankCache,
     is_permanent_error,
     is_transient_error,
-    get_default_rerank_cache,
 )
 
 
 def _make_bge_with_mock_scores(scores: list[float]) -> BGEReranker:
-    """构造 BGEReranker 但 mock 掉 cross_encoder"""
-    from backend.retrieval import reranker as r
+    """构造 BGEReranker 但 mock 掉 cross_encoder
+
+    P3.1: 删 _RerankCache 后,BGEReranker 字段只剩 _cross_encoder / _device / _model_name / _use_fp16。
+    """
+    from backend.domain.retrieval import reranker as r
 
     # 跳过真实 __init__，直接构造实例
     rr = BGEReranker.__new__(BGEReranker)
@@ -32,9 +33,6 @@ def _make_bge_with_mock_scores(scores: list[float]) -> BGEReranker:
     ce = MagicMock()
     ce.predict = MagicMock(return_value=MagicMock(tolist=lambda: scores))
     rr._cross_encoder = ce
-    # P2-B3: cache 字段 (绕过 __init__ 时需要手动设)
-    rr._cache = _RerankCache(capacity=128)
-    rr._cache_enabled = True
     return rr
 
 
@@ -86,113 +84,7 @@ def test_rerank_text_truncated_to_2000_chars():
 
 
 # ===========================================================================
-# P2-B3: Rerank LRU 缓存
-# ===========================================================================
-
-class TestRerankCache:
-    """_RerankCache 单元测试"""
-
-    def test_make_key_deterministic(self):
-        k1 = _RerankCache.make_key("query", ["c1", "c2", "c3"])
-        k2 = _RerankCache.make_key("query", ["c1", "c2", "c3"])
-        assert k1 == k2
-        assert len(k1) == 32  # md5 hex
-
-    def test_make_key_order_invariant(self):
-        """chunk 列表顺序变化应生成相同 key (容忍 RRF 输出顺序波动)"""
-        k1 = _RerankCache.make_key("query", ["c1", "c2"])
-        k2 = _RerankCache.make_key("query", ["c2", "c1"])
-        assert k1 == k2
-
-    def test_make_key_query_sensitive(self):
-        k1 = _RerankCache.make_key("q1", ["c1"])
-        k2 = _RerankCache.make_key("q2", ["c1"])
-        assert k1 != k2
-
-    def test_put_get(self):
-        cache = _RerankCache(capacity=10)
-        results = [RerankResult(chunk_id="c1", doc_id="d1", rerank_score=0.9)]
-        key = cache.make_key("q", ["c1"])
-        cache.put(key, results)
-        got = cache.get(key)
-        assert got is not None
-        assert got[0].chunk_id == "c1"
-        assert cache.get_stats().hits == 1
-
-    def test_get_miss(self):
-        cache = _RerankCache(capacity=10)
-        assert cache.get("nonexistent") is None
-        assert cache.get_stats().misses == 1
-
-    def test_lru_eviction(self):
-        """容量满后, 最久未访问的应被淘汰"""
-        cache = _RerankCache(capacity=2)
-        r = RerankResult(chunk_id="x", doc_id="x", rerank_score=0.5)
-        k1 = cache.make_key("q1", ["c1"])
-        k2 = cache.make_key("q2", ["c2"])
-        k3 = cache.make_key("q3", ["c3"])
-        cache.put(k1, [r])
-        cache.put(k2, [r])
-        # 触发 LRU 更新
-        cache.get(k1)
-        cache.put(k3, [r])  # 应淘汰 k2
-        assert cache.get(k1) is not None
-        assert cache.get(k2) is None
-        assert cache.get_stats().evictions == 1
-
-    def test_stats_hit_rate(self):
-        cache = _RerankCache(capacity=10)
-        r = RerankResult(chunk_id="x", doc_id="x", rerank_score=0.5)
-        k1 = cache.make_key("q", ["c1"])
-        cache.put(k1, [r])
-        cache.get(k1)  # hit
-        cache.get(k1)  # hit
-        cache.get("missing")  # miss
-        stats = cache.get_stats()
-        assert stats.hits == 2
-        assert stats.misses == 1
-        assert abs(stats.hit_rate - 2/3) < 1e-6
-
-    def test_clear(self):
-        cache = _RerankCache(capacity=10)
-        cache.put("k", [RerankResult("c", "d", 0.5)])
-        cache.clear()
-        assert cache.get("k") is None
-        assert cache.get_stats().hits == 0
-
-
-class TestRerankCacheIntegration:
-    """验证 cache hit 时, 底层 API 不被调用"""
-
-    def test_bge_cache_hit_skips_predict(self):
-        """第二次相同 query+chunks 调用, predict() 不应再次执行"""
-        rr = _make_bge_with_mock_scores([0.7, 0.3])
-        chunks = [
-            {"chunk_id": "c1", "doc_id": "d1", "text": "alpha"},
-            {"chunk_id": "c2", "doc_id": "d1", "text": "beta"},
-        ]
-        # 首次调用 — 写 cache
-        rr.rerank("q", chunks, top_k=2)
-        predict_count_first = rr._cross_encoder.predict.call_count
-        # 第二次相同输入 — 应命中 cache
-        rr.rerank("q", chunks, top_k=2)
-        assert rr._cross_encoder.predict.call_count == predict_count_first
-        stats = rr._cache.get_stats()
-        assert stats.hits >= 1
-        assert stats.misses >= 1
-
-    def test_cache_disabled_calls_predict_twice(self):
-        """cache_enabled=False 时, 每次都调 API"""
-        rr = _make_bge_with_mock_scores([0.5])
-        rr._cache_enabled = False
-        chunks = [{"chunk_id": "c1", "doc_id": "d1", "text": "x"}]
-        rr.rerank("q", chunks, top_k=1)
-        rr.rerank("q", chunks, top_k=1)
-        assert rr._cross_encoder.predict.call_count == 2
-
-
-# ===========================================================================
-# P2-B3: 错误分类 (transient vs permanent)
+# P2-B3: 错误分类 (transient vs permanent) — 保留
 # ===========================================================================
 
 class TestErrorClassification:
@@ -234,9 +126,9 @@ class TestHybridSearchErrorFallback:
         """瞬时错误 (rate limit) 应 warning + 降级 RRF top-5"""
         import logging
         from unittest.mock import MagicMock
-        from backend.retrieval.hybrid_search import HybridSearchEngine
-        from backend.ingestion.embedder import Embedder
-        from backend.security.tenant import TenantContext
+        from backend.domain.retrieval.hybrid_search import HybridSearchEngine
+        from backend.domain.ingestion.embedder import Embedder
+        from backend.domain.tenant import TenantContext
 
         class _Hit:
             def __init__(self, **kw):
@@ -271,9 +163,9 @@ class TestHybridSearchErrorFallback:
         """永久错误 (auth) 应 error + 降级 RRF top-5 (不重试)"""
         import logging
         from unittest.mock import MagicMock
-        from backend.retrieval.hybrid_search import HybridSearchEngine
-        from backend.ingestion.embedder import Embedder
-        from backend.security.tenant import TenantContext
+        from backend.domain.retrieval.hybrid_search import HybridSearchEngine
+        from backend.domain.ingestion.embedder import Embedder
+        from backend.domain.tenant import TenantContext
 
         class _Hit:
             def __init__(self, **kw):

@@ -71,39 +71,9 @@ Cache miss 时仍走完整 RAG 流程，latency 与无 cache 一致。
 - 67% 的 Retriever call 被跳过
 - 节省 $4.20 × 0.67 = **$2.81 / 1K query**
 
-## 6. 错误率 / 可用性
+(P3.1 精简: 删 §6 错误率/可用性 + §7 Stream + §8 资源占用 — 这些是生产 SLO 关注的项,作品集 demo 用不到)
 
-| Error Type | 频率 | 处理 |
-|------------|------|------|
-| LLM timeout (>30s) | 0.3% | CircuitBreaker OPEN → fallback to cached response |
-| Qdrant connection lost | <0.1% | Retry 3x with backoff → 503 |
-| Reranker GPU OOM | <0.05% | Fall back to dense-only retrieval |
-| Cache Redis down | <0.1% | Bypass cache, full RAG path |
-
-**目标 SLO**：
-- 可用性 ≥ 99.9% (3 nines)
-- 错误率 < 1%
-- p95 latency < 3s (simple path)
-
-## 7. Stream 性能
-
-| Metric | Value |
-|--------|-------|
-| TTFT (Time to First Token) | 280ms (avg) |
-| Token throughput | 45 tok/s (Anthropic SSE) |
-| Stream end-to-end | 2.1s (avg answer 200 tokens) |
-
-## 8. 资源占用
-
-| Service | CPU (avg) | RAM (avg) | Storage |
-|---------|-----------|-----------|---------|
-| Backend | 35% (1.4 vCPU) | 2.1 GB | 100 MB |
-| Qdrant | 22% (0.9 vCPU) | 3.5 GB | 8.2 GB (50K chunks) |
-| Redis | 5% (0.05 vCPU) | 280 MB | 12 MB |
-| Prometheus | 8% (0.3 vCPU) | 520 MB | 200 MB (24h retention) |
-| Jaeger | 4% (0.16 vCPU) | 180 MB | 80 MB (24h retention) |
-
-## 9. 与"基线 RAG"对比
+## 7. 与"基线 RAG"对比
 
 > "基线 RAG" = 直接 cosine 相似度 + Claude generate，无 Hybrid / Rerank / Cache / Contextual。
 
@@ -115,7 +85,7 @@ Cache miss 时仍走完整 RAG 流程，latency 与无 cache 一致。
 | Faithfulness (RAGAS) | 0.68 | 0.86 | +27% |
 | Answer Relevancy | 0.61 | 0.78 | +28% |
 
-## 10. 复现命令
+## 8. 复现命令
 
 ```bash
 # 1. 启动服务
@@ -142,7 +112,7 @@ cat bench-results.json | jq '.metrics | {
 }'
 ```
 
-## 11. SLO 表
+## 9. SLO 表
 
 | Service | SLO | 实测 |
 |---------|-----|------|
@@ -153,7 +123,7 @@ cat bench-results.json | jq '.metrics | {
 | Retrieval NDCG@10 | > 0.80 | 0.87 ✓ |
 | Faithfulness (RAGAS) | > 0.80 | 0.86 ✓ |
 
-## 12. 已知瓶颈
+## 10. 已知瓶颈
 
 - **Qdrant 双路索引存储 1.5x**：native BM25 + dense vector
 - **Contextual Retrieval 1 LLM call / chunk**：100K chunks ≈ $30 一次性

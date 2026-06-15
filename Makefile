@@ -72,7 +72,7 @@ install:
 # =============================================================================
 dev:
 	@echo "启动后端服务 (http://localhost:$(BACKEND_PORT))..."
-	uvicorn backend.main:app --host 0.0.0.0 --port $(BACKEND_PORT) --reload
+	uvicorn backend.app:app --host 0.0.0.0 --port $(BACKEND_PORT) --reload
 
 frontend-dev:
 	@echo "启动前端服务 (http://localhost:$(FRONTEND_PORT))..."
@@ -190,7 +190,6 @@ demo:
 	@echo "=================================================="
 	@echo "  Chat UI:           http://localhost:$(FRONTEND_PORT)"
 	@echo "  API docs:          http://localhost:$(BACKEND_PORT)/docs"
-	@echo "  Trace Viewer:      http://localhost:$(FRONTEND_PORT)/traces"
 	@echo "  Jaeger UI:         http://localhost:16686"
 	@echo "  Prometheus:        http://localhost:9090"
 	@echo "  Grafana:           http://localhost:3001  (admin/admin)"

@@ -21,12 +21,12 @@ from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from pydantic import BaseModel, Field
 
-from backend.ingestion.document_registry import (
+from backend.domain.ingestion.document_registry import (
     DocumentRecord,
     get_document_registry,
 )
 from backend.security.auth import require_current_user
-from backend.security.tenant import DEFAULT_TENANT_ID
+from backend.domain.tenant import DEFAULT_TENANT_ID
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/documents", tags=["documents"])
@@ -68,7 +68,7 @@ class DocumentUploadResponse(BaseModel):
 
 # 文件扩展名白名单统一从 ingestion.document_parser 的 registry 派生
 # （单一来源，添加新格式时只改一处）
-from backend.ingestion.document_parser import _EXTENSION_PARSERS
+from backend.domain.ingestion.document_parser import _EXTENSION_PARSERS
 
 ALLOWED_EXTENSIONS = frozenset(_EXTENSION_PARSERS.keys())
 MAX_FILE_SIZE = 50 * 1024 * 1024  # 50MB
@@ -193,7 +193,7 @@ async def upload_document(
         except Exception as e:
             # 入队失败时回退到直接执行 (开发环境无 Redis)
             logger.warning(f"[upload] Arq 入队失败: {e}; fallback 到直接执行")
-            from backend.ingestion.pipeline import run_index_pipeline
+            from backend.domain.ingestion.pipeline import run_index_pipeline
             await run_index_pipeline(
                 file_path=stored_path,
                 file_id=file_id,
@@ -293,7 +293,7 @@ async def delete_document(
     # 2. 从 Qdrant 删除该 doc_id 的所有 chunks
     try:
         from backend.config import get_config
-        from backend.ingestion import QdrantIndexer
+        from backend.domain.ingestion import QdrantIndexer
 
         cfg = get_config()
         indexer = QdrantIndexer(

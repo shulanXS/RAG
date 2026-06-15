@@ -39,7 +39,7 @@ def isolated_user_db(tmp_path, monkeypatch):
 @pytest.fixture
 def client(isolated_user_db):
     """FastAPI 客户端（隔离 user DB）"""
-    from backend.main import app
+    from backend.app import app
 
     with TestClient(app) as c:
         yield c

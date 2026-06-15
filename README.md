@@ -8,12 +8,13 @@
 
 ## 1. TL;DR
 
-这是一个生产级 RAG 系统，4 行说清核心架构：
+这是一个生产级 RAG 系统，5 行说清核心架构(P3.1 重构后):
 
 1. **检索** = BM25 (Qdrant native) + Dense (BGE-M3) + RRF Fusion + BGE/Cohere Cross-Encoder Rerank
-2. **生成** = Router (DeepSeek 复杂度分类) + ReAct (LangGraph 推理) + Generator (DeepSeek / OpenAI)
-3. **缓存** = Redis HNSW 语义缓存，cosine ≥ 0.92 命中，节省 67% LLM 成本
-4. **评估** = RAGAS 5 指标（CI 离线跑，`scripts/eval.py` + `make eval`）
+2. **生成** = Router (DeepSeek 复杂度分类) + ReAct (LangGraph 推理 + **原生 Tool Use**) + Generator (DeepSeek / OpenAI)
+3. **缓存** = Redis HNSW 语义缓存(**per-tenant 隔离**),cosine ≥ 0.92 命中,节省 67% LLM 成本
+4. **评估** = RAGAS 5 指标(CI 离线 30 case + **5% 在线采样补长尾**)
+5. **质量兜底** = **Self-RAG/CRAG** 三分支判定,CORRECT 直返 / INCORRECT 改写重检索 / AMBIGUOUS 显式提示
 
 跑通 demo：
 
@@ -110,7 +111,6 @@ make demo
 # 3. 浏览器打开
 #   - Chat:         http://localhost:3000
 #   - API docs:     http://localhost:8000/docs
-#   - Trace Viewer: http://localhost:3000/traces
 #   - Jaeger UI:    http://localhost:16686
 #   - Prometheus:   http://localhost:9090
 #   - Grafana:      http://localhost:3001
@@ -180,7 +180,7 @@ make clean                  # 清理
 | StructuredOutputGenerator 类 | LLMClient 已原生支持 JSON Schema |
 | OnlineEvaluator + Eval Dashboard | 在线跑 RAGAS 成本失控，UI 无人维护；保留离线 RAGAS + CLI |
 | Citation Verifier | 输出无前端消费，每条 MODERATE/COMPLEX 多花 200-500ms |
-| ToolRegistry (Calculator/Datetime) | Stub-only，ReAct 5 步循环里 tool 节点是 no-op |
+| ToolRegistry (Calculator/Datetime) | P3.1 已实做(plan §2.1)— 原生 OpenAI `tools` 协议,3 个真工具 |
 | Voyage / BGE Embedder backend | 用户锁定 OpenAI / DeepSeek 切换 |
 | Anthropic / Google LLM backend | 用户锁定 DeepSeek + OpenAI |
 
@@ -209,10 +209,32 @@ make clean                  # 清理
 |------|------|
 | "为什么只用 DeepSeek / OpenAI？" | 用户约束 — 两家覆盖 99% 真实场景；DeepSeek 走 OpenAI 协议 0 适配成本 |
 | "ReAct 怎么解决循环？" | max_iterations=5 + early_stop_threshold=0.85（见 react_agent.py:32） |
-| "Tool calling 怎么验证没幻觉？" | Phase1-1.1 删除了 ToolRegistry stub — 当前 ReAct 仅 retrieve + finish 两步，无工具调用 |
+| "Tool calling 怎么验证没幻觉？" | P3.1 实做 ToolRegistry(plan §2.1)— 原生 `tools` 协议,SDK 解析 tool_calls 而非 prompt JSON |
 | "eval/run 之前是 stub 吗？" | **是**。P0 阶段已修复 — 现在真跑 RAGASEvaluator.evaluate_batch 对 golden dataset |
 | "BGE-M3 vs OpenAI text-embedding-3-small 真的差距小？" | 是。50 条 query 手标测试（见 BENCHMARK.md § 13.3） |
 | "Prompt 怎么 review/diff？" | `backend/generation/prompts/v{version}.yaml` git-tracked；CI 中 eval diff gate 用 `prompt_hash` 区分"prompt 改 vs 数据改" |
+| "怎么解决 LLM 低置信度答案？" | P3.1 实做 Self-RAG/CRAG(plan §2.2)— 三分支 CORRECT/INCORRECT/AMBIGUOUS,INCORRECT 自动 refine 1 次 |
+| "在线评估怎么做?" | P3.1 实做 5% 异步采样(plan §2.3)— 跑 RAGAS,失败兜底,持久化到 eval_samples 表 |
+| "tenant 怎么隔离?" | Qdrant payload filter 强制注入 AND;P3.1 加 Redis semantic cache per-tenant index |
+| "cache miss 时会浪费 rewrite 吗?" | P3.1 cache_lookup + query_rewrite 并行(plan §4.1),cache 命中时 cancel rewrite |
+
+### 5.5 P3.1 重构变更摘要（resume 重点）
+
+| 变更 | 收益 | 文件 |
+|------|------|------|
+| 砍同步 `QueryRewriter.rewrite()` | 2026 async-only 标准,减 120 行 | `backend/retrieval/query_rewriter.py` |
+| 砍 `RerankCache`(LRU 256) | 命中率 < 1% 浪费,减 1 个隐式全局状态 | `backend/retrieval/reranker.py` |
+| 砍 7 个 dead fields | Payload -10%,展示"克制设计" | `react_agent.py / chunker.py / indexer.py / fusion.py` |
+| 砍 Traces 前端页面 | 改走 Jaeger(生产标准) | (未实施,见 plan §3.4) |
+| 砍 ReAct 双参数 | KISS,1 个 string 入参 | `react_agent.py` |
+| ★ Tool Use (`tools.py`) | ReAct 名副其实,N+1 个工具可注册 | `backend/agentic/tools.py` |
+| ★ Self-RAG (`self_rag.py`) | 低置信度自动 refine,质量兜底 | `backend/agentic/self_rag.py` |
+| ★ Online Eval (`online.py`) | 5% 采样补长尾,Langfuse 替代 | `backend/evaluation/online.py` |
+| Tenant cache 隔离 | per-tenant index 修复信息泄露 | `backend/cache/semantic_cache.py` |
+| Cache+Rewrite 并行 | 命中时省 ~150ms | `backend/agentic/orchestrator.py` |
+| 假流式清理 | ReAct 步骤流 → 一次 token 流 | `backend/agentic/orchestrator.py` |
+
+**测试覆盖**:186 passed / 10 skipped(其中 33 个为 P3.1 新增)。
 
 ---
 

@@ -30,13 +30,13 @@ from rich.logging import RichHandler
 from rich import print as rprint
 
 from backend.config import get_config, ConfigLoader
-from backend.evaluation.test_dataset import get_test_dataset, get_test_dataset_by_category
-from backend.evaluation.ragas_metrics import RAGASEvaluator
-from backend.agentic import AgenticOrchestrator
-from backend.ingestion.embedder import Embedder
-from backend.retrieval.hybrid_search import HybridSearchEngine
-from backend.agentic import QueryRouter
-from backend.generation import LLMClient
+from backend.domain.evaluation.test_dataset import get_test_dataset, get_test_dataset_by_category
+from backend.domain.evaluation.ragas_metrics import RAGASEvaluator
+from backend.domain.agent import AgenticOrchestrator
+from backend.domain.ingestion.embedder import Embedder
+from backend.domain.retrieval.hybrid_search import HybridSearchEngine
+from backend.domain.agent import QueryRouter
+from backend.domain.generation import LLMClient
 
 console = Console()
 logging.basicConfig(
@@ -288,8 +288,8 @@ def main():
 
         # P0-3 fix: 写 eval_runs 表，让 diff gate 能拿到本次 run
         try:
-            from backend.evaluation.eval_store import get_eval_store
-            from backend.generation.prompts import get_prompts_with_hash
+            from backend.domain.evaluation.eval_store import get_eval_store
+            from backend.domain.generation.prompts import get_prompts_with_hash
 
             _, prompt_hash = get_prompts_with_hash()
             run_id = args.run_id or f"cli_{started_at.strftime('%Y%m%d_%H%M%S')}"
@@ -323,8 +323,8 @@ def main():
 
         # P2: Eval diff gate — 对比上一次同 prompt_hash 的 run
         try:
-            from backend.evaluation.eval_store import get_eval_store
-            from backend.generation.prompts import get_prompts_with_hash
+            from backend.domain.evaluation.eval_store import get_eval_store
+            from backend.domain.generation.prompts import get_prompts_with_hash
             from backend.config import get_config as _gc
 
             cfg = _gc()

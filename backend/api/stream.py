@@ -87,7 +87,7 @@ async def stream_chat(
     - {"stage": "done", "answer": "...", "citations": [...], "session_id": "..."}
     - {"stage": "error", "message": "..."}
     """
-    from backend.security.tenant import TenantContext
+    from backend.domain.tenant import TenantContext
     tenant = TenantContext.from_token(token_payload)
 
     return StreamingResponse(

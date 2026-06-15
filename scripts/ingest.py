@@ -30,9 +30,9 @@ from rich.logging import RichHandler
 from rich.table import Table
 
 from backend.config import get_config, ConfigLoader
-from backend.ingestion import DocumentParserFactory, get_chunker, Embedder, QdrantIndexer
-from backend.ingestion.chunker import count_tokens
-from backend.generation.llm_client import LLMClient
+from backend.domain.ingestion import DocumentParserFactory, get_chunker, Embedder, QdrantIndexer
+from backend.domain.ingestion.chunker import count_tokens
+from backend.domain.generation.llm_client import LLMClient
 
 console = Console()
 logging.basicConfig(

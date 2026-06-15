@@ -96,7 +96,7 @@ async def chat(
     start = time.perf_counter()
 
     # 提取租户上下文（从 JWT payload 派生），确保跨租户数据不可见
-    from backend.security.tenant import TenantContext
+    from backend.domain.tenant import TenantContext
     tenant = TenantContext.from_token(token_payload)
 
     try:

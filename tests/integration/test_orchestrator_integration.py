@@ -19,8 +19,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from backend.agentic.query_router import QueryComplexity
-from backend.agentic.orchestrator import AgenticOrchestrator
+from backend.domain.agent.query_router import QueryComplexity
+from backend.domain.agent.orchestrator import AgenticOrchestrator
 
 
 # --------------------------------------------------------------------------
@@ -79,7 +79,7 @@ def _make_orchestrator(
     rewritten.rewritten = "test query"
     rewriter.rewrite = MagicMock(return_value=rewritten)
 
-    with patch("backend.retrieval.query_rewriter.QueryRewriter", return_value=rewriter):
+    with patch("backend.domain.retrieval.query_rewriter.QueryRewriter", return_value=rewriter):
         orch = AgenticOrchestrator(
             hybrid_search_engine=hybrid_search,
             router=router,
@@ -122,11 +122,11 @@ class TestSignalsPropagation:
     @pytest.mark.asyncio
     async def test_signals_in_trace(self):
         """trace["routing"]["signals"] 应该是 dict, 不为 None"""
-        from backend.agentic.query_signals import QuerySignals
+        from backend.domain.agent.query_signals import QuerySignals
         orch = _make_orchestrator()
 
         # 替换 router 的 routing 返回, 注入真实 QuerySignals
-        from backend.agentic.query_router import QueryComplexity
+        from backend.domain.agent.query_router import QueryComplexity
         routing = MagicMock()
         routing.complexity = QueryComplexity.SIMPLE
         routing.confidence = 0.85
@@ -158,8 +158,8 @@ class TestSignalsPropagation:
     @pytest.mark.asyncio
     async def test_trace_routing_contains_signals_dict(self):
         """trace 字典里 signals 字段能正确序列化为 dict (供 JSON 透出)"""
-        from backend.agentic.query_signals import QuerySignals
-        from backend.agentic.query_router import QueryComplexity
+        from backend.domain.agent.query_signals import QuerySignals
+        from backend.domain.agent.query_router import QueryComplexity
         orch = _make_orchestrator()
         routing = MagicMock()
         routing.complexity = QueryComplexity.SIMPLE
@@ -237,7 +237,7 @@ class TestErrorDegradation:
         rewritten.rewritten = "q"
         rewriter.rewrite = MagicMock(return_value=rewritten)
 
-        with patch("backend.retrieval.query_rewriter.QueryRewriter", return_value=rewriter):
+        with patch("backend.domain.retrieval.query_rewriter.QueryRewriter", return_value=rewriter):
             orch = AgenticOrchestrator(
                 hybrid_search_engine=hybrid_search,
                 router=router,

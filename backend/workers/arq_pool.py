@@ -48,7 +48,7 @@ async def enqueue_index_task(
             f"fallback 到直接执行 — 注意：此模式下任务不持久化"
         )
         # Fallback: 同步执行 (与之前 BackgroundTasks 行为一致)
-        from backend.ingestion.pipeline import run_index_pipeline
+        from backend.domain.ingestion.pipeline import run_index_pipeline
         await run_index_pipeline(
             file_path=Path(file_path),
             file_id=file_id,

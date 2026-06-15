@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import pytest
 
-from backend.agentic.query_signals import (
+from backend.domain.agent.query_signals import (
     QueryAnalyzer,
     QuerySignals,
 )

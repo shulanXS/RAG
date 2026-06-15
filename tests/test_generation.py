@@ -16,8 +16,8 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from backend.generation.prompt_builder import PromptBuilder
-from backend.generation.retry import (
+from backend.domain.generation.prompt_builder import PromptBuilder
+from backend.domain.generation.retry import (
     NON_RETRYABLE_EXCEPTIONS,
     RetryConfig,
     _compute_delay,

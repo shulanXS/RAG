@@ -84,6 +84,17 @@ rag_cache_hit = Counter(
 rag_cache_hit_hit = rag_cache_hit.labels(result="hit")
 rag_cache_hit_miss = rag_cache_hit.labels(result="miss")
 
+# P3.1(plan §4.4): Query 改写 LRU 缓存命中指标
+# 改写缓存命中 = 有历史会话 + LLM 未触发改写(cache 命中或代词未触发)。
+# 用于在 Grafana 看板监控"改写模块是否被缓存挡住",容量规划。
+rag_query_rewrite_cache = Counter(
+    "rag_query_rewrite_cache_total",
+    "Query rewriter LRU cache hits",
+    labelnames=["result"],
+)
+rag_query_rewrite_cache_hit = rag_query_rewrite_cache.labels(result="hit")
+rag_query_rewrite_cache_miss = rag_query_rewrite_cache.labels(result="miss")
+
 # --- LLM Tokens ---
 rag_llm_tokens = Counter(
     "rag_llm_tokens_total",
@@ -208,12 +219,23 @@ class MetricsCollectorImpl:
 
         Args:
             hit: 是否命中缓存
-            similarity: 可选，相似度分数
+            similarity: 可选,相似度分数
         """
         if hit:
             rag_cache_hit_hit.inc()
         else:
             rag_cache_hit_miss.inc()
+
+    def record_query_rewrite_cache(self, hit: bool) -> None:
+        """P3.1(plan §4.4): 记录 query 改写 LRU 缓存命中。
+
+        Args:
+            hit: 改写缓存是否命中(命中 = 未触发 LLM,直接复用历史改写结果)
+        """
+        if hit:
+            rag_query_rewrite_cache_hit.inc()
+        else:
+            rag_query_rewrite_cache_miss.inc()
 
     def record_llm_tokens(
         self,

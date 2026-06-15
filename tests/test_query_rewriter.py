@@ -10,7 +10,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from backend.retrieval.query_rewriter import QueryRewriter
+from backend.domain.retrieval.query_rewriter import QueryRewriter
 
 
 def test_needs_rewriting_short_query():
@@ -44,14 +44,17 @@ def test_rewriter_cache_get_put():
     assert rw._cache_get(key) == "value"
 
 
-def test_rewriter_rewrites_with_history():
-    """多轮对话场景：第二点呢 -> 包含前文实体"""
-    from backend.retrieval.query_rewriter import RewrittenQuery
+async def test_rewriter_rewrites_with_history():
+    """多轮对话场景：第二点呢 -> 包含前文实体
+
+    P3.1: 同步 rewrite() 已删除,统一走 async 路径。
+    """
+    from backend.domain.retrieval.query_rewriter import RewrittenQuery
 
     rw = QueryRewriter(llm_client=None)
     history = [{"role": "user", "content": "RAG 系统有 3 个核心组件"}]
     # 无 LLM 的情况下应回退到原 query
-    result = rw.rewrite("第二点呢", conversation_history=history)
+    result = await rw.rewrite_async("第二点呢", conversation_history=history)
     assert isinstance(result, RewrittenQuery)
     assert result.original == "第二点呢"
 
